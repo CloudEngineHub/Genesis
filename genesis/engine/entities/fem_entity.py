@@ -8,7 +8,7 @@ import genesis as gs
 import genesis.utils.element as eu
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
-from genesis.engine.coupler import SAPCoupler
+from genesis.engine.couplers import SAPCoupler
 from genesis.engine.states.cache import QueriedStates
 from genesis.engine.states.entities import FEMEntityState
 from genesis.utils.misc import to_gs_tensor, tensor_to_array
@@ -214,7 +214,7 @@ class FEMEntity(Entity):
             if actu.shape == (n_groups,):
                 self._tgt["actu"] = actu.unsqueeze(0).tile((self._sim._B, 1))
                 is_valid = True
-            elif actu.shape == (n_elements,):
+            elif actu.shape == (self.n_elements,):
                 gs.raise_exception("Cannot set per-element actuation.")
         elif actu.ndim == 2:
             if actu.shape == (self._sim._B, n_groups):
@@ -356,7 +356,7 @@ class FEMEntity(Entity):
         else:
             gs.raise_exception(f"Unsupported morph: {self.morph}.")
 
-        self.instantiate(verts, elems)
+        self.instantiate(*eu.split_all_surface_tets(verts, elems))
 
     def _add_to_solver(self, in_backward=False):
         if not in_backward:
