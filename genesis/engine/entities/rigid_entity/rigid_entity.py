@@ -410,6 +410,7 @@ class RigidEntity(Entity):
             j_info["dofs_limit"] = np.tile([-np.inf, np.inf], (6, 1))
             j_info["dofs_stiffness"] = np.zeros(6)
             j_info["dofs_invweight"] = np.zeros(6)
+            j_info["dofs_frictionloss"] = np.zeros(6)
             j_info["dofs_damping"] = np.zeros(6)
             if isinstance(morph, gs.morphs.Drone):
                 mass_tot = sum(l_info["inertial_mass"] for l_info in l_infos)
@@ -697,6 +698,7 @@ class RigidEntity(Entity):
                 dofs_motion_vel=dofs_motion_vel,
                 dofs_limit=j_info.get("dofs_limit", np.tile([[-np.inf, np.inf]], [n_dofs, 1])),
                 dofs_invweight=j_info.get("dofs_invweight", np.zeros(n_dofs)),
+                dofs_frictionloss=j_info.get("dofs_frictionloss", np.zeros(n_dofs)),
                 dofs_stiffness=j_info.get("dofs_stiffness", np.zeros(n_dofs)),
                 dofs_damping=j_info.get("dofs_damping", np.zeros(n_dofs)),
                 dofs_armature=j_info.get("dofs_armature", np.zeros(n_dofs)),
@@ -761,9 +763,9 @@ class RigidEntity(Entity):
 
         # Add collision geometries
         for g_info in cg_infos:
-            friction = g_info.get("friction", self.material.friction)
+            friction = self.material.friction
             if friction is None:
-                friction = gu.default_friction()
+                friction = g_info.get("friction", gu.default_friction())
             link._add_geom(
                 mesh=g_info["mesh"],
                 init_pos=g_info.get("pos", gu.zero_pos()),
