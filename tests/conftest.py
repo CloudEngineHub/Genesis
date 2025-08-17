@@ -95,6 +95,8 @@ def pytest_xdist_auto_num_workers(config):
     physical_core_count = psutil.cpu_count(logical=config.option.logical)
     _, _, ram_memory, _ = gs.utils.get_device(gs.cpu)
     _, _, vram_memory, backend = gs.utils.get_device(gs.gpu)
+    num_gpus = len(_get_gpu_indices())
+    vram_memory *= num_gpus
     if backend == gs.cpu:
         # Ignore VRAM if no GPU is available
         vram_memory = float("inf")
@@ -124,7 +126,7 @@ def pytest_xdist_auto_num_workers(config):
         num_cpu_per_gpu = 4
         num_workers = min(
             num_workers,
-            len(_get_gpu_indices()),
+            num_gpus,
             max(int(physical_core_count / num_cpu_per_gpu), 1),
         )
 
@@ -288,7 +290,7 @@ def taichi_offline_cache(request):
 @pytest.fixture(scope="function", autouse=True)
 def initialize_genesis(request, backend, precision, taichi_offline_cache):
     import pyglet
-    import taichi as ti
+    import gstaichi as ti
     import genesis as gs
     from genesis.utils.misc import ALLOCATE_TENSOR_WARNING
 
