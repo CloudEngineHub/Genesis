@@ -1754,6 +1754,10 @@ def test_set_dofs_frictionloss_physics(gs_sim, tol):
 @pytest.mark.required
 def test_frictionloss_advanced(show_viewer, tol):
     scene = gs.Scene(
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.0, 0.25, 0.75),
+            camera_lookat=(0.0, 0.0, 0.0),
+        ),
         show_viewer=show_viewer,
         show_FPS=False,
     )
@@ -2154,6 +2158,33 @@ def test_terrain_generation(request, show_viewer):
     terrain_2 = scene.add_entity(gs.morphs.Terrain(**{**terrain_kwargs, **dict(randomize=True)}))
     terrain_2_mesh = terrain_2.geoms[0].mesh
     assert_allclose(terrain_mesh.verts, terrain_2_mesh.verts, tol=gs.EPS)
+
+
+@pytest.mark.required
+def test_discrete_obstacles_terrain():
+    scene = gs.Scene()
+    terrain = scene.add_entity(
+        gs.morphs.Terrain(
+            n_subterrains=(1, 1),
+            subterrain_size=(6.0, 6.0),
+            horizontal_scale=0.5,
+            vertical_scale=0.5,
+            subterrain_types=[["discrete_obstacles_terrain"]],
+            subterrain_parameters={
+                "discrete_obstacles_terrain": {
+                    "max_height": 1.0,
+                    "platform_size": 1.0,
+                }
+            },
+        )
+    )
+    scene.build()
+    height_field = terrain.geoms[0].metadata["height_field"]
+    platform = height_field[5:7, 5:7]
+
+    assert height_field.max().item() == 2.0
+    assert height_field.min().item() == -2.0
+    assert (platform == 0.0).all()
 
 
 def test_mesh_to_heightfield(tmp_path, show_viewer):
