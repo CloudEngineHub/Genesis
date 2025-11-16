@@ -863,6 +863,7 @@ def test_box_box_dynamics(gs_sim):
         assert_allclose(qpos[8], 0.6, atol=2e-3)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "box_box_detection, gjk_collision, dynamics",
     [
@@ -880,7 +881,6 @@ def test_many_boxes_dynamics(box_box_detection, gjk_collision, dynamics, show_vi
         ),
         rigid_options=gs.options.RigidOptions(
             box_box_detection=box_box_detection,
-            max_collision_pairs=1000,
             use_gjk_collision=gjk_collision,
         ),
         viewer_options=gs.options.ViewerOptions(
@@ -908,7 +908,7 @@ def test_many_boxes_dynamics(box_box_detection, gjk_collision, dynamics, show_vi
     if dynamics:
         for entity in scene.entities[1:]:
             entity.set_dofs_velocity(4.0 * np.random.rand(6))
-    num_steps = 650 if dynamics else 150
+    num_steps = 700 if dynamics else 150
     for i in range(num_steps):
         scene.step()
         if i > num_steps - 50:
@@ -1350,7 +1350,6 @@ def test_stickman(gs_sim, mj_sim, tol):
 
 
 @pytest.mark.required
-@pytest.mark.field_only
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_multilink_inverse_kinematics(show_viewer):
     TOL = 1e-5
@@ -2309,16 +2308,15 @@ def test_jacobian(gs_sim, tol):
 
 
 @pytest.mark.required
-def test_urdf_parsing(show_viewer, tol):
+@pytest.mark.parametrize("gjk_collision", [True, False])
+def test_urdf_parsing(show_viewer, tol, gjk_collision):
     POS_OFFSET = 0.8
     WOLRD_QUAT = np.array([1.0, 1.0, -0.3, +0.3])
     DOOR_JOINT_DAMPING = 1.5
 
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
-            # Must use GJK to make collision detection independent from the center of each geometry.
-            # Note that it is also the case for MPR+SDF most of the time due to warm-start.
-            use_gjk_collision=True,
+            use_gjk_collision=gjk_collision,
         ),
         show_viewer=show_viewer,
         show_FPS=False,
@@ -3167,13 +3165,15 @@ def test_mesh_primitive_COM(show_viewer, tol):
 
 @pytest.mark.required
 @pytest.mark.parametrize("scale", [0.1, 10.0])
+@pytest.mark.parametrize("box_box_detection", [False, True])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-def test_noslip_iterations(scale, show_viewer, tol):
+def test_noslip_iterations(scale, box_box_detection, show_viewer, tol):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.01,
         ),
         rigid_options=gs.options.RigidOptions(
+            box_box_detection=box_box_detection,
             noslip_iterations=5,
         ),
         viewer_options=gs.options.ViewerOptions(
@@ -3186,21 +3186,19 @@ def test_noslip_iterations(scale, show_viewer, tol):
         show_viewer=show_viewer,
     )
 
-    boxes = []
     for i in range(3):
-        boxes.append(
-            scene.add_entity(
-                gs.morphs.Box(
-                    size=(scale, scale, scale),
-                    pos=(i * scale, 0, 0),
-                    fixed=(i == 0),
-                ),
-                surface=gs.surfaces.Default(
-                    color=(*np.random.rand(3), 0.7),
-                ),
-                visualize_contact=True,
-            )
+        scene.add_entity(
+            gs.morphs.Box(
+                size=(scale, scale, scale),
+                pos=(i * (1 - (not box_box_detection) * 1e-3) * scale, 0, 0),
+                fixed=(i == 0),
+            ),
+            surface=gs.surfaces.Default(
+                color=(*np.random.rand(3), 1.0 if i != 1 else 0.7),
+            ),
+            visualize_contact=True,
         )
+    box_1, box_2 = scene.entities[1:]
     scene.build()
 
     rho = 200
@@ -3211,24 +3209,24 @@ def test_noslip_iterations(scale, show_viewer, tol):
     safety = 2.5
 
     # simulate for 20 seconds
-    for i in range(2000):
-        boxes[2].control_dofs_force(np.array([-safety / coeff_f * n_box * rho * scale**3 * g]), np.array([0]))
+    for _ in range(2000):
+        # push to -x direction
+        box_2.control_dofs_force([-safety / coeff_f * n_box * rho * scale**3 * g], [0])
         scene.step()
 
-    box_1_z = tensor_to_array(boxes[1].get_qpos())[2]
     # allow some small sliding due to first few frames
     # scale = 0.1 is less stable than bigger scale
+    _, _, box_1_z = box_1.get_pos()
     assert_allclose(box_1_z, 0.0, atol=4e-2 * scale)
 
     # reduce the multiplier and it will slide
     safety = 0.9
-    for i in range(2000):
-        # push to -x direction
-        boxes[2].control_dofs_force(np.array([-safety / coeff_f * n_box * rho * scale**3 * g]), np.array([0]))
+    for _ in range(300):
+        box_2.control_dofs_force([-safety / coeff_f * n_box * rho * scale**3 * g], [0])
         scene.step()
 
-    box_1_z = tensor_to_array(boxes[1].get_qpos())[2]
     # it will slip away
+    _, _, box_1_z = box_1.get_pos()
     assert box_1_z < -scale
 
 
