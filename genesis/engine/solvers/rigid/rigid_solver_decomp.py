@@ -258,7 +258,6 @@ class RigidSolver(Solver):
                 sparse_solve=self._options.sparse_solve,
                 integrator=self._integrator,
                 solver_type=self._options.constraint_solver,
-                is_backward=False,
             )
             # Add terms for static inner loops, use -1 if not requires_grad to avoid re-compilation
             if self.sim.options.requires_grad:
@@ -281,7 +280,6 @@ class RigidSolver(Solver):
                 enable_collision=self._enable_collision,
                 integrator=gs.integrator.approximate_implicitfast,
                 solver_type=gs.constraint_solver.CG,
-                is_backward=False,
             )
 
         if self._static_rigid_sim_config.requires_grad:
@@ -5083,6 +5081,11 @@ def func_forward_kinematics_entity(
         else ti.static(range(static_rigid_sim_config.max_n_links_per_entity))
     ):
         EPS = rigid_global_info.EPS[None]
+        W = ti.static(func_write_field_if_backward)
+        R = ti.static(func_read_field_if_backward)
+        WR = ti.static(func_write_and_read_field_if_backward)
+        BW = ti.static(static_rigid_sim_config.is_backward)
+
         i_l = i_l_ if ti.static(not static_rigid_sim_config.is_backward) else (i_l_ + entities_info.link_start[i_e])
 
         if func_check_index_range(
@@ -5090,13 +5093,16 @@ def func_forward_kinematics_entity(
         ):
             I_l = [i_l, i_b] if ti.static(static_rigid_sim_config.batch_links_info) else i_l
 
-            links_state.pos_bw[i_l, 0, i_b] = links_info.pos[I_l]
-            links_state.quat_bw[i_l, 0, i_b] = links_info.quat[I_l]
+            pos = W(links_state.pos_bw, i_l, 0, i_b, links_info.pos[I_l], BW)
+            quat = W(links_state.quat_bw, i_l, 0, i_b, links_info.quat[I_l], BW)
             if links_info.parent_idx[I_l] != -1:
                 parent_pos = links_state.pos[links_info.parent_idx[I_l], i_b]
                 parent_quat = links_state.quat[links_info.parent_idx[I_l], i_b]
-                links_state.pos_bw[i_l, 0, i_b] = parent_pos + gu.ti_transform_by_quat(links_info.pos[I_l], parent_quat)
-                links_state.quat_bw[i_l, 0, i_b] = gu.ti_transform_quat_by_quat(links_info.quat[I_l], parent_quat)
+                pos_ = parent_pos + gu.ti_transform_by_quat(links_info.pos[I_l], parent_quat)
+                quat_ = gu.ti_transform_quat_by_quat(links_info.quat[I_l], parent_quat)
+
+                pos = W(links_state.pos_bw, i_l, 0, i_b, pos_, BW)
+                quat = W(links_state.quat_bw, i_l, 0, i_b, quat_, BW)
 
             n_joints = links_info.joint_end[I_l] - links_info.joint_start[I_l]
 
@@ -5138,16 +5144,14 @@ def func_forward_kinematics_entity(
                         elif joint_type == gs.JOINT_TYPE.PRISMATIC:
                             axis = dofs_info.motion_vel[I_d]
 
-                        joints_state.xanchor[i_j, i_b] = (
-                            gu.ti_transform_by_quat(joints_info.pos[I_j], links_state.quat_bw[i_l, curr_i_j, i_b])
-                            + links_state.pos_bw[i_l, curr_i_j, i_b]
-                        )
-                        joints_state.xaxis[i_j, i_b] = gu.ti_transform_by_quat(
-                            axis, links_state.quat_bw[i_l, curr_i_j, i_b]
-                        )
+                        pos_ = R(links_state.pos_bw, i_l, curr_i_j, i_b, pos, BW)
+                        quat_ = R(links_state.quat_bw, i_l, curr_i_j, i_b, quat, BW)
+
+                        joints_state.xanchor[i_j, i_b] = gu.ti_transform_by_quat(joints_info.pos[I_j], quat_) + pos_
+                        joints_state.xaxis[i_j, i_b] = gu.ti_transform_by_quat(axis, quat_)
 
                     if joint_type == gs.JOINT_TYPE.FREE:
-                        links_state.pos_bw[i_l, next_i_j, i_b] = ti.Vector(
+                        pos_ = ti.Vector(
                             [
                                 rigid_global_info.qpos[q_start, i_b],
                                 rigid_global_info.qpos[q_start + 1, i_b],
@@ -5155,7 +5159,7 @@ def func_forward_kinematics_entity(
                             ],
                             dt=gs.ti_float,
                         )
-                        links_state.quat_bw[i_l, next_i_j, i_b] = ti.Vector(
+                        quat_ = ti.Vector(
                             [
                                 rigid_global_info.qpos[q_start + 3, i_b],
                                 rigid_global_info.qpos[q_start + 4, i_b],
@@ -5164,9 +5168,12 @@ def func_forward_kinematics_entity(
                             ],
                             dt=gs.ti_float,
                         )
-                        xyz = gu.ti_quat_to_xyz(links_state.quat_bw[i_l, next_i_j, i_b], EPS)
+                        pos = WR(links_state.pos_bw, i_l, next_i_j, i_b, pos_, BW)
+                        quat = WR(links_state.quat_bw, i_l, next_i_j, i_b, quat_, BW)
+
+                        xyz = gu.ti_quat_to_xyz(quat, EPS)
                         for j in ti.static(range(3)):
-                            dofs_state.pos[dof_start + j, i_b] = links_state.pos_bw[i_l, next_i_j, i_b][j]
+                            dofs_state.pos[dof_start + j, i_b] = pos[j]
                             dofs_state.pos[dof_start + 3 + j, i_b] = xyz[j]
                     elif joint_type == gs.JOINT_TYPE.FIXED:
                         pass
@@ -5183,38 +5190,35 @@ def func_forward_kinematics_entity(
                         xyz = gu.ti_quat_to_xyz(qloc, EPS)
                         for j in ti.static(range(3)):
                             dofs_state.pos[dof_start + j, i_b] = xyz[j]
-                        links_state.quat_bw[i_l, next_i_j, i_b] = gu.ti_transform_quat_by_quat(
-                            qloc, links_state.quat_bw[i_l, curr_i_j, i_b]
-                        )
-                        links_state.pos_bw[i_l, next_i_j, i_b] = joints_state.xanchor[
-                            i_j, i_b
-                        ] - gu.ti_transform_by_quat(joints_info.pos[I_j], links_state.quat_bw[i_l, next_i_j, i_b])
+                        quat_ = gu.ti_transform_quat_by_quat(qloc, R(links_state.quat_bw, i_l, curr_i_j, i_b, quat, BW))
+                        quat = WR(links_state.quat_bw, i_l, next_i_j, i_b, quat_, BW)
+                        pos_ = joints_state.xanchor[i_j, i_b] - gu.ti_transform_by_quat(joints_info.pos[I_j], quat)
+                        pos = W(links_state.pos_bw, i_l, next_i_j, i_b, pos_, BW)
                     elif joint_type == gs.JOINT_TYPE.REVOLUTE:
                         axis = dofs_info.motion_ang[I_d]
                         dofs_state.pos[dof_start, i_b] = (
                             rigid_global_info.qpos[q_start, i_b] - rigid_global_info.qpos0[q_start, i_b]
                         )
                         qloc = gu.ti_rotvec_to_quat(axis * dofs_state.pos[dof_start, i_b], EPS)
-                        links_state.quat_bw[i_l, next_i_j, i_b] = gu.ti_transform_quat_by_quat(
-                            qloc, links_state.quat_bw[i_l, curr_i_j, i_b]
-                        )
-                        links_state.pos_bw[i_l, next_i_j, i_b] = joints_state.xanchor[
-                            i_j, i_b
-                        ] - gu.ti_transform_by_quat(joints_info.pos[I_j], links_state.quat_bw[i_l, next_i_j, i_b])
+                        quat_ = gu.ti_transform_quat_by_quat(qloc, R(links_state.quat_bw, i_l, curr_i_j, i_b, quat, BW))
+                        quat = WR(links_state.quat_bw, i_l, next_i_j, i_b, quat_, BW)
+                        pos_ = joints_state.xanchor[i_j, i_b] - gu.ti_transform_by_quat(joints_info.pos[I_j], quat)
+                        pos = W(links_state.pos_bw, i_l, next_i_j, i_b, pos_, BW)
                     else:  # joint_type == gs.JOINT_TYPE.PRISMATIC:
                         dofs_state.pos[dof_start, i_b] = (
                             rigid_global_info.qpos[q_start, i_b] - rigid_global_info.qpos0[q_start, i_b]
                         )
-                        links_state.pos_bw[i_l, next_i_j, i_b] = (
-                            links_state.pos_bw[i_l, curr_i_j, i_b]
+                        pos_ = (
+                            R(links_state.pos_bw, i_l, curr_i_j, i_b, pos, BW)
                             + joints_state.xaxis[i_j, i_b] * dofs_state.pos[dof_start, i_b]
                         )
+                        pos = W(links_state.pos_bw, i_l, next_i_j, i_b, pos_, BW)
 
             # Skip link pose update for fixed root links to let users manually overwrite them
             i_j_ = 0 if ti.static(not static_rigid_sim_config.is_backward) else n_joints
             if not (links_info.parent_idx[I_l] == -1 and links_info.is_fixed[I_l]):
-                links_state.pos[i_l, i_b] = links_state.pos_bw[i_l, i_j_, i_b]
-                links_state.quat[i_l, i_b] = links_state.quat_bw[i_l, i_j_, i_b]
+                links_state.pos[i_l, i_b] = R(links_state.pos_bw, i_l, i_j_, i_b, pos, BW)
+                links_state.quat[i_l, i_b] = R(links_state.quat_bw, i_l, i_j_, i_b, quat, BW)
 
 
 @ti.func
@@ -5234,6 +5238,11 @@ def func_forward_velocity_entity(
         if ti.static(not static_rigid_sim_config.is_backward)
         else ti.static(range(static_rigid_sim_config.max_n_links_per_entity))
     ):
+        W = ti.static(func_write_field_if_backward)
+        R = ti.static(func_read_field_if_backward)
+        A = ti.static(func_atomic_add_field_if_backward)
+        BW = ti.static(static_rigid_sim_config.is_backward)
+
         i_l = i_l_ if ti.static(not static_rigid_sim_config.is_backward) else (i_l_ + entities_info.link_start[i_e])
 
         if func_check_index_range(
@@ -5242,12 +5251,16 @@ def func_forward_velocity_entity(
             I_l = [i_l, i_b] if ti.static(static_rigid_sim_config.batch_links_info) else i_l
             n_joints = links_info.joint_end[I_l] - links_info.joint_start[I_l]
 
-            links_state.cd_vel_bw[i_l, 0, i_b] = ti.Vector.zero(gs.ti_float, 3)
-            links_state.cd_ang_bw[i_l, 0, i_b] = ti.Vector.zero(gs.ti_float, 3)
+            cvel_vel = W(links_state.cd_vel_bw, i_l, 0, i_b, ti.Vector.zero(gs.ti_float, 3), BW)
+            cvel_ang = W(links_state.cd_ang_bw, i_l, 0, i_b, ti.Vector.zero(gs.ti_float, 3), BW)
 
             if links_info.parent_idx[I_l] != -1:
-                links_state.cd_vel_bw[i_l, 0, i_b] = links_state.cd_vel[links_info.parent_idx[I_l], i_b]
-                links_state.cd_ang_bw[i_l, 0, i_b] = links_state.cd_ang[links_info.parent_idx[I_l], i_b]
+                cvel_vel = W(
+                    links_state.cd_vel_bw, i_l, 0, i_b, links_state.cd_vel[links_info.parent_idx[I_l], i_b], BW
+                )
+                cvel_ang = W(
+                    links_state.cd_ang_bw, i_l, 0, i_b, links_state.cd_ang[links_info.parent_idx[I_l], i_b], BW
+                )
 
             for i_j_ in (
                 range(n_joints)
@@ -5269,22 +5282,11 @@ def func_forward_velocity_entity(
 
                     if joint_type == gs.JOINT_TYPE.FREE:
                         for i_3 in ti.static(range(3)):
-                            func_atomic_add_if_backward_3d(
-                                links_state.cd_vel_bw,
-                                i_l,
-                                curr_i_j,
-                                i_b,
-                                dofs_state.cdof_vel[dof_start + i_3, i_b] * dofs_state.vel[dof_start + i_3, i_b],
-                                static_rigid_sim_config,
-                            )
-                            func_atomic_add_if_backward_3d(
-                                links_state.cd_ang_bw,
-                                i_l,
-                                curr_i_j,
-                                i_b,
-                                dofs_state.cdof_ang[dof_start + i_3, i_b] * dofs_state.vel[dof_start + i_3, i_b],
-                                static_rigid_sim_config,
-                            )
+                            _vel = dofs_state.cdof_vel[dof_start + i_3, i_b] * dofs_state.vel[dof_start + i_3, i_b]
+                            _ang = dofs_state.cdof_ang[dof_start + i_3, i_b] * dofs_state.vel[dof_start + i_3, i_b]
+
+                            cvel_vel = cvel_vel + A(links_state.cd_vel_bw, i_l, curr_i_j, i_b, _vel, BW)
+                            cvel_ang = cvel_ang + A(links_state.cd_ang_bw, i_l, curr_i_j, i_b, _ang, BW)
 
                         for i_3 in ti.static(range(3)):
                             (
@@ -5296,34 +5298,25 @@ def func_forward_velocity_entity(
                                 dofs_state.cdofd_ang[dof_start + i_3 + 3, i_b],
                                 dofs_state.cdofd_vel[dof_start + i_3 + 3, i_b],
                             ) = gu.motion_cross_motion(
-                                links_state.cd_ang_bw[i_l, curr_i_j, i_b],
-                                links_state.cd_vel_bw[i_l, curr_i_j, i_b],
+                                R(links_state.cd_ang_bw, i_l, curr_i_j, i_b, cvel_ang, BW),
+                                R(links_state.cd_vel_bw, i_l, curr_i_j, i_b, cvel_vel, BW),
                                 dofs_state.cdof_ang[dof_start + i_3 + 3, i_b],
                                 dofs_state.cdof_vel[dof_start + i_3 + 3, i_b],
                             )
 
-                        links_state.cd_vel_bw[i_l, next_i_j, i_b] = links_state.cd_vel_bw[i_l, curr_i_j, i_b]
-                        links_state.cd_ang_bw[i_l, next_i_j, i_b] = links_state.cd_ang_bw[i_l, curr_i_j, i_b]
+                        if ti.static(static_rigid_sim_config.is_backward):
+                            links_state.cd_vel_bw[i_l, next_i_j, i_b] = links_state.cd_vel_bw[i_l, curr_i_j, i_b]
+                            links_state.cd_ang_bw[i_l, next_i_j, i_b] = links_state.cd_ang_bw[i_l, curr_i_j, i_b]
 
                         for i_3 in ti.static(range(3)):
-                            func_atomic_add_if_backward_3d(
-                                links_state.cd_vel_bw,
-                                i_l,
-                                next_i_j,
-                                i_b,
-                                dofs_state.cdof_vel[dof_start + i_3 + 3, i_b]
-                                * dofs_state.vel[dof_start + i_3 + 3, i_b],
-                                static_rigid_sim_config,
+                            _vel = (
+                                dofs_state.cdof_vel[dof_start + i_3 + 3, i_b] * dofs_state.vel[dof_start + i_3 + 3, i_b]
                             )
-                            func_atomic_add_if_backward_3d(
-                                links_state.cd_ang_bw,
-                                i_l,
-                                next_i_j,
-                                i_b,
-                                dofs_state.cdof_ang[dof_start + i_3 + 3, i_b]
-                                * dofs_state.vel[dof_start + i_3 + 3, i_b],
-                                static_rigid_sim_config,
+                            _ang = (
+                                dofs_state.cdof_ang[dof_start + i_3 + 3, i_b] * dofs_state.vel[dof_start + i_3 + 3, i_b]
                             )
+                            cvel_vel = cvel_vel + A(links_state.cd_vel_bw, i_l, next_i_j, i_b, _vel, BW)
+                            cvel_ang = cvel_ang + A(links_state.cd_ang_bw, i_l, next_i_j, i_b, _ang, BW)
 
                     else:
                         for i_d_ in (
@@ -5336,14 +5329,15 @@ def func_forward_velocity_entity(
                                 i_d, dof_start, joints_info.dof_end[I_j], static_rigid_sim_config.is_backward
                             ):
                                 dofs_state.cdofd_ang[i_d, i_b], dofs_state.cdofd_vel[i_d, i_b] = gu.motion_cross_motion(
-                                    links_state.cd_ang_bw[i_l, curr_i_j, i_b],
-                                    links_state.cd_vel_bw[i_l, curr_i_j, i_b],
+                                    R(links_state.cd_ang_bw, i_l, curr_i_j, i_b, cvel_ang, BW),
+                                    R(links_state.cd_vel_bw, i_l, curr_i_j, i_b, cvel_vel, BW),
                                     dofs_state.cdof_ang[i_d, i_b],
                                     dofs_state.cdof_vel[i_d, i_b],
                                 )
 
-                        links_state.cd_vel_bw[i_l, next_i_j, i_b] = links_state.cd_vel_bw[i_l, curr_i_j, i_b]
-                        links_state.cd_ang_bw[i_l, next_i_j, i_b] = links_state.cd_ang_bw[i_l, curr_i_j, i_b]
+                        if ti.static(static_rigid_sim_config.is_backward):
+                            links_state.cd_vel_bw[i_l, next_i_j, i_b] = links_state.cd_vel_bw[i_l, curr_i_j, i_b]
+                            links_state.cd_ang_bw[i_l, next_i_j, i_b] = links_state.cd_ang_bw[i_l, curr_i_j, i_b]
 
                         for i_d_ in (
                             range(dof_start, joints_info.dof_end[I_j])
@@ -5354,26 +5348,14 @@ def func_forward_velocity_entity(
                             if func_check_index_range(
                                 i_d, dof_start, joints_info.dof_end[I_j], static_rigid_sim_config.is_backward
                             ):
-                                func_atomic_add_if_backward_3d(
-                                    links_state.cd_vel_bw,
-                                    i_l,
-                                    next_i_j,
-                                    i_b,
-                                    dofs_state.cdof_vel[i_d, i_b] * dofs_state.vel[i_d, i_b],
-                                    static_rigid_sim_config,
-                                )
-                                func_atomic_add_if_backward_3d(
-                                    links_state.cd_ang_bw,
-                                    i_l,
-                                    next_i_j,
-                                    i_b,
-                                    dofs_state.cdof_ang[i_d, i_b] * dofs_state.vel[i_d, i_b],
-                                    static_rigid_sim_config,
-                                )
+                                _vel = dofs_state.cdof_vel[i_d, i_b] * dofs_state.vel[i_d, i_b]
+                                _ang = dofs_state.cdof_ang[i_d, i_b] * dofs_state.vel[i_d, i_b]
+                                cvel_vel = cvel_vel + A(links_state.cd_vel_bw, i_l, next_i_j, i_b, _vel, BW)
+                                cvel_ang = cvel_ang + A(links_state.cd_ang_bw, i_l, next_i_j, i_b, _ang, BW)
 
             i_j_ = 0 if ti.static(not static_rigid_sim_config.is_backward) else n_joints
-            links_state.cd_vel[i_l, i_b] = links_state.cd_vel_bw[i_l, i_j_, i_b]
-            links_state.cd_ang[i_l, i_b] = links_state.cd_ang_bw[i_l, i_j_, i_b]
+            links_state.cd_vel[i_l, i_b] = R(links_state.cd_vel_bw, i_l, i_j_, i_b, cvel_vel, BW)
+            links_state.cd_ang[i_l, i_b] = R(links_state.cd_ang_bw, i_l, i_j_, i_b, cvel_ang, BW)
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -6750,65 +6732,19 @@ def kernel_prepare_backward_substep(
                 force_update_fixed_geoms=False,
             )
 
-        # FIXME: Parameter pruning for ndarray is buggy on this one. Inlining this function is "fixing" this issue.
+        # FIXME: Parameter pruning for ndarray is buggy for now and requires match variable and arg names.
         # Save results of [update_cartesian_space] to adjoint cache
-        # func_copy_cartesian_space(
-        #     src_dofs_state=dofs_state,
-        #     src_links_state=links_state,
-        #     src_joints_state=joints_state,
-        #     src_geoms_state=geoms_state,
-        #     dst_dofs_state=dofs_state_adjoint_cache,
-        #     dst_links_state=links_state_adjoint_cache,
-        #     dst_joints_state=joints_state_adjoint_cache,
-        #     dst_geoms_state=geoms_state_adjoint_cache,
-        #     static_rigid_sim_config=static_rigid_sim_config,
-        # )
-
-        ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for I in ti.grouped(ti.ndrange(*dofs_state.pos.shape)):
-            # pos, cdof_ang, cdof_vel, cdofvel_ang, cdofvel_vel, cdofd_ang, cdofd_vel
-            dofs_state_adjoint_cache.pos[I] = dofs_state.pos[I]
-            dofs_state_adjoint_cache.cdof_ang[I] = dofs_state.cdof_ang[I]
-            dofs_state_adjoint_cache.cdof_vel[I] = dofs_state.cdof_vel[I]
-            dofs_state_adjoint_cache.cdofvel_ang[I] = dofs_state.cdofvel_ang[I]
-            dofs_state_adjoint_cache.cdofvel_vel[I] = dofs_state.cdofvel_vel[I]
-            dofs_state_adjoint_cache.cdofd_ang[I] = dofs_state.cdofd_ang[I]
-            dofs_state_adjoint_cache.cdofd_vel[I] = dofs_state.cdofd_vel[I]
-
-        # links state
-        ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for I in ti.grouped(ti.ndrange(*links_state.pos.shape)):
-            # pos, quat, root_COM, mass_sum, i_pos, i_quat, cinr_inertial, cinr_pos, cinr_quat, cinr_mass, j_pos, j_quat,
-            # cd_vel, cd_ang
-            links_state_adjoint_cache.pos[I] = links_state.pos[I]
-            links_state_adjoint_cache.quat[I] = links_state.quat[I]
-            links_state_adjoint_cache.root_COM[I] = links_state.root_COM[I]
-            links_state_adjoint_cache.mass_sum[I] = links_state.mass_sum[I]
-            links_state_adjoint_cache.i_pos[I] = links_state.i_pos[I]
-            links_state_adjoint_cache.i_quat[I] = links_state.i_quat[I]
-            links_state_adjoint_cache.cinr_inertial[I] = links_state.cinr_inertial[I]
-            links_state_adjoint_cache.cinr_pos[I] = links_state.cinr_pos[I]
-            links_state_adjoint_cache.cinr_quat[I] = links_state.cinr_quat[I]
-            links_state_adjoint_cache.cinr_mass[I] = links_state.cinr_mass[I]
-            links_state_adjoint_cache.j_pos[I] = links_state.j_pos[I]
-            links_state_adjoint_cache.j_quat[I] = links_state.j_quat[I]
-            links_state_adjoint_cache.cd_vel[I] = links_state.cd_vel[I]
-            links_state_adjoint_cache.cd_ang[I] = links_state.cd_ang[I]
-
-        # joints state
-        ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for I in ti.grouped(ti.ndrange(*joints_state.xanchor.shape)):
-            # xanchor, xaxis
-            joints_state_adjoint_cache.xanchor[I] = joints_state.xanchor[I]
-            joints_state_adjoint_cache.xaxis[I] = joints_state.xaxis[I]
-
-        # geoms state
-        ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for I in ti.grouped(ti.ndrange(*geoms_state.pos.shape)):
-            # pos, quat, verts_updated
-            geoms_state_adjoint_cache.pos[I] = geoms_state.pos[I]
-            geoms_state_adjoint_cache.quat[I] = geoms_state.quat[I]
-            geoms_state_adjoint_cache.verts_updated[I] = geoms_state.verts_updated[I]
+        func_copy_cartesian_space(
+            dofs_state=dofs_state,
+            links_state=links_state,
+            joints_state=joints_state,
+            geoms_state=geoms_state,
+            dofs_state_adjoint_cache=dofs_state_adjoint_cache,
+            links_state_adjoint_cache=links_state_adjoint_cache,
+            joints_state_adjoint_cache=joints_state_adjoint_cache,
+            geoms_state_adjoint_cache=geoms_state_adjoint_cache,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -6846,65 +6782,19 @@ def kernel_begin_backward_substep(
         )
 
         if not static_rigid_sim_config.enable_mujoco_compatibility:
-            # FIXME: Parameter pruning for ndarray is buggy on this one. Inlining this function is "fixing" this issue.
+            # FIXME: Parameter pruning for ndarray is buggy for now and requires match variable and arg names.
             # Save results of [update_cartesian_space] to adjoint cache
-            # func_copy_cartesian_space(
-            #     src_dofs_state=dofs_state,
-            #     src_links_state=links_state,
-            #     src_joints_state=joints_state,
-            #     src_geoms_state=geoms_state,
-            #     dst_dofs_state=dofs_state_adjoint_cache,
-            #     dst_links_state=links_state_adjoint_cache,
-            #     dst_joints_state=joints_state_adjoint_cache,
-            #     dst_geoms_state=geoms_state_adjoint_cache,
-            #     static_rigid_sim_config=static_rigid_sim_config,
-            # )
-
-            ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-            for I in ti.grouped(ti.ndrange(*dofs_state.pos.shape)):
-                # pos, cdof_ang, cdof_vel, cdofvel_ang, cdofvel_vel, cdofd_ang, cdofd_vel
-                dofs_state_adjoint_cache.pos[I] = dofs_state.pos[I]
-                dofs_state_adjoint_cache.cdof_ang[I] = dofs_state.cdof_ang[I]
-                dofs_state_adjoint_cache.cdof_vel[I] = dofs_state.cdof_vel[I]
-                dofs_state_adjoint_cache.cdofvel_ang[I] = dofs_state.cdofvel_ang[I]
-                dofs_state_adjoint_cache.cdofvel_vel[I] = dofs_state.cdofvel_vel[I]
-                dofs_state_adjoint_cache.cdofd_ang[I] = dofs_state.cdofd_ang[I]
-                dofs_state_adjoint_cache.cdofd_vel[I] = dofs_state.cdofd_vel[I]
-
-            # links state
-            ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-            for I in ti.grouped(ti.ndrange(*links_state.pos.shape)):
-                # pos, quat, root_COM, mass_sum, i_pos, i_quat, cinr_inertial, cinr_pos, cinr_quat, cinr_mass, j_pos, j_quat,
-                # cd_vel, cd_ang
-                links_state_adjoint_cache.pos[I] = links_state.pos[I]
-                links_state_adjoint_cache.quat[I] = links_state.quat[I]
-                links_state_adjoint_cache.root_COM[I] = links_state.root_COM[I]
-                links_state_adjoint_cache.mass_sum[I] = links_state.mass_sum[I]
-                links_state_adjoint_cache.i_pos[I] = links_state.i_pos[I]
-                links_state_adjoint_cache.i_quat[I] = links_state.i_quat[I]
-                links_state_adjoint_cache.cinr_inertial[I] = links_state.cinr_inertial[I]
-                links_state_adjoint_cache.cinr_pos[I] = links_state.cinr_pos[I]
-                links_state_adjoint_cache.cinr_quat[I] = links_state.cinr_quat[I]
-                links_state_adjoint_cache.cinr_mass[I] = links_state.cinr_mass[I]
-                links_state_adjoint_cache.j_pos[I] = links_state.j_pos[I]
-                links_state_adjoint_cache.j_quat[I] = links_state.j_quat[I]
-                links_state_adjoint_cache.cd_vel[I] = links_state.cd_vel[I]
-                links_state_adjoint_cache.cd_ang[I] = links_state.cd_ang[I]
-
-            # joints state
-            ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-            for I in ti.grouped(ti.ndrange(*joints_state.xanchor.shape)):
-                # xanchor, xaxis
-                joints_state_adjoint_cache.xanchor[I] = joints_state.xanchor[I]
-                joints_state_adjoint_cache.xaxis[I] = joints_state.xaxis[I]
-
-            # geoms state
-            ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-            for I in ti.grouped(ti.ndrange(*geoms_state.pos.shape)):
-                # pos, quat, verts_updated
-                geoms_state_adjoint_cache.pos[I] = geoms_state.pos[I]
-                geoms_state_adjoint_cache.quat[I] = geoms_state.quat[I]
-                geoms_state_adjoint_cache.verts_updated[I] = geoms_state.verts_updated[I]
+            func_copy_cartesian_space(
+                dofs_state=dofs_state,
+                links_state=links_state,
+                joints_state=joints_state,
+                geoms_state=geoms_state,
+                dofs_state_adjoint_cache=dofs_state_adjoint_cache,
+                links_state_adjoint_cache=links_state_adjoint_cache,
+                joints_state_adjoint_cache=joints_state_adjoint_cache,
+                geoms_state_adjoint_cache=geoms_state_adjoint_cache,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
 
     return is_grad_valid
 
@@ -6931,14 +6821,14 @@ def func_is_grad_valid(
 
 @ti.func
 def func_copy_cartesian_space(
-    src_dofs_state: array_class.DofsState,
-    src_links_state: array_class.LinksState,
-    src_joints_state: array_class.JointsState,
-    src_geoms_state: array_class.GeomsState,
-    dst_dofs_state: array_class.DofsState,
-    dst_links_state: array_class.LinksState,
-    dst_joints_state: array_class.JointsState,
-    dst_geoms_state: array_class.GeomsState,
+    dofs_state: array_class.DofsState,
+    links_state: array_class.LinksState,
+    joints_state: array_class.JointsState,
+    geoms_state: array_class.GeomsState,
+    dofs_state_adjoint_cache: array_class.DofsState,
+    links_state_adjoint_cache: array_class.LinksState,
+    joints_state_adjoint_cache: array_class.JointsState,
+    geoms_state_adjoint_cache: array_class.GeomsState,
     static_rigid_sim_config: ti.template(),
 ):
     # Copy outputs of [kernel_update_cartesian_space] among [dofs, links, joints, geoms] states. This is used to restore
@@ -6946,50 +6836,50 @@ def func_copy_cartesian_space(
 
     # dofs state
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for I in ti.grouped(ti.ndrange(*src_dofs_state.pos.shape)):
+    for I in ti.grouped(ti.ndrange(*dofs_state.pos.shape)):
         # pos, cdof_ang, cdof_vel, cdofvel_ang, cdofvel_vel, cdofd_ang, cdofd_vel
-        dst_dofs_state.pos[I] = src_dofs_state.pos[I]
-        dst_dofs_state.cdof_ang[I] = src_dofs_state.cdof_ang[I]
-        dst_dofs_state.cdof_vel[I] = src_dofs_state.cdof_vel[I]
-        dst_dofs_state.cdofvel_ang[I] = src_dofs_state.cdofvel_ang[I]
-        dst_dofs_state.cdofvel_vel[I] = src_dofs_state.cdofvel_vel[I]
-        dst_dofs_state.cdofd_ang[I] = src_dofs_state.cdofd_ang[I]
-        dst_dofs_state.cdofd_vel[I] = src_dofs_state.cdofd_vel[I]
+        dofs_state_adjoint_cache.pos[I] = dofs_state.pos[I]
+        dofs_state_adjoint_cache.cdof_ang[I] = dofs_state.cdof_ang[I]
+        dofs_state_adjoint_cache.cdof_vel[I] = dofs_state.cdof_vel[I]
+        dofs_state_adjoint_cache.cdofvel_ang[I] = dofs_state.cdofvel_ang[I]
+        dofs_state_adjoint_cache.cdofvel_vel[I] = dofs_state.cdofvel_vel[I]
+        dofs_state_adjoint_cache.cdofd_ang[I] = dofs_state.cdofd_ang[I]
+        dofs_state_adjoint_cache.cdofd_vel[I] = dofs_state.cdofd_vel[I]
 
     # links state
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for I in ti.grouped(ti.ndrange(*src_links_state.pos.shape)):
+    for I in ti.grouped(ti.ndrange(*links_state.pos.shape)):
         # pos, quat, root_COM, mass_sum, i_pos, i_quat, cinr_inertial, cinr_pos, cinr_quat, cinr_mass, j_pos, j_quat,
         # cd_vel, cd_ang
-        dst_links_state.pos[I] = src_links_state.pos[I]
-        dst_links_state.quat[I] = src_links_state.quat[I]
-        dst_links_state.root_COM[I] = src_links_state.root_COM[I]
-        dst_links_state.mass_sum[I] = src_links_state.mass_sum[I]
-        dst_links_state.i_pos[I] = src_links_state.i_pos[I]
-        dst_links_state.i_quat[I] = src_links_state.i_quat[I]
-        dst_links_state.cinr_inertial[I] = src_links_state.cinr_inertial[I]
-        dst_links_state.cinr_pos[I] = src_links_state.cinr_pos[I]
-        dst_links_state.cinr_quat[I] = src_links_state.cinr_quat[I]
-        dst_links_state.cinr_mass[I] = src_links_state.cinr_mass[I]
-        dst_links_state.j_pos[I] = src_links_state.j_pos[I]
-        dst_links_state.j_quat[I] = src_links_state.j_quat[I]
-        dst_links_state.cd_vel[I] = src_links_state.cd_vel[I]
-        dst_links_state.cd_ang[I] = src_links_state.cd_ang[I]
+        links_state_adjoint_cache.pos[I] = links_state.pos[I]
+        links_state_adjoint_cache.quat[I] = links_state.quat[I]
+        links_state_adjoint_cache.root_COM[I] = links_state.root_COM[I]
+        links_state_adjoint_cache.mass_sum[I] = links_state.mass_sum[I]
+        links_state_adjoint_cache.i_pos[I] = links_state.i_pos[I]
+        links_state_adjoint_cache.i_quat[I] = links_state.i_quat[I]
+        links_state_adjoint_cache.cinr_inertial[I] = links_state.cinr_inertial[I]
+        links_state_adjoint_cache.cinr_pos[I] = links_state.cinr_pos[I]
+        links_state_adjoint_cache.cinr_quat[I] = links_state.cinr_quat[I]
+        links_state_adjoint_cache.cinr_mass[I] = links_state.cinr_mass[I]
+        links_state_adjoint_cache.j_pos[I] = links_state.j_pos[I]
+        links_state_adjoint_cache.j_quat[I] = links_state.j_quat[I]
+        links_state_adjoint_cache.cd_vel[I] = links_state.cd_vel[I]
+        links_state_adjoint_cache.cd_ang[I] = links_state.cd_ang[I]
 
     # joints state
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for I in ti.grouped(ti.ndrange(*src_joints_state.xanchor.shape)):
+    for I in ti.grouped(ti.ndrange(*joints_state.xanchor.shape)):
         # xanchor, xaxis
-        dst_joints_state.xanchor[I] = src_joints_state.xanchor[I]
-        dst_joints_state.xaxis[I] = src_joints_state.xaxis[I]
+        joints_state_adjoint_cache.xanchor[I] = joints_state.xanchor[I]
+        joints_state_adjoint_cache.xaxis[I] = joints_state.xaxis[I]
 
     # geoms state
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for I in ti.grouped(ti.ndrange(*src_geoms_state.pos.shape)):
+    for I in ti.grouped(ti.ndrange(*geoms_state.pos.shape)):
         # pos, quat, verts_updated
-        dst_geoms_state.pos[I] = src_geoms_state.pos[I]
-        dst_geoms_state.quat[I] = src_geoms_state.quat[I]
-        dst_geoms_state.verts_updated[I] = src_geoms_state.verts_updated[I]
+        geoms_state_adjoint_cache.pos[I] = geoms_state.pos[I]
+        geoms_state_adjoint_cache.quat[I] = geoms_state.quat[I]
+        geoms_state_adjoint_cache.verts_updated[I] = geoms_state.verts_updated[I]
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -7103,11 +6993,9 @@ def kernel_update_geoms_render_T(
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_g, i_b in ti.ndrange(n_geoms, _B):
         geom_T = gu.ti_trans_quat_to_T(
-            geoms_state.pos[i_g, i_b] + rigid_global_info.envs_offset[i_b],
-            geoms_state.quat[i_g, i_b],
-            EPS,
+            geoms_state.pos[i_g, i_b] + rigid_global_info.envs_offset[i_b], geoms_state.quat[i_g, i_b], EPS
         )
-        for J in ti.static(ti.grouped(ti.static(ti.ndrange(4, 4)))):
+        for J in ti.static(ti.grouped(ti.ndrange(4, 4))):
             geoms_render_T[(i_g, i_b, *J)] = ti.cast(geom_T[J], ti.float32)
 
 
@@ -7127,9 +7015,7 @@ def kernel_update_vgeoms_render_T(
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_g, i_b in ti.ndrange(n_vgeoms, _B):
         geom_T = gu.ti_trans_quat_to_T(
-            vgeoms_state.pos[i_g, i_b] + rigid_global_info.envs_offset[i_b],
-            vgeoms_state.quat[i_g, i_b],
-            EPS,
+            vgeoms_state.pos[i_g, i_b] + rigid_global_info.envs_offset[i_b], vgeoms_state.quat[i_g, i_b], EPS
         )
         for J in ti.static(ti.grouped(ti.ndrange(4, 4))):
             vgeoms_render_T[(i_g, i_b, *J)] = ti.cast(geom_T[J], ti.float32)
@@ -8051,6 +7937,40 @@ def func_atomic_add_if_backward_3d(
         field[i, j, k] += value
     else:
         field[i, j, k] = field[i, j, k] + value
+
+
+@ti.func
+def func_read_field_if_backward(
+    field: array_class.V_ANNOTATION, i: ti.i32, j: ti.i32, k: ti.i32, value, is_backward: ti.template()
+):
+    return field[i, j, k] if ti.static(is_backward) else value
+
+
+@ti.func
+def func_write_field_if_backward(
+    field: array_class.V_ANNOTATION, i: ti.i32, j: ti.i32, k: ti.i32, value, is_backward: ti.template()
+):
+    if ti.static(is_backward):
+        field[i, j, k] = value
+    return value
+
+
+@ti.func
+def func_write_and_read_field_if_backward(
+    field: array_class.V_ANNOTATION, i: ti.i32, j: ti.i32, k: ti.i32, value, is_backward: ti.template()
+):
+    if ti.static(is_backward):
+        field[i, j, k] = value
+    return field[i, j, k] if ti.static(is_backward) else value
+
+
+@ti.func
+def func_atomic_add_field_if_backward(
+    field: array_class.V_ANNOTATION, i: ti.i32, j: ti.i32, k: ti.i32, value, is_backward: ti.template()
+):
+    if ti.static(is_backward):
+        field[i, j, k] += value
+    return value
 
 
 @ti.func
