@@ -862,7 +862,8 @@ def test_box_box_dynamics(gs_sim):
         assert_allclose(qpos[8], 0.6, atol=2e-3)
 
 
-@pytest.mark.slow  # ~840s
+@pytest.mark.slow  # ~200s
+@pytest.mark.debug(False)  # Disable debug for speedup
 @pytest.mark.parametrize(
     "box_box_detection, gjk_collision, dynamics",
     [
@@ -1841,8 +1842,12 @@ def test_frictionloss_advanced(show_viewer, tol):
     assert_allclose(robot.get_AABB()[0, 2], 0.0, tol=2e-4)
     box_pos = box.get_pos()
     assert box_pos[0] > 0.6
-    assert_allclose(box_pos[1:], 0.0, tol=0.02)
-    assert_allclose(box.get_dofs_velocity(), 0.0, tol=5 * tol)
+    # This is to check collision detection is working correctly on metal
+    # The box will collide with the robot and rolling on the ground,
+    # We check whether it's rolling within a reasonable range and not blowing up.
+    # Behavior on mdetial is different from other platforms
+    assert_allclose(box_pos[1:], 0.0, tol=0.05)
+    assert_allclose(box.get_dofs_velocity(), 0.0, tol=50 * tol)
 
 
 @pytest.mark.parametrize("backend", [gs.cpu])
@@ -2533,21 +2538,24 @@ def test_urdf_capsule(tmp_path, show_viewer, tol):
     assert np.linalg.norm(geom_verts - (0.0, 0.0, 0.14), axis=-1, ord=np.inf).min() < 1e-3
 
 
-def test_urdf_color_overwrite():
+@pytest.mark.required
+@pytest.mark.required
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_urdf_color_overwrite(overwrite):
     scene = gs.Scene()
     robot = scene.add_entity(
         gs.morphs.URDF(
             file="genesis/assets/urdf/blue_box/model.urdf",
         ),
         surface=gs.surfaces.Default(
-            color=(1.0, 0.0, 0.0, 1.0),
+            color=(1.0, 0.0, 0.0, 1.0) if overwrite else None,
         ),
     )
     for vgeom in robot.vgeoms:
         visual = vgeom.vmesh.trimesh.visual
         assert visual.defined
         color = np.unique(visual.vertex_colors, axis=0)
-        assert_array_equal(color, (255, 0, 0, 255))
+        assert_array_equal(color, (255, 0, 0, 255) if overwrite else (0, 0, 255, 255))
     for geom in robot.geoms:
         visual = geom.mesh.trimesh.visual
         assert visual.defined

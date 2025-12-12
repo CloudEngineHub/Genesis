@@ -35,6 +35,9 @@ if TYPE_CHECKING:
     from genesis.engine.scene import Scene
     from genesis.engine.simulator import Simulator
 
+
+IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
+
 # minimum constraint impedance
 IMP_MIN = 0.0001
 # maximum constraint impedance
@@ -1976,7 +1979,10 @@ class RigidSolver(Solver):
             if (
                 (not dofs_mask or isinstance(dofs_mask[0], slice))
                 and isinstance(envs_idx, torch.Tensor)
-                and (velocity is None or (velocity.ndim == 2 and envs_idx.dtype == torch.bool))
+                and (
+                    (velocity is None and (not IS_OLD_TORCH or envs_idx.dtype == torch.bool))
+                    or (velocity.ndim == 2 and envs_idx.dtype == torch.bool)
+                )
             ):
                 dofs_vel = vel[(slice(None), *dofs_mask)]
                 if velocity is None:
@@ -5973,7 +5979,10 @@ def func_torque_and_passive_force(
                                 func_add_safe_backward(
                                     dofs_state.qf_passive,
                                     [dof_start + j_d, i_b],
-                                    -rigid_global_info.qpos[q_start + j_d, i_b] * dofs_info.stiffness[I_d],
+                                    # dofs_state.pos = qpos - qpos0
+                                    # using dofs_state instead of qpos here allows
+                                    # qpos to be pulled into qpos0 instead 0
+                                    -dofs_state.pos[dof_start + j_d, i_b] * dofs_info.stiffness[I_d],
                                     BW,
                                 )
 
