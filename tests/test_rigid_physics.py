@@ -3280,6 +3280,46 @@ def test_data_accessor(n_envs, batched, tol):
 
 
 @pytest.mark.required
+def test_deprecated_properties(caplog):
+    scene = gs.Scene(
+        show_viewer=False,
+        show_FPS=False,
+    )
+    box = scene.add_entity(
+        gs.morphs.Box(
+            size=(1.0, 1.0, 1.0),
+            pos=(0.0, 0.0, 0.0),
+        )
+    )
+    scene.build()
+
+    joint = box.joints[0]
+
+    # Verify introspection doesn't trigger warnings
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        repr(joint)
+        vars(joint)
+    assert len(caplog.records) == 0
+
+    for name_old, name_new in (
+        ("dof_idx", "dofs_idx"),
+        ("dof_idx_local", "dofs_idx_local"),
+        ("q_idx", "qs_idx"),
+        ("q_idx_local", "qs_idx_local"),
+    ):
+        # Make sure that deprecated properties are hidden
+        assert name_old not in dir(joint)
+
+        # Verify deprecated properties emit warnings but work correctly
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            deprecated_value = getattr(joint, name_old)
+        assert len(caplog.records) > 0
+        assert_allclose(deprecated_value, getattr(joint, name_new), tol=gs.EPS)
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("enable_mujoco_compatibility", [True, False])
 def test_getter_vs_state_post_step_consistency(enable_mujoco_compatibility):
     DT = 0.01
@@ -3701,7 +3741,12 @@ def test_joint_get_anchor_pos_and_axis(n_envs):
 @pytest.mark.required
 @pytest.mark.parametrize("is_fixed", [False, True])
 @pytest.mark.parametrize("merge_fixed_links", [False, True])
-def test_merge_entities(is_fixed, merge_fixed_links, show_viewer, tol):
+def test_merge_entities(is_fixed, merge_fixed_links, show_viewer, tol, monkeypatch):
+    # Force parallelism on CPU to trigger any cross-entity race condition
+    if gs.backend == gs.cpu:
+        monkeypatch.setenv("GS_PARA_LEVEL", "2")
+        monkeypatch.setenv("TI_NUM_THREADS", "3")
+
     EULER_OFFSET = (0, 0, 45)
 
     scene = gs.Scene(
@@ -3735,14 +3780,24 @@ def test_merge_entities(is_fixed, merge_fixed_links, show_viewer, tol):
         ),
         vis_mode="collision",
     )
+    tool = scene.add_entity(
+        gs.morphs.Sphere(
+            radius=0.005,
+        ),
+    )
     box = scene.add_entity(
         gs.morphs.Box(
             size=(0.02, 0.02, 0.02),
             pos=(0.3, 0.0, 0.01),
         ),
     )
+    with pytest.raises(gs.GenesisException):
+        franka.attach(hand, "right_finger")
     hand.attach(franka, "attachment")
+    tool.attach(hand, "right_finger")
     scene.build()
+    with pytest.raises(gs.GenesisException):
+        box.attach(hand, "right_finger")
 
     franka.control_dofs_position([-1, 0.8, 1, -2, 1, 0.5, -0.5])
     hand.control_dofs_position([0.04, 0.04])
@@ -3757,3 +3812,5 @@ def test_merge_entities(is_fixed, merge_fixed_links, show_viewer, tol):
         assert torch.linalg.norm(link.get_pos() - attach_link.get_pos(), dim=-1) < 0.08
     if not merge_fixed_links:
         assert_allclose(torch.linalg.norm(hand.links[-1].get_pos() - attach_link.get_pos(), dim=-1), 0.105, tol=tol)
+
+    assert_allclose(tool.get_pos(), hand.get_link("right_finger").get_pos(), tol=gs.EPS)
