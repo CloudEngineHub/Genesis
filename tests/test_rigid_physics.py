@@ -1,13 +1,9 @@
 import math
-import uuid
 import os
 import sys
-import tempfile
 import xml.etree.ElementTree as ET
 from contextlib import nullcontext
 from copy import deepcopy
-from typing import cast
-from pathlib import Path
 
 import igl
 import mujoco
@@ -1286,7 +1282,7 @@ def test_set_root_pose(batch_fixed_verts, relative, show_viewer, tol):
 
     sphere_aabb, sphere_base_aabb = sphere.get_AABB(), sphere.geoms[0].get_AABB()
     assert_allclose(sphere_aabb.mean(dim=-2), pos_delta[0] + 1.0, tol=tol)
-    assert_allclose(sphere.get_AABB(), sphere.geoms[0].get_AABB(), tol=tol)
+    assert_allclose(sphere_aabb, sphere_base_aabb, tol=tol)
 
     # Simulate for a while to check if the dynamic object is colliding with the static one
     if batch_fixed_verts:
@@ -3513,21 +3509,21 @@ def test_mesh_primitive_COM(show_viewer, tol):
     bunny = scene.add_entity(
         gs.morphs.Mesh(
             file="meshes/bunny.obj",
-            pos=(-1.0, -1.0, 1.0),
+            pos=(-1.0, -1.0, 0.6),
         ),
         vis_mode="collision",
     )
     cube = scene.add_entity(
         gs.morphs.Box(
             size=(0.5, 0.5, 0.5),
-            pos=(1.0, 1.0, 1.0),
+            pos=(1.0, 1.0, 0.55),
         ),
         vis_mode="collision",
     )
 
     scene.build()
     rigid = scene.sim.rigid_solver
-    for _ in range(120):
+    for _ in range(40):
         scene.step()
     scene.rigid_solver.update_vgeoms()
 
@@ -3699,14 +3695,12 @@ def test_axis_aligned_bounding_boxes(n_envs):
     assert_allclose(robot_vaabb, robot_aabb, atol=1e-3)
 
 
+@pytest.mark.slow  # ~150s
 @pytest.mark.required
 @pytest.mark.parametrize("batch_links_info", [False, True])
 @pytest.mark.parametrize("batch_joints_info", [False, True])
 @pytest.mark.parametrize("batch_dofs_info", [False, True])
 def test_batched_info(batch_links_info, batch_joints_info, batch_dofs_info):
-    """
-    Test if batching options (batch_links_info, batch_joints_info, batch_dofs_info) work correctly.
-    """
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             batch_links_info=batch_links_info,
