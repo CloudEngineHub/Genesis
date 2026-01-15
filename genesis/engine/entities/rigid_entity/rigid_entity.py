@@ -1,8 +1,8 @@
+import inspect
 from copy import copy
 from itertools import chain
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Any
 from functools import wraps
-import inspect
 
 import gstaichi as ti
 import numpy as np
@@ -164,6 +164,8 @@ class RigidEntity(Entity):
             n_dofs = 6
             init_qpos = np.concatenate([morph.pos, morph.quat])
 
+        metadata: dict[str, Any] = {"texture_path": None}
+
         if isinstance(morph, gs.options.morphs.Box):
             extents = np.array(morph.size)
             tmesh = mu.create_box(extents=extents)
@@ -171,27 +173,29 @@ class RigidEntity(Entity):
             geom_data = extents
             geom_type = gs.GEOM_TYPE.BOX
             link_name_prefix = "box"
-
         elif isinstance(morph, gs.options.morphs.Sphere):
             tmesh = mu.create_sphere(radius=morph.radius)
             cmesh = tmesh
             geom_data = np.array([morph.radius])
             geom_type = gs.GEOM_TYPE.SPHERE
             link_name_prefix = "sphere"
-
         elif isinstance(morph, gs.options.morphs.Cylinder):
             tmesh = mu.create_cylinder(radius=morph.radius, height=morph.height)
             cmesh = tmesh
             geom_data = None
             geom_type = gs.GEOM_TYPE.MESH
             link_name_prefix = "cylinder"
-
         elif isinstance(morph, gs.options.morphs.Plane):
-            tmesh, cmesh = mu.create_plane(normal=morph.normal, plane_size=morph.plane_size, tile_size=morph.tile_size)
+            metadata["texture_path"] = mu.DEFAULT_PLANE_TEXTURE_PATH
+            tmesh, cmesh = mu.create_plane(
+                normal=morph.normal,
+                plane_size=morph.plane_size,
+                tile_size=morph.tile_size,
+                color_or_texture=metadata["texture_path"],
+            )
             geom_data = np.array(morph.normal)
             geom_type = gs.GEOM_TYPE.PLANE
             link_name_prefix = "plane"
-
         else:
             gs.raise_exception("Unsupported primitive shape")
 
@@ -202,7 +206,7 @@ class RigidEntity(Entity):
                 dict(
                     contype=0,
                     conaffinity=0,
-                    vmesh=gs.Mesh.from_trimesh(tmesh, surface=surface),
+                    vmesh=gs.Mesh.from_trimesh(tmesh, surface=surface, metadata=metadata),
                 )
             )
         if (morph.contype or morph.conaffinity) and morph.collision:
@@ -2800,7 +2804,7 @@ class RigidEntity(Entity):
         contact_info : dict
             The contact information.
         """
-        contacts_info = self._solver.collider.get_contacts(as_tensor=True, to_torch=True)
+        contact_data = self._solver.collider.get_contacts(as_tensor=True, to_torch=True)
 
         logical_operation = torch.logical_xor if exclude_self_contact else torch.logical_or
         if with_entity is not None and self.idx == with_entity.idx:
@@ -2810,12 +2814,12 @@ class RigidEntity(Entity):
 
         valid_mask = logical_operation(
             torch.logical_and(
-                contacts_info["geom_a"] >= self.geom_start,
-                contacts_info["geom_a"] < self.geom_end,
+                contact_data["geom_a"] >= self.geom_start,
+                contact_data["geom_a"] < self.geom_end,
             ),
             torch.logical_and(
-                contacts_info["geom_b"] >= self.geom_start,
-                contacts_info["geom_b"] < self.geom_end,
+                contact_data["geom_b"] >= self.geom_start,
+                contact_data["geom_b"] < self.geom_end,
             ),
         )
         if with_entity is not None and self.idx != with_entity.idx:
@@ -2823,26 +2827,26 @@ class RigidEntity(Entity):
                 valid_mask,
                 torch.logical_or(
                     torch.logical_and(
-                        contacts_info["geom_a"] >= with_entity.geom_start,
-                        contacts_info["geom_a"] < with_entity.geom_end,
+                        contact_data["geom_a"] >= with_entity.geom_start,
+                        contact_data["geom_a"] < with_entity.geom_end,
                     ),
                     torch.logical_and(
-                        contacts_info["geom_b"] >= with_entity.geom_start,
-                        contacts_info["geom_b"] < with_entity.geom_end,
+                        contact_data["geom_b"] >= with_entity.geom_start,
+                        contact_data["geom_b"] < with_entity.geom_end,
                     ),
                 ),
             )
 
         if self._solver.n_envs == 0:
-            contacts_info = {key: value[valid_mask] for key, value in contacts_info.items()}
+            contact_data = {key: value[valid_mask] for key, value in contact_data.items()}
         else:
-            contacts_info["valid_mask"] = valid_mask
+            contact_data["valid_mask"] = valid_mask
 
-        contacts_info["force_a"] = -contacts_info["force"]
-        contacts_info["force_b"] = +contacts_info["force"]
-        del contacts_info["force"]
+        contact_data["force_a"] = -contact_data["force"]
+        contact_data["force_b"] = +contact_data["force"]
+        del contact_data["force"]
 
-        return contacts_info
+        return contact_data
 
     def get_links_net_contact_force(self, envs_idx=None):
         """
