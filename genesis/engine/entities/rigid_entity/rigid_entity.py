@@ -31,7 +31,7 @@ from .rigid_link import RigidLink
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
-    from genesis.engine.solvers.rigid.rigid_solver_decomp import RigidSolver
+    from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
 
 
 # Wrapper to track the arguments of a function and save them in the target buffer
@@ -169,13 +169,13 @@ class RigidEntity(Entity):
 
         self._free_verts_idx_local = torch.tensor([], dtype=gs.tc_int, device=gs.device)
         self._fixed_verts_idx_local = torch.tensor([], dtype=gs.tc_int, device=gs.device)
-        self._base_links_idx_ = torch.tensor([self.base_link_idx], dtype=gs.tc_int, device=gs.device)
 
         self._batch_fixed_verts = morph.batch_fixed_verts
 
         self._visualize_contact: bool = visualize_contact
 
         self._is_built: bool = False
+        self._is_attached: bool = False
 
         # Heterogeneous simulation support (convert None to [] for consistency)
         self._morph_heterogeneous = morph_heterogeneous if morph_heterogeneous is not None else []
@@ -1118,6 +1118,9 @@ class RigidEntity(Entity):
             The name of the link in the parent entity to be linked. Default to the latest link the parent kinematic
             tree.
         """
+        if self._is_attached:
+            gs.raise_exception("Entity already attached.")
+
         if not isinstance(parent_entity, RigidEntity):
             gs.raise_exception("Parent entity must derive from 'RigidEntity'.")
 
@@ -1174,6 +1177,8 @@ class RigidEntity(Entity):
 
             # Must invalidate invweight for all child links and joints
             link._invweight = None
+
+        self._is_attached = True
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- Jacobian & IK ------------------------------------
@@ -1748,7 +1753,7 @@ class RigidEntity(Entity):
         # run FK
         ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
         for i_b_ in range(envs_idx.shape[0]):
-            gs.engine.solvers.rigid.rigid_solver_decomp.func_forward_kinematics_entity(
+            gs.engine.solvers.rigid.rigid_solver.func_forward_kinematics_entity(
                 self._idx_in_solver,
                 envs_idx[i_b_],
                 links_state,
@@ -1778,7 +1783,7 @@ class RigidEntity(Entity):
         # run FK
         ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
         for i_b_ in range(envs_idx.shape[0]):
-            gs.engine.solvers.rigid.rigid_solver_decomp.func_forward_kinematics_entity(
+            gs.engine.solvers.rigid.rigid_solver.func_forward_kinematics_entity(
                 self._idx_in_solver,
                 envs_idx[i_b_],
                 links_state,
@@ -2451,18 +2456,16 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
+        # Throw exception in entity no longer has a "true" base link becaused it has attached
+        if self._is_attached:
+            gs.raise_exception("Impossible to set position of an entity that has been attached.")
         if zero_velocity:
             self.zero_all_dofs_velocity(envs_idx=envs_idx, skip_forward=True)
-        self._solver.set_base_links_pos(pos, self._base_links_idx_, envs_idx, relative=relative)
+        self._solver.set_base_links_pos(pos, self.base_link_idx, envs_idx, relative=relative)
 
     @gs.assert_built
     def set_pos_grad(self, envs_idx, relative, pos_grad):
-        self._solver.set_base_links_pos_grad(
-            self._base_links_idx_,
-            envs_idx,
-            relative,
-            pos_grad.data,
-        )
+        self._solver.set_base_links_pos_grad(self.base_link_idx, envs_idx, relative, pos_grad.data)
 
     @gs.assert_built
     @tracked
@@ -2483,18 +2486,15 @@ class RigidEntity(Entity):
         envs_idx : None | array_like, optional
             The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
+        if self._is_attached:
+            gs.raise_exception("Impossible to set position of an entity that has been attached.")
         if zero_velocity:
             self.zero_all_dofs_velocity(envs_idx=envs_idx, skip_forward=True)
-        self._solver.set_base_links_quat(quat, self._base_links_idx_, envs_idx, relative=relative)
+        self._solver.set_base_links_quat(quat, self.base_link_idx, envs_idx, relative=relative)
 
     @gs.assert_built
     def set_quat_grad(self, envs_idx, relative, quat_grad):
-        self._solver.set_base_links_quat_grad(
-            self._base_links_idx_,
-            envs_idx,
-            relative,
-            quat_grad.data,
-        )
+        self._solver.set_base_links_quat_grad(self.base_link_idx, envs_idx, relative, quat_grad.data)
 
     @gs.assert_built
     def get_verts(self):
@@ -3269,6 +3269,13 @@ class RigidEntity(Entity):
         return self._is_built
 
     @property
+    def is_attached(self):
+        """
+        Whether this rigid entity has already been attached to another one.
+        """
+        return self._is_attached
+
+    @property
     def visualize_contact(self):
         """Whether to visualize contact force."""
         return self._visualize_contact
@@ -3609,7 +3616,7 @@ def kernel_rigid_entity_inverse_kinematics(
         for i_sample in range(max_samples):
             for _ in range(max_solver_iters):
                 # run FK to update link states using current q
-                gs.engine.solvers.rigid.rigid_solver_decomp.func_forward_kinematics_entity(
+                gs.engine.solvers.rigid.rigid_solver.func_forward_kinematics_entity(
                     rigid_entity._idx_in_solver,
                     i_b,
                     links_state,
@@ -3723,7 +3730,7 @@ def kernel_rigid_entity_inverse_kinematics(
                     )
 
                 # update q
-                gs.engine.solvers.rigid.rigid_solver_decomp.func_integrate_dq_entity(
+                gs.engine.solvers.rigid.rigid_solver.func_integrate_dq_entity(
                     rigid_entity._IK_delta_qpos,
                     rigid_entity._idx_in_solver,
                     i_b,
@@ -3738,7 +3745,7 @@ def kernel_rigid_entity_inverse_kinematics(
 
             if not solved:
                 # re-compute final error if exited not due to solved
-                gs.engine.solvers.rigid.rigid_solver_decomp.func_forward_kinematics_entity(
+                gs.engine.solvers.rigid.rigid_solver.func_forward_kinematics_entity(
                     rigid_entity._idx_in_solver,
                     i_b,
                     links_state,
@@ -3838,7 +3845,7 @@ def kernel_rigid_entity_inverse_kinematics(
         # restore original qpos and link state
         for i_q in range(rigid_entity.n_qs):
             rigid_global_info.qpos[i_q + rigid_entity._q_start, i_b] = rigid_entity._IK_qpos_orig[i_q, i_b]
-        gs.engine.solvers.rigid.rigid_solver_decomp.func_forward_kinematics_entity(
+        gs.engine.solvers.rigid.rigid_solver.func_forward_kinematics_entity(
             rigid_entity._idx_in_solver,
             i_b,
             links_state,

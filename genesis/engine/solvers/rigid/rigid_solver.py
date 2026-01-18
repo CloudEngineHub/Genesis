@@ -21,18 +21,19 @@ from genesis.utils.misc import (
     sanitize_indexed_tensor,
     assign_indexed_tensor,
 )
-from genesis.utils.sdf_decomp import SDF
+from genesis.utils.sdf import SDF
 
 from ..base_solver import Solver
-from .collider_decomp import Collider
-from .constraint_solver_decomp import ConstraintSolver
-from .constraint_solver_decomp_island import ConstraintSolverIsland
-from .rigid_solver_decomp_util import func_wakeup_entity_and_its_temp_island
+from .collider import Collider
+from .constraint_solver import ConstraintSolver
+from .constraint_solver_island import ConstraintSolverIsland
+from .rigid_solver_util import func_wakeup_entity_and_its_temp_island
 
 if TYPE_CHECKING:
     import genesis.engine.solvers.rigid.array_class
     from genesis.engine.scene import Scene
     from genesis.engine.simulator import Simulator
+    from genesis.engine.entities.rigid_entity import RigidJoint, RigidLink, RigidGeom, RigidVisGeom
 
 
 IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
@@ -2691,25 +2692,25 @@ class RigidSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     @property
-    def links(self):
+    def links(self) -> list["RigidLink"]:
         if self.is_built:
             return self._links
         return gs.List(link for entity in self._entities for link in entity.links)
 
     @property
-    def joints(self):
+    def joints(self) -> list["RigidJoint"]:
         if self.is_built:
             return self._joints
         return gs.List(joint for entity in self._entities for joint in entity.joints)
 
     @property
-    def geoms(self):
+    def geoms(self) -> list["RigidGeom"]:
         if self.is_built:
             return self._geoms
         return gs.List(geom for entity in self._entities for geom in entity.geoms)
 
     @property
-    def vgeoms(self):
+    def vgeoms(self) -> list["RigidVisGeom"]:
         if self.is_built:
             return self._vgeoms
         return gs.List(vgeom for entity in self._entities for vgeom in entity.vgeoms)
@@ -8487,3 +8488,8 @@ def func_write_and_read_field_if(field: array_class.V_ANNOTATION, I, value, cond
 def func_check_index_range(idx: ti.i32, min: ti.i32, max: ti.i32, cond: ti.template()):
     # Conditionally check if the index is in the range [min, max) to save computational cost
     return (idx >= min and idx < max) if ti.static(cond) else True
+
+
+from genesis.utils.deprecated_module_wrapper import create_virtual_deprecated_module
+
+create_virtual_deprecated_module(__name__, "genesis.engine.solvers.rigid.rigid_solver_decomp")
