@@ -6,16 +6,16 @@ import sys
 import time
 
 import numpy as np
-import OpenGL.error
-import pyglet
 import pytest
 import torch
 
 import genesis as gs
 import genesis.utils.geom as gu
+from genesis.options.sensors import RasterizerCameraOptions
 from genesis.utils import set_random_seed
 from genesis.utils.image_exporter import FrameImageExporter, as_grayscale_image
 from genesis.utils.misc import tensor_to_array
+from genesis.vis.keybindings import Key
 
 from .conftest import IS_INTERACTIVE_VIEWER_AVAILABLE
 from .utils import assert_allclose, assert_array_equal, get_hf_dataset, rgb_array_to_png_bytes
@@ -1203,7 +1203,7 @@ def test_interactive_viewer_key_press(tmp_path, monkeypatch, renderer, png_snaps
     assert pyrender_viewer.is_active
 
     # Try saving the current frame
-    pyrender_viewer.dispatch_event("on_key_press", pyglet.window.key.S, 0)
+    pyrender_viewer.dispatch_event("on_key_press", Key.S, 0)
 
     # Waiting for request completion
     if pyrender_viewer.run_in_thread:
@@ -1218,7 +1218,9 @@ def test_interactive_viewer_key_press(tmp_path, monkeypatch, renderer, png_snaps
         pyrender_viewer.dispatch_pending_events()
         pyrender_viewer.dispatch_events()
 
-    # Skip the rest of the test if necessary
+    # Skip the rest of the test if necessary.
+    # Similarly, 'glBlitFramebuffer(..., GL_DEPTH_BUFFER_BIT, GL_NEAREST)' involved in offscreen rendering of depth map
+    # with interactive viewer enabled takes ages on old CPU-based Mesa rendering driver (~15000s).
     if sys.platform == "linux":
         glinfo = pyrender_viewer.context.get_info()
         renderer = glinfo.get_renderer()
@@ -1609,3 +1611,41 @@ def test_deformable_uv_textures(renderer_type, renderer, backend, show_viewer, p
 
     # Snapshot test for visual regression
     assert rgb_array_to_png_bytes(rgb_arr) == png_snapshot
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
+@pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason="Interactive viewer not supported on this platform.")
+def test_rasterizer_camera_sensor_with_viewer(renderer):
+    """Test that RasterizerCameraSensor works correctly when interactive viewer is enabled.
+
+    This verifies that the sensor properly shares the viewer's OpenGL context instead of
+    creating a conflicting separate context.
+    """
+    CAM_RES = (128, 64)
+
+    scene = gs.Scene(
+        viewer_options=gs.options.ViewerOptions(
+            res=CAM_RES,
+            run_in_thread=False,
+        ),
+        renderer=renderer,
+        show_viewer=True,
+    )
+    # At least one entity is needed to ensure the rendered image is not entirely blank,
+    # otherwise it is not possible to verify that something was actually rendered.
+    scene.add_entity(morph=gs.morphs.Plane())
+    camera_sensor = scene.add_sensor(
+        RasterizerCameraOptions(
+            res=CAM_RES,
+        )
+    )
+    scene.build()
+
+    pyrender_viewer = scene.visualizer.viewer._pyrender_viewer
+    assert pyrender_viewer.is_active
+
+    scene.step()
+
+    data = camera_sensor.read()
+    assert data.rgb.float().std() > 1.0, "RGB std too low, image may be blank"
