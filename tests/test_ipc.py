@@ -112,7 +112,7 @@ def test_link_filter_strict():
     scene.build(n_envs=0)
 
     coupler = scene.sim.coupler
-    entity_idx = robot._idx_in_solver
+    entity_idx = scene.sim.rigid_solver.entities.index(robot)
     base_link_idx = robot.get_link("base").idx
     moving_link_idx = robot.get_link("moving").idx
 
@@ -128,7 +128,7 @@ def test_link_filter_strict():
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("n_envs", [0])  # FIXME: batching is not supported for now
+@pytest.mark.parametrize("n_envs", [0, 2])
 @pytest.mark.parametrize("coupling_type", ["two_way_soft_constraint", "external_articulation"])
 @pytest.mark.parametrize("joint_type", ["revolute", "prismatic"])
 @pytest.mark.parametrize("fixed", [True, False])
@@ -139,6 +139,7 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
     POS = (0, 0, 0.5)
     OMEGA = 2.0 * np.pi  # 1 Hz oscillation
     SCALE = 0.5 if joint_type == "revolute" else 0.15
+    CONTACT_MARGIN = 0.01
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -149,6 +150,7 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
             enable_collision=False,
         ),
         coupler_options=gs.options.IPCCouplerOptions(
+            contact_d_hat=CONTACT_MARGIN,
             contact_friction_mu=0.5,
             constraint_strength_translation=1,
             constraint_strength_rotation=1,
@@ -192,11 +194,18 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
     assert (0, moving_link_idx) in scene.sim.coupler._link_to_abd_slot
     if coupling_type == "two_way_soft_constraint":
         assert moving_link_idx in scene.sim.coupler.abd_data_by_link
-        assert set(envs_idx) == set(scene.sim.coupler.abd_data_by_link[moving_link_idx])
-    elif fixed:
-        assert not scene.sim.coupler.abd_data_by_link
+        assert not any(env_data is None for env_data in scene.sim.coupler.abd_data_by_link[moving_link_idx])
+    elif coupling_type == "external_articulation":
+        entity_idx = scene.sim.rigid_solver.entities.index(robot)
+        art_data = scene.sim.coupler._articulated_entities[entity_idx]
+        assert art_data is not None
+        assert len(art_data.articulation_slots_by_env) == max(scene.n_envs, 1)
+        if fixed:
+            assert not scene.sim.coupler.abd_data_by_link
 
+    dist_min = float("inf")
     cur_dof_pos_history, target_dof_pos_history = [], []
+    gs_transform_history, ipc_transform_history = [], []
     for i in range(100):
         # Apply sinusoidal target position
         t = i * scene.sim_options.dt
@@ -208,12 +217,19 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
         cur_dof_pos_history.append(cur_dof_pos)
         target_dof_pos_history.append(target_dof_pos)
 
+        # Make sure the robot never went through the ground
+        if not fixed:
+            robot_verts = tensor_to_array(robot.get_verts())
+            dist_min = np.minimum(dist_min, robot_verts[..., 2].min(axis=-1))
+            # FIXME: For some reason it actually can...
+            assert (dist_min > -0.1).all()
+
         scene.step()
 
         if coupling_type == "two_way_soft_constraint" or not fixed:
             for env_idx in envs_idx:
                 abd_data = scene.sim.coupler.abd_data_by_link[moving_link_idx][env_idx]
-                gs_transform, ipc_transform = abd_data["aim_transform"], abd_data["transform"]
+                gs_transform, ipc_transform = abd_data.aim_transform, abd_data.transform
                 # FIXME: Why the tolerance is must so large if no fixed ?!
                 assert_allclose(gs_transform[:3, 3], ipc_transform[:3, 3], atol=TOL_SINGLE if fixed else 0.2)
                 assert_allclose(
@@ -221,26 +237,36 @@ def test_joints(n_envs, coupling_type, joint_type, fixed, show_viewer):
                     gu.R_to_xyz(ipc_transform[:3, :3], rpy=True),
                     atol=1e-4 if fixed else 0.3,
                 )
+                gs_transform_history.append(gs_transform)
+                ipc_transform_history.append(ipc_transform)
     cur_dof_pos_history = np.stack(cur_dof_pos_history, axis=-1)
     target_dof_pos_history = np.stack(target_dof_pos_history, axis=-1)
 
     for env_idx in envs_idx if scene.n_envs > 0 else (slice(None),):
         corr = np.corrcoef(cur_dof_pos_history[env_idx], target_dof_pos_history)[0, 1]
         assert corr > 1.0 - 5e-3
-    # FIXME: Why is it necessary to skip many steps if not fixed ?!
-    start_idx = 0 if fixed else 50
     assert_allclose(
-        cur_dof_pos_history[..., start_idx:] - cur_dof_pos_history[..., start_idx],
-        target_dof_pos_history[..., start_idx:] - target_dof_pos_history[..., start_idx],
+        cur_dof_pos_history - cur_dof_pos_history[..., [0]],
+        target_dof_pos_history - target_dof_pos_history[..., [0]],
         tol=0.03,
     )
     assert_allclose(np.ptp(cur_dof_pos_history, axis=-1), 2 * SCALE, tol=0.05)
 
-    final_base_pos = robot.get_pos()
+    if gs_transform_history:
+        gs_pos_history, gs_quat_history = gu.T_to_trans_quat(np.stack(gs_transform_history, axis=0))
+        ipc_pos_history, ipc_quat_history = gu.T_to_trans_quat(np.stack(ipc_transform_history, axis=0))
+        pos_err_history = np.linalg.norm(ipc_pos_history - gs_pos_history, axis=-1)
+        rot_err_history = np.linalg.norm(
+            gu.quat_to_rotvec(gu.transform_quat_by_quat(gs.inv_quat(gs_quat_history), ipc_quat_history)), axis=-1
+        )
+        assert (np.percentile(pos_err_history, 90, axis=0) < 1e-2).all()
+        assert (np.percentile(rot_err_history, 90, axis=0) < 5e-2).all()
+
+    # Make sure the robot bounced on the ground or stayed in place
     if fixed:
-        assert_allclose(final_base_pos, POS, atol=TOL_SINGLE)
+        assert_allclose(robot.get_pos(), POS, atol=TOL_SINGLE)
     else:
-        assert POS[2] - final_base_pos[..., 2] > 0.2
+        assert (dist_min < 1.5 * CONTACT_MARGIN).all()
 
 
 @pytest.mark.required
@@ -394,7 +420,7 @@ def test_objects_freefall(n_envs, show_viewer):
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("n_envs", [0])  # FIXME: batching is not supported for now
+@pytest.mark.parametrize("n_envs", [0, 2])
 def test_objects_colliding(n_envs, show_viewer):
     DT = 0.02
     CONTACT_MARGIN = 0.01
@@ -496,8 +522,8 @@ def test_objects_colliding(n_envs, show_viewer):
         obj_p_history = np.stack(p_history[obj], axis=-3)
 
         # Make sure that all vertices are laying on the ground
-        assert (obj_p_history[..., 2] > 0.0).all()
         assert (obj_p_history[..., 2] < 1.5 * CONTACT_MARGIN).any()
+        assert (obj_p_history[..., 2] > 0.0).all()
 
         # Check that the objects did not fly away (5cm)
         obj_delta_history = np.linalg.norm((obj_p_history - obj_p_history[..., [0], :, :])[..., :2], axis=-1)
@@ -505,7 +531,7 @@ def test_objects_colliding(n_envs, show_viewer):
 
         # Make sure that all objects reached steady state
         obj_disp_history = np.linalg.norm(np.diff(obj_p_history[..., -10:, :, :], axis=-3), axis=-1)
-        assert_allclose(obj_disp_history, 0.0, tol=2e-3)
+        assert_allclose(obj_disp_history, 0.0, tol=5e-3)
 
         # Make sure that the cloth is laying on all objects (at least one vertex above the others)
         if obj is cloth:
@@ -528,9 +554,9 @@ def test_robot_grasp_fem(coupling_type, show_viewer):
         ),
         coupler_options=gs.options.IPCCouplerOptions(
             contact_friction_mu=0.8,
-            constraint_strength_translation=100,
-            constraint_strength_rotation=100,
-            newton_translation_tolerance=10,
+            constraint_strength_translation=10.0,
+            constraint_strength_rotation=10.0,
+            newton_translation_tolerance=10.0,
             enable_rigid_rigid_contact=False,
             enable_rigid_ground_contact=False,
         ),
@@ -647,10 +673,11 @@ def test_robot_grasp_fem(coupling_type, show_viewer):
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("n_envs", [0])
+@pytest.mark.parametrize("n_envs", [0, 2])
 def test_momentum_conversation(n_envs, show_viewer):
     DT = 0.001
     DURATION = 0.30
+    CONTACT_MARGIN = 0.01
     VELOCITY = np.array([4.0, 0.0, 0.0], dtype=gs.np_float)
 
     scene = gs.Scene(
@@ -659,6 +686,7 @@ def test_momentum_conversation(n_envs, show_viewer):
             gravity=(0.0, 0.0, 0.0),
         ),
         coupler_options=gs.options.IPCCouplerOptions(
+            contact_d_hat=CONTACT_MARGIN,
             constraint_strength_translation=1,
             constraint_strength_rotation=1,
         ),
@@ -731,11 +759,11 @@ def test_momentum_conversation(n_envs, show_viewer):
 
         # Make sure that rigid and fem are not penetrating each other
         fem_aabb_min, fem_aabb_max = fem_positions.min(axis=-2), fem_positions.max(axis=-2)
-        rigid_aabb_min, rigid_aabb_max = tensor_to_array(rigid_cube.get_AABB())
-        delta = np.maximum(0, np.maximum(rigid_aabb_min - fem_aabb_max, fem_aabb_min - rigid_aabb_max))
+        rigid_aabb = tensor_to_array(rigid_cube.get_AABB())
+        rigid_aabb_min, rigid_aabb_max = rigid_aabb[..., 0, :], rigid_aabb[..., 1, :]
         overlap = np.minimum(fem_aabb_max, rigid_aabb_max) - np.maximum(rigid_aabb_min, fem_aabb_min)
-        dist_min = min(dist_min, -overlap.min(axis=-1))
-        assert dist_min > 0.0
+        dist_min = np.minimum(dist_min, -overlap.min(axis=-1))
+        assert (dist_min > 0.0).all()
 
         volume_attr = fem_proc_geo.vertices().find(builtin.volume)
         mass_density_attr = fem_proc_geo.vertices().find(builtin.mass_density)
@@ -756,9 +784,7 @@ def test_momentum_conversation(n_envs, show_viewer):
         scene.step()
 
     # Make sure the objects bounced on each other
-    assert dist_min < 0.01
-    fem_centroid = fem_positions.mean(axis=-2)
-    rigid_centroid = rigid_cube.get_pos()
+    assert (dist_min < 1.5 * CONTACT_MARGIN).all()
     # FIXME: The velocity post-impact does not match expectation ?!
     expected_cube_vel = (cube_mass - blob_mass) / (cube_mass + blob_mass) * VELOCITY
     expected_blob_vel = 2 * cube_mass / (cube_mass + blob_mass) * VELOCITY

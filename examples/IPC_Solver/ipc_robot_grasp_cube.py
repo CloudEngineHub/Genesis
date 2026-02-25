@@ -7,7 +7,7 @@ import genesis as gs
 
 
 def main():
-    gs.init(backend=gs.gpu, logging_level="info")
+    gs.init(backend=gs.cpu, logging_level="info")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-ipc", action="store_true", default=False)
@@ -24,11 +24,11 @@ def main():
     if not args.no_ipc:
         coupler_options = gs.options.IPCCouplerOptions(
             contact_friction_mu=0.8,
-            constraint_strength_translation=100,
-            constraint_strength_rotation=100,
+            constraint_strength_translation=10.0,
+            constraint_strength_rotation=10.0,
             enable_rigid_rigid_contact=False,
             enable_rigid_ground_contact=False,
-            newton_translation_tolerance=10,
+            newton_translation_tolerance=10.0,
         )
 
     scene = gs.Scene(
@@ -64,7 +64,7 @@ def main():
         )
     else:
         cube_material = gs.materials.Rigid()
-    cube = scene.add_entity(
+    scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.65, 0.0, 0.03),
             size=(0.05, 0.05, 0.05),
