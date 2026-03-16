@@ -1,21 +1,23 @@
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar
 
 import numpy as np
-from pydantic import Field, BeforeValidator, StrictBool, StrictInt, model_validator
+from pydantic import BeforeValidator, Field, StrictBool, StrictInt, model_validator
 
 import genesis as gs
 from genesis.typing import (
-    _is_sequence,
-    UnitIntervalVec3Type,
-    UnitIntervalVec4Type,
     FArrayType,
+    IArrayType,
     LaxVec3FType,
     NonNegativeFloat,
     NonNegativeInt,
     PositiveFloat,
     RotationMatrixType,
+    UnitIntervalVec3Type,
+    UnitIntervalVec4Type,
+    Vec3FArrayType,
     Vec3FType,
     Vec4FType,
+    _is_sequence,
 )
 
 from ..options import Options
@@ -23,6 +25,14 @@ from .raycaster import DepthCameraPattern, RaycastPattern
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
+    from genesis.engine.sensors.base_sensor import Sensor
+    from genesis.engine.sensors.contact_force import ContactForceSensor, ContactSensor
+    from genesis.engine.sensors.imu import IMUSensor
+    from genesis.engine.sensors.proximity import ProximitySensor
+    from genesis.engine.sensors.raycaster import RaycasterSensor
+
+
+SensorT = TypeVar("SensorT", bound="Sensor")
 
 
 if TYPE_CHECKING:
@@ -38,12 +48,13 @@ else:
 CrossCouplingAxisType = RotationMatrixType | UnitIntervalVec3Type | float
 
 
-class SensorOptions(Options):
+class SensorOptions(Options, Generic[SensorT]):
     """
     Base class for all sensor options.
 
     Each sensor should have their own options class that inherits from this class.
-    The options class should be registered with the SensorManager using the @register_sensor decorator.
+    The associated sensor class registers itself via ``Sensor.__init_subclass__`` when parameterized
+    with this options class, e.g. ``class MySensor(Sensor[MyOptions, MyMetadata, MyData]): ...``
 
     Parameters
     ----------
@@ -74,7 +85,7 @@ class SensorOptions(Options):
             )
 
 
-class RigidSensorOptionsMixin(SensorOptions):
+class RigidSensorOptionsMixin(SensorOptions[SensorT]):
     """
     Base options class for sensors that are attached to a RigidEntity.
 
@@ -109,7 +120,7 @@ class RigidSensorOptionsMixin(SensorOptions):
                 gs.raise_exception(f"Invalid RigidLink index {self.link_idx_local} for entity {self.entity_idx}.")
 
 
-class NoisySensorOptionsMixin(SensorOptions):
+class NoisySensorOptionsMixin(SensorOptions[SensorT]):
     """
     Base options class for analog sensors that are attached to a RigidEntity.
 
@@ -146,7 +157,7 @@ class NoisySensorOptionsMixin(SensorOptions):
             gs.raise_exception(f"{type(self).__name__}: Jitter must be less than or equal to read delay.")
 
 
-class Contact(RigidSensorOptionsMixin, SensorOptions):
+class Contact(RigidSensorOptionsMixin["ContactSensor"]):
     """
     Sensor that returns bool based on whether associated RigidLink is in contact.
 
@@ -162,7 +173,7 @@ class Contact(RigidSensorOptionsMixin, SensorOptions):
     debug_color: UnitIntervalVec4Type = (1.0, 0.0, 1.0, 0.5)
 
 
-class ContactForce(RigidSensorOptionsMixin, NoisySensorOptionsMixin):
+class ContactForce(RigidSensorOptionsMixin["ContactForceSensor"], NoisySensorOptionsMixin["ContactForceSensor"]):
     """
     Sensor that returns the total contact force being applied to the associated RigidLink in its local frame.
 
@@ -192,7 +203,7 @@ class ContactForce(RigidSensorOptionsMixin, NoisySensorOptionsMixin):
             gs.raise_exception(f"min_force should be less than max_force, got: {self.min_force} and {self.max_force}")
 
 
-class IMU(RigidSensorOptionsMixin, NoisySensorOptionsMixin):
+class IMU(RigidSensorOptionsMixin["IMUSensor"], NoisySensorOptionsMixin["IMUSensor"]):
     """
     IMU sensor returns the linear acceleration (accelerometer) and angular velocity (gyroscope)
     of the associated entity link.
@@ -289,7 +300,46 @@ class IMU(RigidSensorOptionsMixin, NoisySensorOptionsMixin):
         self.noise = self.acc_noise + self.gyro_noise + self.mag_noise
 
 
-class Raycaster(RigidSensorOptionsMixin):
+class ProximityOptions(RigidSensorOptionsMixin["ProximitySensor"], NoisySensorOptionsMixin["ProximitySensor"]):
+    """
+    Proximity sensor that reports distance and nearest point from probe positions to tracked mesh surfaces.
+
+    Attached to a rigid entity link. Takes a list of local probe positions and a list of global link indices
+    to track; for each probe, outputs the distance and nearest point (world frame) to the closest mesh
+    surface among the tracked links. If no mesh is within max_range, reports max_range and the probe
+    position as nearest point.
+
+    Parameters
+    ----------
+    probe_local_pos : array-like[array-like[float, float, float]]
+        Probe positions in link-local frame. One (x, y, z) per probe.
+    track_link_idx : array-like[int]
+        Global link indices (solver link space) whose mesh geoms are used for distance queries.
+    max_range : float
+        Maximum reporting range in meters. When no mesh is within this distance, distance is
+        clamped to max_range and nearest points is the probe position. Default: 10.0.
+    debug_sphere_radius: float, optional
+        The radius of each debug sphere drawn in the scene. Defaults to 0.008.
+    debug_color: array-like[float, float, float, float], optional
+        The rgba color of the debug sphere. Defaults to (0.2, 0.6, 1.0, 0.6).
+    """
+
+    probe_local_pos: Vec3FArrayType = [(0.0, 0.0, 0.0)]
+    track_link_idx: IArrayType = Field(default_factory=tuple)
+    max_range: PositiveFloat = 10.0
+
+    debug_sphere_radius: PositiveFloat = 0.008
+    debug_color: UnitIntervalVec4Type = (0.2, 0.6, 1.0, 0.6)
+
+    def validate_scene(self, scene: "Scene"):
+        super().validate_scene(scene)
+        n_links = scene.sim.rigid_solver.n_links
+        for i, link_idx in enumerate(self.track_link_idx):
+            if not (0 <= link_idx < n_links):
+                gs.raise_exception(f"ProximityOptions.track_link_idx[{i}]={link_idx} is out of range [0, {n_links}).")
+
+
+class Raycaster(RigidSensorOptionsMixin["RaycasterSensor"]):
     """
     Raycaster sensor that performs ray casting to get distance measurements and point clouds.
 
