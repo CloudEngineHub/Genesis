@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, ClassVar, Generic, Sequence, Type, TypeVar, ge
 from typing_extensions import TypeVar as TypeVarWithDefault
 
 import numpy as np
+import quadrants as qd
 import torch
 
 import genesis as gs
@@ -65,7 +66,7 @@ class SharedSensorMetadata:
 
 SharedSensorMetadataT = TypeVar("SharedSensorMetadataT", bound=SharedSensorMetadata)
 OptionsT = TypeVar("OptionsT", bound="SensorOptions")
-DataT = TypeVarWithDefault("DataT", default=tuple)
+DataT = TypeVarWithDefault("DataT", default=tuple, covariant=True)
 
 
 class Sensor(RBC, Generic[OptionsT, SharedSensorMetadataT, DataT]):
@@ -76,7 +77,7 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorMetadataT, DataT]):
 
     Each concrete sensor class declares its associated options, metadata, and data types via Generic type parameters::
 
-        class MySensor(Sensor[MyOptions, MyMetadata]):
+        class MySensor(Sensor[MyOptions, MyMetadata, MyData]):
             ...  # DataT defaults to tuple; specify explicitly for NamedTuple returns
 
     Note
@@ -104,8 +105,11 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorMetadataT, DataT]):
                 if len(args) >= 3 and not isinstance(args[2], TypeVar):
                     cls._return_data_class = args[2]
                 break
-        # Auto-register if this class defines its own options (not inherited)
+        # Auto-register if this class defines its own options (not inherited).
+        # Enforce that concrete sensor classes also specify the metadata type parameter.
         if "_options_cls" in cls.__dict__:
+            if "_metadata_cls" not in cls.__dict__:
+                raise TypeError(f"{cls.__name__} must specify Sensor[OptionsT, MetadataT, DataT=tuple].")
             from .sensor_manager import SensorManager
 
             SensorManager.SENSOR_TYPES_MAP[cls._options_cls] = cls
@@ -153,7 +157,7 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorMetadataT, DataT]):
         self._shared_metadata.cache_sizes.append(self._cache_size)
 
     @classmethod
-    def reset(cls, shared_metadata: SharedSensorMetadataT, envs_idx):
+    def reset(cls, shared_metadata: SharedSensorMetadataT, shared_ground_truth_cache: torch.Tensor, envs_idx):
         """
         Reset the sensor.
 
@@ -163,6 +167,8 @@ class Sensor(RBC, Generic[OptionsT, SharedSensorMetadataT, DataT]):
         ----------
         shared_metadata : SharedSensorMetadata
             The shared metadata for the sensor class.
+        shared_ground_truth_cache : torch.Tensor
+            The shared ground truth cache for the sensor class.
         envs_idx: array_like
             The indices of the environments to reset. The envs_idx should already be sanitized by SensorManager.
         """
@@ -491,7 +497,8 @@ class NoisySensorMixin(Generic[NoisySensorMetadataMixinT]):
         self._shared_metadata.interpolate.append(self._options.interpolate)
 
     @classmethod
-    def reset(cls, shared_metadata: NoisySensorMetadataMixin, envs_idx):
+    def reset(cls, shared_metadata: NoisySensorMetadataMixin, shared_ground_truth_cache: torch.Tensor, envs_idx):
+        super().reset(shared_metadata, shared_ground_truth_cache, envs_idx)
         shared_metadata.cur_random_walk[envs_idx, ...].fill_(0.0)
 
     @classmethod
