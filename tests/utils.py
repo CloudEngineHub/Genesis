@@ -36,7 +36,7 @@ from genesis.utils.misc import tensor_to_array
 REPOSITY_URL = "Genesis-Embodied-AI/Genesis"
 DEFAULT_BRANCH_NAME = "main"
 
-HUGGINGFACE_ASSETS_REVISION = "152338db51e6aa247eed712ed40e5357e0bf6fd3"
+HUGGINGFACE_ASSETS_REVISION = "573a30599c816a97624f675660868d20e3d3900f"
 HUGGINGFACE_SNAPSHOT_REVISION = "cb24acb2310ae1fa7c8f051cb9f51d88dadfab47"
 
 MESH_EXTENSIONS = (".mtl", *MESH_FORMATS, *GLTF_FORMATS, *USD_FORMATS)
@@ -593,6 +593,7 @@ def build_genesis_sim(
         convexify=True,
         decompose_robot_error_threshold=float("inf"),
         default_armature=None,
+        align=False,
     )
     if xml_path.endswith(".xml"):
         morph = gs.morphs.MJCF(**morph_kwargs)

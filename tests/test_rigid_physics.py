@@ -17,7 +17,7 @@ import genesis.utils.geom as gu
 import genesis.utils.terrain as tu
 from genesis.ext import urdfpy
 from genesis.utils import urdf as uu
-from genesis.utils.misc import get_assets_dir, tensor_to_array, qd_to_numpy, qd_to_torch
+from genesis.utils.misc import get_assets_dir, qd_to_numpy, qd_to_torch, tensor_to_array
 
 from .utils import (
     assert_allclose,
@@ -1004,8 +1004,8 @@ def test_robot_scale_and_dofs_armature(xml_path, tol):
     # It is also a good opportunity to check that it updates 'invweight' and meaninertia accordingly.
     attr_orig = {}
     for scale, robot in zip(ROBOT_SCALES, scene.entities):
-        links_invweight = robot.get_links_invweight().clone()
-        dofs_invweight = robot.get_dofs_invweight().clone()
+        links_invweight = robot.get_links_invweight()
+        dofs_invweight = robot.get_dofs_invweight()
         robot.set_dofs_armature(torch.ones((robot.n_dofs,), dtype=gs.tc_float, device=gs.device))
         assert torch.all(robot.get_dofs_invweight() < 1.0)
         with pytest.raises(AssertionError):
@@ -1013,8 +1013,8 @@ def test_robot_scale_and_dofs_armature(xml_path, tol):
         with pytest.raises(AssertionError):
             assert_allclose(robot.get_links_invweight(), links_invweight, tol=tol)
         robot.set_dofs_armature(torch.zeros((robot.n_dofs,), dtype=gs.tc_float, device=gs.device))
-        links_invweight = robot.get_links_invweight().clone()
-        dofs_invweight = robot.get_dofs_invweight().clone()
+        links_invweight = robot.get_links_invweight()
+        dofs_invweight = robot.get_dofs_invweight()
         qpos = np.random.rand(robot.n_dofs)
         robot.set_dofs_position(qpos)
         robot.set_dofs_armature(torch.zeros((robot.n_dofs,), dtype=gs.tc_float, device=gs.device))
@@ -3680,7 +3680,7 @@ def test_data_accessor(n_envs, batched, tol):
             if is_tuple:
                 datas = [torch.as_tensor(val) for val in datas]
             else:
-                datas = torch.as_tensor(datas)
+                datas = torch.as_tensor(datas, dtype=gs.tc_float)
             datas_tp = datas if is_tuple else (datas,)
             if getter is not None:
                 # Randomly sample new data that are strictly positive and normalized,
@@ -3978,22 +3978,23 @@ def test_contype_conaffinity(show_viewer, tol):
 
 
 @pytest.mark.required
-def test_mesh_primitive_COM(show_viewer, tol):
+def test_mesh_primitive_COM(show_viewer):
     scene = gs.Scene(
         profiling_options=gs.options.ProfilingOptions(
             show_FPS=False,
         ),
         show_viewer=show_viewer,
     )
-    plane = scene.add_entity(
+    scene.add_entity(
         gs.morphs.Plane(),
     )
     bunny = scene.add_entity(
         gs.morphs.Mesh(
             file="meshes/bunny.obj",
-            pos=(-1.0, -1.0, 0.6),
+            pos=(-1.0, -1.0, 0.55),
         ),
         vis_mode="collision",
+        visualize_contact=True,
     )
     cube = scene.add_entity(
         gs.morphs.Box(
@@ -4001,11 +4002,12 @@ def test_mesh_primitive_COM(show_viewer, tol):
             pos=(1.0, 1.0, 0.55),
         ),
         vis_mode="collision",
+        visualize_contact=True,
     )
 
     scene.build()
     rigid = scene.sim.rigid_solver
-    for _ in range(40):
+    for _ in range(50):
         scene.step()
     scene.rigid_solver.update_vgeoms()
 
@@ -4249,7 +4251,7 @@ def test_ellipsoid(xml_path, show_viewer):
 
 
 @pytest.mark.required
-def test_mesh_align(show_viewer):
+def test_mesh_align(show_viewer, tol):
     INIT_POS = (0.0, 0.0, 0.8)
 
     asset_path = get_hf_dataset(pattern="glb/mango.glb")
@@ -4265,18 +4267,23 @@ def test_mesh_align(show_viewer):
         show_viewer=show_viewer,
     )
     scene.add_entity(gs.morphs.Plane())
+    mango_morph = gs.morphs.Mesh(
+        file=f"{asset_path}/glb/mango.glb",
+        scale=0.045,
+        pos=INIT_POS,
+        align=True,
+    )
     mango = scene.add_entity(
-        gs.morphs.Mesh(
-            file=f"{asset_path}/glb/mango.glb",
-            scale=0.045,
-            pos=INIT_POS,
-            align=True,
-        ),
+        mango_morph,
         material=gs.materials.Rigid(
             rho=1000.0,
         ),
         vis_mode="collision",
         visualize_contact=True,
+    )
+    ghost_mango = scene.add_entity(
+        mango_morph,
+        material=gs.materials.Kinematic(),
     )
     scene.build()
 
@@ -4288,17 +4295,75 @@ def test_mesh_align(show_viewer):
     assert_allclose(vgeom.get_quat(), gu.identity_quat(), atol=1e-3)
 
     # With align=True, the link frame is placed at the geometry COM
-    assert_allclose(mango.get_links_pos(ref="link_com"), mango.get_pos(), tol=2e-3)
+    assert_allclose(mango.get_links_pos(ref="link_com"), mango.get_pos(), tol=tol)
     geom_inertia_i = qd_to_numpy(scene.rigid_solver.links_state.cinr_inertial, transpose=True)[0, 1]
     geom_quat = tensor_to_array(mango.get_quat())
-    assert_allclose(gu.R_to_xyz(gu.quat_to_R(geom_quat) @ uu.principal_axes_rot(geom_inertia_i).T), 0.0, tol=0.1)
+    assert_allclose(gu.R_to_xyz(gu.quat_to_R(geom_quat) @ uu.principal_axes_rot(geom_inertia_i).T), 0.0, tol=tol)
+
+    # Same qpos on rigid and kinematic entities must yield matching vAABB
+    qpos = (0.3, -0.2, 1.0, 0.6, 0.5, 0.3, 0.0)
+    mango.set_qpos(qpos)
+    ghost_mango.set_qpos(qpos)
+    assert_allclose(mango.get_vAABB(), ghost_mango.get_vAABB(), tol=gs.EPS)
+    scene.reset()
 
     # Simulate
-    for _ in range(300):
+    for _ in range(400):
         scene.step()
 
     assert_allclose(mango.get_dofs_velocity(), 0, tol=0.05)
     assert (-0.005 < mango.get_AABB()[0, 2] < 0.0).all()
+
+
+@pytest.mark.required
+def test_urdf_align(show_viewer, tol):
+    INIT_POS = (0.0, 0.0, 0.7)
+
+    asset_path = get_hf_dataset(pattern="fork/*")
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.01,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.8, 0.8, 0.6),
+            camera_lookat=(-0.3, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(gs.morphs.Plane())
+    fork_morph = gs.morphs.URDF(
+        file=f"{asset_path}/fork/fork.urdf",
+        pos=INIT_POS,
+    )
+    fork = scene.add_entity(
+        fork_morph,
+        vis_mode="collision",
+        visualize_contact=True,
+    )
+    ghost_fork = scene.add_entity(
+        fork_morph,
+        material=gs.materials.Kinematic(),
+    )
+    scene.build()
+
+    # With align=None (auto-True for basic rigid objects), the link frame origin is at the collision geometry COM
+    assert_allclose(fork.get_links_pos(ref="link_com"), fork.get_pos(), tol=tol)
+
+    # Same qpos on rigid and kinematic entities must yield matching vAABB
+    qpos = (0.3, -0.2, 1.0, 0.6, 0.5, 0.3, 0.0)
+    fork.set_qpos(qpos)
+    ghost_fork.set_qpos(qpos)
+    assert_allclose(fork.get_vAABB(), ghost_fork.get_vAABB(), tol=gs.EPS)
+    scene.reset()
+
+    # Simulate with initial angular velocity to check numerical stability
+    fork.set_dofs_velocity(10.0, dofs_idx_local=slice(3, 6))
+    for _ in range(100):
+        scene.step()
+
+    assert_allclose(fork.get_dofs_velocity(), 0, tol=0.05)
+    assert (-0.002 < fork.get_AABB()[0, 2] < 0.0).all()
 
 
 @pytest.mark.slow  # ~150s
@@ -4618,6 +4683,53 @@ def test_heterogeneous_fewer_envs_than_variants():
 
 
 @pytest.mark.required
+def test_heterogeneous_mass_setters(tol):
+    """Test entity/link mass setters with heterogeneous morphs."""
+    scene = gs.Scene(show_viewer=False)
+    het_obj = scene.add_entity(
+        morph=[
+            gs.morphs.Box(size=(0.01, 0.01, 0.01)),
+            gs.morphs.Box(size=(0.02, 0.02, 0.02)),
+            gs.morphs.Sphere(radius=0.01),
+            gs.morphs.Sphere(radius=0.02),
+        ],
+    )
+    scene.build(n_envs=4)
+
+    link = next(link for link in het_obj.links if not link.is_fixed)
+
+    # Invalid shape should raise before any per-env state is set.
+    with pytest.raises(gs.GenesisException):
+        link.set_mass((1.0, 2.0))
+
+    het_obj.set_mass(1.0)
+    assert_allclose(het_obj.get_mass(), 1.0, tol=tol)
+
+    # Link-level setter should support per-environment mass targets.
+    target_mass = (0.2, 0.4, 0.6, 0.8)
+    link.set_mass(target_mass)
+    assert_allclose(link.get_mass(), target_mass, tol=tol)
+
+
+@pytest.mark.required
+def test_non_batched_mass_setters(tol):
+    """Test link mass setter with non-batched links info (batch_links_info=False)."""
+    scene = gs.Scene(show_viewer=False, rigid_options=gs.options.RigidOptions(batch_links_info=False))
+    obj = scene.add_entity(morph=gs.morphs.Box(size=(0.1, 0.1, 0.1)))
+    scene.build(n_envs=4)
+
+    link = next(link for link in obj.links if not link.is_fixed)
+
+    # Scalar set_mass should work and apply uniformly across all envs.
+    link.set_mass(2.0)
+    assert_allclose(link.get_mass(), 2.0, tol=tol)
+
+    # Per-env array mass should raise a clear exception.
+    with pytest.raises(gs.GenesisException):
+        link.set_mass((1.0, 2.0, 3.0, 4.0))
+
+
+@pytest.mark.required
 def test_heterogeneous_aabb(tol):
     """Test that get_AABB and get_vAABB work correctly with heterogeneous simulation."""
     scene = gs.Scene(show_viewer=False)
@@ -4741,7 +4853,7 @@ def test_pick_heterogenous_objects(show_viewer):
     assert_allclose(gripper_widths, expected_grip_widths, tol=0.005)
 
     # Record positions before lifting
-    pre_lift_z = het_obj.get_pos()[:, 2].clone()
+    pre_lift_z = het_obj.get_pos()[:, 2]
 
     # Lift
     qpos_lift = franka.inverse_kinematics(
