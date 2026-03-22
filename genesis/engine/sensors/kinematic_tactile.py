@@ -518,6 +518,7 @@ def _next_pow2(n: int) -> int:
     return p
 
 
+@torch.jit.script
 def _precompute_dilate_kernel_fft(
     dilate_coeff: float, grid_spacing: tuple[float, float], fft_n: tuple[int, int]
 ) -> torch.Tensor:
@@ -949,6 +950,7 @@ class KinematicContactProbe(
 
         shared_ground_truth_cache.zero_()
 
+        output = shared_ground_truth_cache.contiguous()
         _kernel_kinematic_contact_probe(
             shared_metadata.probe_positions,
             shared_metadata.probe_normals,
@@ -970,8 +972,10 @@ class KinematicContactProbe(
             solver.verts_info,
             solver.faces_info,
             gs.EPS,
-            shared_ground_truth_cache,
+            output,
         )
+        if not shared_ground_truth_cache.is_contiguous():
+            shared_ground_truth_cache.copy_(output)
 
     def _draw_debug(self, context: "RasterizerContext", buffer_updates: dict[str, np.ndarray]):
         self._draw_debug_probes(context, lambda data: data.penetration)
@@ -1098,6 +1102,7 @@ class ElastomerDisplacementSensor(
     ):
         solver = shared_metadata.solver
 
+        output = shared_ground_truth_cache.contiguous()
         _kernel_elastomer_displacement(
             shared_metadata.is_grid,
             shared_metadata.probe_positions,
@@ -1123,7 +1128,7 @@ class ElastomerDisplacementSensor(
             shared_metadata.contact_buf,
             shared_metadata.contact_link_buf,
             gs.EPS,
-            shared_ground_truth_cache,
+            output,
         )
 
         _elastomer_displacement_grid_fft_dilate(
@@ -1137,7 +1142,7 @@ class ElastomerDisplacementSensor(
             shared_metadata.dilate_coefficient,
             shared_metadata.dilate_max_delta,
             shared_metadata.grid_dilate_out_buffer,
-            shared_ground_truth_cache,
+            output,
         )
         _kernel_elastomer_displacement_grid_shear_twist(
             shared_metadata.probe_positions,
@@ -1155,8 +1160,10 @@ class ElastomerDisplacementSensor(
             solver.links_state,
             solver._sim.dt,
             gs.EPS,
-            shared_ground_truth_cache,
+            output,
         )
+        if not shared_ground_truth_cache.is_contiguous():
+            shared_ground_truth_cache.copy_(output)
 
     def _draw_debug(self, context: "RasterizerContext", buffer_updates: dict[str, np.ndarray]):
         self._draw_debug_probes(context, lambda data: torch.linalg.norm(data, dim=-1))

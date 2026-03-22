@@ -36,7 +36,7 @@ from genesis.utils.misc import tensor_to_array
 REPOSITY_URL = "Genesis-Embodied-AI/Genesis"
 DEFAULT_BRANCH_NAME = "main"
 
-HUGGINGFACE_ASSETS_REVISION = "573a30599c816a97624f675660868d20e3d3900f"
+HUGGINGFACE_ASSETS_REVISION = "d36ae7d8f558ba5e251391160846c6e7843871b4"
 HUGGINGFACE_SNAPSHOT_REVISION = "cb24acb2310ae1fa7c8f051cb9f51d88dadfab47"
 
 MESH_EXTENSIONS = (".mtl", *MESH_FORMATS, *GLTF_FORMATS, *USD_FORMATS)
@@ -563,7 +563,7 @@ def build_genesis_sim(
         sim_options=gs.options.SimOptions(
             dt=mj_sim.model.opt.timestep,
             substeps=1,
-            gravity=mj_sim.model.opt.gravity.tolist(),
+            gravity=mj_sim.model.opt.gravity,
         ),
         rigid_options=gs.options.RigidOptions(
             integrator=gs_integrator,

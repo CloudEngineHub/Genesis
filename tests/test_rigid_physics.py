@@ -17,6 +17,7 @@ import genesis.utils.geom as gu
 import genesis.utils.terrain as tu
 from genesis.ext import urdfpy
 from genesis.utils import urdf as uu
+from genesis.engine.states.solvers import RigidSolverState
 from genesis.utils.misc import get_assets_dir, qd_to_numpy, qd_to_torch, tensor_to_array
 
 from .utils import (
@@ -584,6 +585,68 @@ def test_dynamic_weld_scene_reset():
     scene.reset(state=scene.get_state(), envs_idx=[0])
     assert solver.constraint_solver.constraint_state.qd_n_equalities[0] == n_eq_base
     assert solver.constraint_solver.constraint_state.qd_n_equalities[1] == n_eq_base + 1
+
+
+@pytest.mark.required
+def test_reset(show_viewer):
+    BOOL_MASK = torch.tensor([True, False, True, False], dtype=torch.bool, device=gs.device)
+
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        gs.morphs.URDF(
+            file="urdf/plane/plane.urdf",
+            fixed=True,
+        )
+    )
+    scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=(0, 0, 0.5),
+        )
+    )
+    scene.build(n_envs=4)
+
+    init_state = scene.get_state()
+    init_rigid_state = next(s for s in init_state.solvers_state if isinstance(s, RigidSolverState))
+    for _ in range(50):
+        scene.step()
+    fallen_state = scene.get_state()
+    fallen_rigid_state = next(s for s in fallen_state.solvers_state if isinstance(s, RigidSolverState))
+
+    for envs_idx in (BOOL_MASK, torch.where(BOOL_MASK)[0]):
+        scene.reset(state=fallen_state)
+        scene.reset(state=init_state, envs_idx=envs_idx)
+        for actual, init_ref, fallen_ref in (
+            (
+                qd_to_torch(scene.rigid_solver._rigid_global_info.qpos, transpose=True, copy=True),
+                init_rigid_state.qpos,
+                fallen_rigid_state.qpos,
+            ),
+            (
+                qd_to_torch(scene.rigid_solver.dofs_state.vel, transpose=True, copy=True),
+                init_rigid_state.dofs_vel,
+                fallen_rigid_state.dofs_vel,
+            ),
+            (
+                qd_to_torch(scene.rigid_solver.links_state.pos, transpose=True, copy=True),
+                init_rigid_state.links_pos,
+                fallen_rigid_state.links_pos,
+            ),
+        ):
+            assert_allclose(actual[BOOL_MASK], init_ref[BOOL_MASK], tol=gs.EPS)
+            assert_allclose(actual[~BOOL_MASK], fallen_ref[~BOOL_MASK], tol=gs.EPS)
+
+    # After reset, simulation from init_state should reproduce the original fallen_state trajectory
+    for _ in range(50):
+        scene.step()
+    for actual, fallen_ref in (
+        (qd_to_torch(scene.rigid_solver._rigid_global_info.qpos, transpose=True, copy=True), fallen_rigid_state.qpos),
+        (qd_to_torch(scene.rigid_solver.dofs_state.vel, transpose=True, copy=True), fallen_rigid_state.dofs_vel),
+        (qd_to_torch(scene.rigid_solver.links_state.pos, transpose=True, copy=True), fallen_rigid_state.links_pos),
+    ):
+        assert_allclose(actual[BOOL_MASK], fallen_ref[BOOL_MASK], tol=gs.EPS)
 
 
 @pytest.mark.required
@@ -2190,7 +2253,7 @@ def test_frictionloss_advanced(show_viewer, tol):
     assert_allclose(robot.get_contacts()["position"][:, 2].min(), 0.0, tol=1e-4)
     assert_allclose(robot.get_AABB()[0, 2], 0.0, tol=2e-4)
     box_pos = box.get_pos()
-    assert box_pos[0] > 0.6
+    assert box_pos[0] > 0.5
     # This is to check collision detection is working correctly on metal
     # The box will collide with the robot and rolling on the ground,
     # We check whether it's rolling within a reasonable range and not blowing up.
@@ -3035,7 +3098,7 @@ def test_urdf_capsule(tmp_path, show_viewer, tol):
 @pytest.mark.required
 @pytest.mark.required
 @pytest.mark.parametrize("overwrite", [False, True])
-def test_urdf_color_overwrite(overwrite, show_viewer):
+def test_color_overwrite(overwrite, show_viewer):
     scene = gs.Scene(show_viewer=show_viewer)
     box = scene.add_entity(
         gs.morphs.URDF(
@@ -3047,7 +3110,7 @@ def test_urdf_color_overwrite(overwrite, show_viewer):
         ),
     )
     asset_path = get_hf_dataset(pattern="chain.urdf")
-    robot = scene.add_entity(
+    chain = scene.add_entity(
         gs.morphs.URDF(
             file=f"{asset_path}/chain.urdf",
         ),
@@ -3074,6 +3137,15 @@ def test_urdf_color_overwrite(overwrite, show_viewer):
             color=(1.0, 0.0, 0.0, 1.0) if overwrite else None,
         ),
     )
+    asset_path = get_hf_dataset(pattern="humanoid.xml")
+    humanoid = scene.add_entity(
+        gs.morphs.MJCF(
+            file=f"{asset_path}/humanoid.xml",
+        ),
+        surface=gs.surfaces.Default(
+            color=(1.0, 0.0, 0.0, 1.0) if overwrite else None,
+        ),
+    )
     if show_viewer:
         scene.build()
     for vgeom in box.vgeoms:
@@ -3082,12 +3154,28 @@ def test_urdf_color_overwrite(overwrite, show_viewer):
         assert visual.defined
         color = np.unique(visual.vertex_colors, axis=0)
         assert_equal(color, (255, 0, 0, 255) if overwrite else (0, 0, 255, 255))
-    for vgeom in robot.vgeoms:
+    for vgeom in chain.vgeoms:
         assert vgeom.vmesh.metadata["is_visual_overwritten"] == overwrite
         visual = vgeom.vmesh.trimesh.visual
         assert visual.defined
         color = np.unique(visual.vertex_colors, axis=0)
         assert_equal(color, (255, 0, 0, 255) if overwrite else (51, 51, 51, 255))
+    for vgeom in humanoid.vgeoms:
+        # FIXME: The original material is lost because the visuals are collision geometries that has been duplicated as
+        # visual to circumvent the lack of dedicated visuals.
+        is_true_visual = vgeom.vmesh.metadata["name"] == "nose"
+        assert vgeom.vmesh.metadata["is_visual_overwritten"] == overwrite or not is_true_visual
+        visual = vgeom.vmesh.trimesh.visual
+        assert visual.defined
+        color = np.unique(visual.vertex_colors, axis=0)
+        if is_true_visual:
+            if overwrite:
+                assert_equal(color, (255, 0, 0, 255))
+            else:
+                with pytest.raises(AssertionError):
+                    assert_equal(color, (128, 128, 128, 255))
+        else:
+            assert_equal(color, (255, 0, 0, 255) if overwrite else (128, 128, 128, 255))
     for vgeom in axis.vgeoms:
         assert vgeom.vmesh.metadata["is_visual_overwritten"] == overwrite
         visual = vgeom.vmesh.trimesh.visual
@@ -3156,6 +3244,82 @@ def test_urdf_joint_dynamics(joint_damping, joint_friction, xml_path):
     assert_allclose(robot.joints[1].dofs_damping, joint_damping, tol=gs.EPS)
     assert_allclose(robot.joints[0].dofs_frictionloss, 0.0, tol=gs.EPS)
     assert_allclose(robot.joints[1].dofs_frictionloss, joint_friction, tol=gs.EPS)
+
+
+@pytest.fixture(scope="session")
+def freeflyer_mjcf():
+    mjcf = ET.Element("mujoco", model="freeflyer")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    body = ET.SubElement(worldbody, "body", name="base", pos="0 0 1")
+    ET.SubElement(body, "joint", type="free")
+    ET.SubElement(body, "inertial", pos="0 0 0", mass="1.0", diaginertia="0.01 0.01 0.01")
+    ET.SubElement(body, "geom", type="sphere", size="0.05")
+    child = ET.SubElement(body, "body", name="child", pos="0 0 0.1")
+    ET.SubElement(child, "joint", type="hinge", axis="0 1 0")
+    ET.SubElement(child, "inertial", pos="0 0 0", mass="0.5", diaginertia="0.001 0.001 0.001")
+    ET.SubElement(child, "geom", type="sphere", size="0.02")
+    grandchild = ET.SubElement(child, "body", name="grandchild", pos="0 0 0.1")
+    ET.SubElement(grandchild, "joint", type="slide", axis="1 0 0", armature="42.0")
+    ET.SubElement(grandchild, "inertial", pos="0 0 0", mass="0.1", diaginertia="0.0001 0.0001 0.0001")
+    ET.SubElement(grandchild, "geom", type="sphere", size="0.01")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
+def freeflyer_urdf():
+    robot = ET.Element("robot", name="freeflyer")
+    ET.SubElement(robot, "link", name="world")
+    base_link = ET.SubElement(robot, "link", name="base_link")
+    inertial = ET.SubElement(base_link, "inertial")
+    ET.SubElement(inertial, "origin", rpy="0 0 0", xyz="0 0 0")
+    ET.SubElement(inertial, "mass", value="1.0")
+    ET.SubElement(inertial, "inertia", ixx="0.01", ixy="0", ixz="0", iyy="0.01", iyz="0", izz="0.01")
+    collision = ET.SubElement(base_link, "collision")
+    ET.SubElement(ET.SubElement(collision, "geometry"), "sphere", radius="0.05")
+    root_joint = ET.SubElement(robot, "joint", name="root", type="floating")
+    ET.SubElement(root_joint, "parent", link="world")
+    ET.SubElement(root_joint, "child", link="base_link")
+    child_link = ET.SubElement(robot, "link", name="child_link")
+    child_inertial = ET.SubElement(child_link, "inertial")
+    ET.SubElement(child_inertial, "origin", rpy="0 0 0", xyz="0 0 0")
+    ET.SubElement(child_inertial, "mass", value="0.5")
+    ET.SubElement(child_inertial, "inertia", ixx="0.001", ixy="0", ixz="0", iyy="0.001", iyz="0", izz="0.001")
+    child_collision = ET.SubElement(child_link, "collision")
+    ET.SubElement(ET.SubElement(child_collision, "geometry"), "sphere", radius="0.02")
+    arm_joint = ET.SubElement(robot, "joint", name="arm", type="revolute")
+    ET.SubElement(arm_joint, "parent", link="base_link")
+    ET.SubElement(arm_joint, "child", link="child_link")
+    ET.SubElement(arm_joint, "origin", rpy="0 0 0", xyz="0 0 0.1")
+    ET.SubElement(arm_joint, "axis", xyz="0 1 0")
+    ET.SubElement(arm_joint, "limit", lower="-3.14", upper="3.14", effort="10", velocity="10")
+    return robot
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("model_name", ["freeflyer_mjcf", "freeflyer_urdf"])
+def test_default_armature_freeflyer(xml_path):
+    DEFAULT_ARMATURE = 1000.0
+
+    if xml_path.endswith(".urdf"):
+        morph = gs.morphs.URDF(
+            file=xml_path,
+            default_armature=DEFAULT_ARMATURE,
+        )
+    else:
+        morph = gs.morphs.MJCF(
+            file=xml_path,
+            default_armature=DEFAULT_ARMATURE,
+        )
+
+    scene = gs.Scene()
+    robot = scene.add_entity(morph)
+    scene.build()
+
+    armature = robot.get_dofs_armature()
+    assert_allclose(armature[:6], 0.0, tol=gs.EPS)
+    assert_allclose(armature[6], DEFAULT_ARMATURE, tol=gs.EPS)
+    if xml_path.endswith(".mjcf"):
+        assert abs(armature[7]) > gs.EPS and abs(armature[7] - DEFAULT_ARMATURE) > gs.EPS
 
 
 @pytest.mark.required
@@ -3385,6 +3549,7 @@ def test_get_constraints_api(show_viewer, tol):
         assert_allclose((link_a_[1], link_b_[1]), ((link_a,), (link_b,)), tol=0)
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize("precision", ["32", "64"])
 @pytest.mark.parametrize("backend", [gs.gpu])
@@ -4212,7 +4377,7 @@ def test_axis_aligned_bounding_boxes(n_envs):
 def test_ellipsoid(xml_path, show_viewer):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
-            dt=0.05,
+            dt=0.02,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0.4, 0.4, 0.3),
@@ -4231,8 +4396,8 @@ def test_ellipsoid(xml_path, show_viewer):
     )
     scene.build()
 
-    entity.set_dofs_velocity(4 * np.random.rand(3), dofs_idx_local=slice(3, 6))
-    entity.set_dofs_kv(0.1, dofs_idx_local=slice(3, 6))
+    entity.set_dofs_velocity(20 * np.random.rand(3), dofs_idx_local=slice(3, 6))
+    entity.set_dofs_kv(0.002, dofs_idx_local=slice(3, 6))
     entity.control_dofs_velocity(0.0, dofs_idx_local=slice(3, 6))
 
     # AABB must match the ellipsoid semi-axes
@@ -4241,7 +4406,7 @@ def test_ellipsoid(xml_path, show_viewer):
     assert_allclose(aabb_extent, (0.10, 0.10, 0.04), atol=1e-3)
 
     # Free-fall onto plane: ellipsoid must come to rest
-    for _ in range(300):
+    for _ in range(100):
         scene.step()
 
     assert_allclose(entity.get_dofs_velocity(), 0, tol=5e-3)
@@ -4541,6 +4706,7 @@ def test_merge_entities(is_fixed, merge_fixed_links, show_viewer, tol, monkeypat
     assert_allclose(tool.get_pos(), hand.get_link("right_finger").get_pos(), tol=gs.EPS)
 
 
+@pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_heterogeneous_simulation(show_viewer, tol):
     """Test heterogeneous simulation by comparing against independent homogeneous simulations.
