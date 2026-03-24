@@ -18,6 +18,7 @@ from typing import Literal, Sequence
 
 import cpuinfo
 import mujoco
+import pytest
 import numpy as np
 import torch
 from httpcore import TimeoutException as HTTPTimeoutException
@@ -36,7 +37,7 @@ from genesis.utils.misc import tensor_to_array
 REPOSITY_URL = "Genesis-Embodied-AI/Genesis"
 DEFAULT_BRANCH_NAME = "main"
 
-HUGGINGFACE_ASSETS_REVISION = "d36ae7d8f558ba5e251391160846c6e7843871b4"
+HUGGINGFACE_ASSETS_REVISION = "bca4acd56099684f2d82f94dd9e1814ffe56861c"
 HUGGINGFACE_SNAPSHOT_REVISION = "cb24acb2310ae1fa7c8f051cb9f51d88dadfab47"
 
 MESH_EXTENSIONS = (".mtl", *MESH_FORMATS, *GLTF_FORMATS, *USD_FORMATS)
@@ -701,7 +702,15 @@ def check_mujoco_model_consistency(
     for gs_i, mj_i in zip(gs_bodies_idx, mj_bodies_idx):
         gs_invweight_i = gs_sim.rigid_solver.links_info.invweight.to_numpy()[gs_i]
         mj_invweight_i = mj_sim.model.body(mj_i).invweight0
-        assert_allclose(gs_invweight_i, mj_invweight_i, tol=tol)
+        try:
+            assert_allclose(gs_invweight_i, mj_invweight_i, tol=tol)
+        except AssertionError:
+            if tuple(int(x) for x in mujoco.__version__.split(".")[:2]) < (3, 5):
+                pytest.skip(
+                    "MuJoCo < 3.5 lacks the degenerate invweight fix. "
+                    "See https://github.com/google-deepmind/mujoco/commit/1cda1e7a"
+                )
+            raise
         gs_inertia_i = gs_sim.rigid_solver.links_info.inertial_i.to_numpy()[gs_i, [0, 1, 2], [0, 1, 2]]
         mj_inertia_i = mj_sim.model.body(mj_i).inertia
         assert_allclose(gs_inertia_i, mj_inertia_i, tol=tol)

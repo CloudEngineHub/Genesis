@@ -23,8 +23,6 @@ from genesis.utils.misc import get_assets_dir, qd_to_numpy, qd_to_torch, tensor_
 from .utils import (
     assert_allclose,
     assert_equal,
-    build_genesis_sim,
-    build_mujoco_sim,
     check_mujoco_data_consistency,
     check_mujoco_model_consistency,
     get_hf_dataset,
@@ -4524,7 +4522,7 @@ def test_urdf_align(show_viewer, tol):
 
     # Simulate with initial angular velocity to check numerical stability
     fork.set_dofs_velocity(10.0, dofs_idx_local=slice(3, 6))
-    for _ in range(100):
+    for _ in range(200):
         scene.step()
 
     assert_allclose(fork.get_dofs_velocity(), 0, tol=0.05)

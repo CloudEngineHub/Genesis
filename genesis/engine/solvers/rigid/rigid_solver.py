@@ -549,8 +549,18 @@ class RigidSolver(KinematicSolver):
                     A = jac @ mass_mat_inv @ jac.T
                     A_diag = np.diag(A)
 
-                    links_invweight[i_b_, i_l, 0] = A_diag[:3].mean()
-                    links_invweight[i_b_, i_l, 1] = A_diag[3:].mean()
+                    tran = A_diag[:3].mean()
+                    rot = A_diag[3:].mean()
+
+                    # If one component is zero, use the other to prevent degenerate constraints.
+                    # See https://github.com/google-deepmind/mujoco/commit/1cda1e7a
+                    if tran < gs.EPS and rot > gs.EPS:
+                        tran = rot
+                    elif rot < gs.EPS and tran > gs.EPS:
+                        rot = tran
+
+                    links_invweight[i_b_, i_l, 0] = tran
+                    links_invweight[i_b_, i_l, 1] = rot
 
             # Compute dofs invweight
             if i_b_ == 0 or self._options.batch_dofs_info:
@@ -1946,6 +1956,8 @@ class RigidSolver(KinematicSolver):
             num_values = len(tensor_list)
             for j, mask_j in enumerate(((*mask, ..., j) for j in range(num_values)) if num_values > 1 else (mask,)):
                 assign_indexed_tensor(data, mask_j, tensor_list[j])
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
             return
 
         tensor_list = list(tensor_list)
@@ -2037,6 +2049,8 @@ class RigidSolver(KinematicSolver):
         if gs.use_zerocopy:
             errno = qd_to_torch(self._errno, copy=False)
             errno[envs_idx] = 0
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
         else:
             kernel_set_zero(envs_idx, self._errno)
 
@@ -2064,6 +2078,8 @@ class RigidSolver(KinematicSolver):
             ctrl_mode[mask] = gs.CTRL_MODE.FORCE
             ctrl_force = qd_to_torch(self.dofs_state.ctrl_force, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_force, mask, force)
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
             return
 
         force, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2083,6 +2099,8 @@ class RigidSolver(KinematicSolver):
             ctrl_pos[mask] = 0.0
             ctrl_vel = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_vel, mask, velocity)
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
             return
 
         velocity, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2102,6 +2120,8 @@ class RigidSolver(KinematicSolver):
             assign_indexed_tensor(ctrl_pos, mask, position)
             ctrl_vel = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             ctrl_vel[mask] = 0.0
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
             return
 
         position, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2121,6 +2141,8 @@ class RigidSolver(KinematicSolver):
             assign_indexed_tensor(ctrl_pos, mask, position)
             ctrl_vel = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_vel, mask, velocity)
+            if gs.backend == gs.metal:
+                torch.mps.synchronize()
             return
 
         position, dofs_idx, _ = self._sanitize_io_variables(
