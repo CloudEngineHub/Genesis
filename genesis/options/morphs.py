@@ -37,7 +37,7 @@ URDF_FORMAT = ".urdf"
 XACRO_FORMAT = ".xacro"
 MJCF_FORMAT = ".xml"
 GLTF_FORMATS = (".glb", ".gltf")
-MESH_FORMATS = (".obj", ".stl", *GLTF_FORMATS)
+MESH_FORMATS = (".obj", ".stl", ".dae", *GLTF_FORMATS)
 USD_FORMATS = (".usd", ".usda", ".usdc", ".usdz")
 
 
@@ -102,6 +102,7 @@ class Morph(Options):
     visualization: StrictBool = True
     collision: StrictBool = True
     requires_jac_and_IK: StrictBool = False
+    enable_custom_vverts: StrictBool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -469,6 +470,8 @@ class Plane(Primitive):
 
         if self.requires_jac_and_IK:
             gs.raise_exception("`requires_jac_and_IK` must be False for `Plane`.")
+        if self.enable_custom_vverts:
+            gs.raise_exception("`enable_custom_vverts` must be False for `Plane`.")
 
 
 ############################ Mesh ############################

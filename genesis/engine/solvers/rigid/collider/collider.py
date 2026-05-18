@@ -47,7 +47,7 @@ from .contact import (
     func_contact_orthogonals,
     func_rotate_frame,
     func_set_upstream_grad,
-    func_sort_contacts,
+    func_clamp_and_sort_contacts,
 )
 from . import narrowphase
 from .narrowphase import (
@@ -162,7 +162,7 @@ class Collider:
 
         # Initialize the static config, which stores every data that are compile-time constants.
         # Note that updating any of them will trigger recompilation.
-        self._collider_static_config = array_class.StructColliderStaticConfig(
+        self._collider_static_config = array_class.ColliderStaticConfig(
             has_terrain=has_terrain,
             has_non_box_plane_convex_convex=has_non_box_plane_convex_convex,
             has_convex_specialization=has_convex_specialization,
@@ -560,6 +560,10 @@ class Collider:
             self._collider_info.terrain_scale.from_numpy(scale)
             self._collider_info.terrain_xyz_maxmin.from_numpy(xyz_maxmin)
 
+    def activate_sdf(self) -> None:
+        """Enable SDF queries against this collider's geometry. Idempotent."""
+        self._sdf.activate()
+
     def reset(self, envs_idx=None, *, cache_only: bool = True) -> None:
         self._contact_data_cache.clear()
         if gs.use_zerocopy:
@@ -581,8 +585,6 @@ class Collider:
                 normal.zero_()
             else:
                 normal[:, envs_idx] = 0.0
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
@@ -636,8 +638,6 @@ class Collider:
                 pos[:, envs_idx] = 0.0
                 normal[:, envs_idx] = 0.0
                 force[:, envs_idx] = 0.0
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         if not isinstance(envs_idx, torch.Tensor):
@@ -802,8 +802,9 @@ class Collider:
             )
 
         if self._use_split_narrowphase:
-            func_sort_contacts(
+            func_clamp_and_sort_contacts(
                 self._collider_state,
+                self._collider_info,
                 self._solver._static_rigid_sim_config,
             )
 

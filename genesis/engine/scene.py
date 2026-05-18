@@ -3,6 +3,7 @@ import os
 import pickle
 import sys
 import time
+import trimesh
 import weakref
 from typing import TYPE_CHECKING, Callable, Iterable, Literal, overload
 
@@ -13,6 +14,7 @@ from quadrants.lang import impl
 
 import genesis as gs
 import genesis.utils.geom as gu
+import genesis.utils.mesh as mu
 from genesis.engine.force_fields import ForceField
 from genesis.engine.materials.base import EntityT, Material
 from genesis.engine.states.solvers import SimState
@@ -267,23 +269,6 @@ class Scene(RBC):
             gs.raise_exception("`renderer` should be an instance of `gs.renderers.Renderer`.")
 
         # Validate rigid_options against sim_options
-        if impl.current_cfg().debug:
-            if sim_options.requires_grad and not gs.use_ndarray:
-                gs.raise_exception(
-                    "Genesis debug mode together with performance mode is not supported when gradient computation is "
-                    "enabled, i.e. `sim_options.requires_grad=True`."
-                )
-        else:
-            if sim_options.requires_grad and gs.use_ndarray:
-                if gs.backend == gs.metal:
-                    gs.raise_exception(
-                        "Metal backend does not support gradient computation with Quadrants dynamic array mode. "
-                        "Please use field mode instead, i.e. 'gs.init(..., performance_mode=True)'."
-                    )
-                gs.logger.info(
-                    "Using Quadrants dynamic array mode while enabling gradient computation is not recommended. Please "
-                    "enable performance mode at init for efficiency, i.e. 'gs.init(..., performance_mode=True)'."
-                )
         if rigid_options.box_box_detection is None:
             rigid_options.box_box_detection = not sim_options.requires_grad
         elif rigid_options.box_box_detection and sim_options.requires_grad:
@@ -649,6 +634,26 @@ class Scene(RBC):
             The options for the sensor.
         """
         return self._sim._sensor_manager.create_sensor(sensor_options)
+
+    @gs.assert_built
+    def read_sensors(self, envs_idx=None) -> "dict[type[Sensor], torch.Tensor]":
+        """
+        Read every sensor in the scene as a tensor per sensor class.
+
+        Always returns a fresh tensor independent of the internal sensor storage; the caller is free to mutate the
+        result.
+
+        Parameters
+        ----------
+        envs_idx : array-like | int | slice | None
+            Environment selection. Defaults to all environments.
+
+        Returns
+        -------
+        dict[Type[Sensor], torch.Tensor]
+            For each sensor class present in the scene, a tensor of shape (B, [history,] class_cache_size).
+        """
+        return self._sim._sensor_manager.read_sensors(entity_idx=None, envs_idx=envs_idx)
 
     @gs.assert_unbuilt
     def start_recording(self, data_func: Callable, rec_options: "RecorderOptions") -> "Recorder":
@@ -1090,7 +1095,7 @@ class Scene(RBC):
             return self._visualizer.context.draw_debug_arrow(pos, vec, radius, color)
 
     @gs.assert_built
-    def draw_debug_frame(self, T, axis_length=1.0, origin_size=0.015, axis_radius=0.01):
+    def draw_debug_frame(self, T, axis_length=1.0, origin_size=0.015, axis_radius=0.01, color=None):
         """
         Draws a 3-axis coordinate frame in the scene for visualization.
 
@@ -1104,6 +1109,8 @@ class Scene(RBC):
             The size of the origin point (represented as a sphere).
         axis_radius : float, optional
             The radius of the axes (represented as cylinders).
+        color : array_like, shape (4,), optional
+            Uniform RGBA color override for the entire frame. If None, uses standard RGB axis coloring.
 
         Returns
         -------
@@ -1111,10 +1118,10 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_frame(T, axis_length, origin_size, axis_radius)
+            return self._visualizer.context.draw_debug_frame(T, axis_length, origin_size, axis_radius, color)
 
     @gs.assert_built
-    def draw_debug_frames(self, Ts, axis_length=1.0, origin_size=0.015, axis_radius=0.01):
+    def draw_debug_frames(self, Ts, axis_length=1.0, origin_size=0.015, axis_radius=0.01, color=None):
         """
         Draws 3-axis coordinate frames in the scene for visualization.
 
@@ -1128,6 +1135,8 @@ class Scene(RBC):
             The size of the origin point (represented as a sphere).
         axis_radius : float, optional
             The radius of the axes (represented as cylinders).
+        color : array_like, shape (4,), optional
+            Uniform RGBA color override for the entire frame. If None, uses standard RGB axis coloring.
 
         Returns
         -------
@@ -1135,7 +1144,7 @@ class Scene(RBC):
             The created debug object.
         """
         with self._visualizer.viewer_lock:
-            return self._visualizer.context.draw_debug_frames(Ts, axis_length, origin_size, axis_radius)
+            return self._visualizer.context.draw_debug_frames(Ts, axis_length, origin_size, axis_radius, color)
 
     @gs.assert_built
     def draw_debug_mesh(self, mesh, pos=np.zeros(3), T=None):
@@ -1256,6 +1265,57 @@ class Scene(RBC):
             return self._visualizer.context.draw_debug_points(poss, colors)
 
     @gs.assert_built
+    def draw_debug_frustum(self, camera, color=(1.0, 1.0, 1.0, 0.3)):
+        """
+        Draws a camera frustum in the scene for visualization.
+
+        Parameters
+        ----------
+        camera : Camera
+            The camera object whose frustum will be visualized. Works for any
+            camera including sensor cameras.
+        color : array_like, shape (4,), optional
+            The color of the frustum in RGBA format.
+
+        Returns
+        -------
+        node : genesis.ext.pyrender.mesh.Mesh
+            The created debug object.
+        """
+        with self._visualizer.viewer_lock:
+            mesh = mu.create_camera_frustum(camera, color)
+            return self._visualizer.context.draw_debug_mesh(mesh, T=camera.transform)
+
+    @gs.assert_built
+    def draw_debug_trajectory(self, poss, radius=0.002, color=(1.0, 0.5, 0.0, 0.8)):
+        """
+        Draws a trajectory as a series of connected lines in the scene for visualization.
+
+        Parameters
+        ----------
+        poss : array_like, shape (N, 3)
+            The positions of the trajectory points.
+        radius : float, optional
+            The radius of the trajectory lines.
+        color : array_like, shape (4,), optional
+            The color of the trajectory in RGBA format.
+
+        Returns
+        -------
+        node : genesis.ext.pyrender.mesh.Mesh
+            The created debug object (a single merged mesh of all segments).
+        """
+
+        poss = np.asarray(poss)
+        if len(poss) < 2:
+            return None
+
+        segments = [mu.create_line(poss[i], poss[i + 1], radius, color) for i in range(len(poss) - 1)]
+        merged = trimesh.util.concatenate(segments)
+        with self._visualizer.viewer_lock:
+            return self._visualizer.context.draw_debug_mesh(merged)
+
+    @gs.assert_built
     def draw_debug_path(self, qposs, entity, link_idx=-1, density=0.3, frame_scaling=1.0):
         """
         Draws a planned joint trajectory in the scene for visualization.
@@ -1347,9 +1407,26 @@ class Scene(RBC):
         return rgb_out, depth_out, seg_out, normal_out
 
     @gs.assert_built
+    def update_debug_objects(self, objs, poses):
+        """
+        Updates the poses of debug objects previously created by ``draw_debug_*`` methods.
+
+        Parameters
+        ----------
+        objs : tuple of genesis.ext.pyrender.mesh.Mesh
+            The debug objects to update, i.e. visualizer nodes returned by ``draw_debug_*`` methods. Currently only
+            individual sphere, frame, mesh, and arrow objects (returned by ``draw_debug_sphere``, ``draw_debug_frame``,
+            ``draw_debug_mesh``, and ``draw_debug_arrow`` respectively) are supported.
+        poses : tuple of array_like, each of shape (4, 4)
+            The new transformation matrices for each debug object.
+        """
+        with self._visualizer.viewer_lock:
+            self._visualizer.context.update_debug_objects(objs, poses)
+
+    @gs.assert_built
     def clear_debug_object(self, obj):
         """
-        Clears all the debug objects in the scene.
+        Clears the specified debug object from the scene.
         """
         with self._visualizer.viewer_lock:
             self._visualizer.context.clear_debug_object(obj)
@@ -1391,7 +1468,7 @@ class Scene(RBC):
         arrays: dict[str, np.ndarray] = {}
 
         for name, value in self.__dict__.items():
-            if isinstance(value, (qd.Field, qd.Ndarray)):
+            if isinstance(value, (qd.Tensor, qd.Field, qd.Ndarray)):
                 arrays[".".join((self.__class__.__name__, name))] = value.to_numpy()
 
         for solver in self.active_solvers:
@@ -1431,7 +1508,7 @@ class Scene(RBC):
         arrays = state["arrays"]
 
         for name, value in self.__dict__.items():
-            if isinstance(value, (qd.Field, qd.Ndarray)):
+            if isinstance(value, (qd.Tensor, qd.Field, qd.Ndarray)):
                 key = ".".join((self.__class__.__name__, name))
                 if key in arrays:
                     value.from_numpy(arrays[key])

@@ -30,7 +30,7 @@ def rotmatx(matin, i0, i1, i2, f0, f1, f2):
     return matres
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def collider_kernel_reset(
     envs_idx: qd.types.ndarray(),
     static_rigid_sim_config: qd.template(),
@@ -109,7 +109,7 @@ def func_collider_clear_env(
 
 
 # only used with hibernation ??
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def kernel_collider_clear(
     envs_idx: qd.types.ndarray(),
     links_state: array_class.LinksState,
@@ -123,7 +123,7 @@ def kernel_collider_clear(
         func_collider_clear_env(i_b, links_state, links_info, static_rigid_sim_config, collider_state)
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def kernel_masked_collider_clear(
     envs_mask: qd.types.ndarray(),
     links_state: array_class.LinksState,
@@ -136,7 +136,7 @@ def kernel_masked_collider_clear(
             func_collider_clear_env(i_b, links_state, links_info, static_rigid_sim_config, collider_state)
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def collider_kernel_get_contacts(
     is_padded: qd.template(),
     iout: qd.types.ndarray(),
@@ -190,7 +190,7 @@ def func_add_contact(
     geoms_info: array_class.GeomsInfo,
     collider_state: array_class.ColliderState,
     collider_info: array_class.ColliderInfo,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
     use_atomic: qd.template() = False,
 ):
     i_c = 0
@@ -436,34 +436,38 @@ def func_rotate_frame(
     return new_pos, new_quat
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
-def func_sort_contacts(
+@qd.kernel(fastcache=True)
+def func_clamp_and_sort_contacts(
     collider_state: array_class.ColliderState,
+    collider_info: array_class.ColliderInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Sort contacts within each env spatially by x-coordinate, moving
-    entire geom-pair groups as units.
+    """Sort contacts spatially by x-coordinate, moving entire geom-pair groups as units, while clamping number of
+    contacts to avoid unbounded memory access.
 
-    Contacts from the same geom pair are contiguous after narrowphase.
-    We assign every contact in a group the x-position of the group's first
-    contact.  The stable insertion sort then reorders groups spatially while
-    preserving the narrowphase ordering within each group.
+    When contacts are added with use_atomic=True from parallel narrowphase kernels, the counter may exceed the array
+    bounds even though only in-bounds entries are actually written. The clamp brings the counter back to the valid
+    range before sorting.
+
+    Contacts from the same geom pair are contiguous after narrowphase. We assign every contact in a group the
+    x-position of the group's first contact. The stable insertion sort then reorders groups spatially while preserving
+    the narrowphase ordering within each group.
 
     Two-phase approach to minimise memory traffic:
-    1. Insertion sort on a compact (key, index) pair — 8 bytes per swap
-       instead of moving all 11 contact fields (~92 bytes).
-    2. In-place cycle-following permutation that moves each contact record
-       exactly once.
+    1. Insertion sort on a compact (key, index) pair — 8 bytes per swap instead of moving all 11 contact fields
+    2. In-place cycle-following permutation that moves each contact record exactly once
     """
     _B = collider_state.n_contacts.shape[0]
+    max_contact_pairs = collider_info.max_contact_pairs[None]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
-        n = collider_state.n_contacts[i_b]
+        n_con = qd.min(collider_state.n_contacts[i_b], max_contact_pairs)
+        collider_state.n_contacts[i_b] = n_con
 
         # Phase 1: initialise and insertion-sort the (key, idx) arrays.
         group_key = gs.qd_float(0.0)
-        for i in range(n):
+        for i in range(n_con):
             ga = collider_state.contact_data.geom_a[i, i_b]
             gb = collider_state.contact_data.geom_b[i, i_b]
             if (
@@ -475,7 +479,7 @@ def func_sort_contacts(
             collider_state.contact_sort_key[i, i_b] = group_key
             collider_state.contact_sort_idx[i, i_b] = i
 
-        for i in range(1, n):
+        for i in range(1, n_con):
             curr_key = collider_state.contact_sort_key[i, i_b]
             if collider_state.contact_sort_key[i - 1, i_b] <= curr_key:
                 continue
@@ -493,7 +497,7 @@ def func_sort_contacts(
 
         # Phase 2: apply permutation in-place via cycle decomposition.
         # Each contact is read and written exactly once.
-        for i in range(n):
+        for i in range(n_con):
             if collider_state.contact_sort_idx[i, i_b] != i:
                 tmp_geom_a = collider_state.contact_data.geom_a[i, i_b]
                 tmp_geom_b = collider_state.contact_data.geom_b[i, i_b]

@@ -358,7 +358,7 @@ def func_contact_mpr_terrain(
     mpr_state: array_class.MPRState,
     mpr_info: array_class.MPRInfo,
     support_field_info: array_class.SupportFieldInfo,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
 ):
     ga_pos, ga_quat = geoms_state.pos[i_ga, i_b], geoms_state.quat[i_ga, i_b]
     gb_pos, gb_quat = geoms_state.pos[i_gb, i_b], geoms_state.quat[i_gb, i_b]
@@ -541,7 +541,7 @@ def func_convex_convex_contact(
     support_field_info: array_class.SupportFieldInfo,
     # FIXME: Passing nested data structure as input argument is not supported for now.
     diff_contact_input: array_class.DiffContactInput,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
 ):
     if not (geoms_info.type[i_ga] == gs.GEOM_TYPE.PLANE and geoms_info.type[i_gb] == gs.GEOM_TYPE.BOX):
         EPS = rigid_global_info.EPS[None]
@@ -1151,7 +1151,7 @@ def _func_multicontact_mpr(
     gjk_info: array_class.GJKInfo,
     gjk_static_config: qd.template(),
     support_field_info: array_class.SupportFieldInfo,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
 ):
     """Compute all contacts (0 through 4) for a pair and write them contiguously
     via a single atomic reservation, ensuring deterministic per-pair ordering.
@@ -1301,8 +1301,16 @@ def _func_multicontact_mpr(
         collider_state.narrowphase_work_queues.gjk_i_gb[idx] = i_gb
         collider_state.narrowphase_work_queues.gjk_i_pair[idx] = i_pair
     else:
-        start_idx = qd.atomic_add(collider_state.n_contacts[i_b], n_con)
-        if start_idx + n_con <= collider_info.max_contact_pairs[None]:
+        # Non-atomic pre-check to avoid reserving slots we cannot fill. A rare race between the read and the
+        # atomic_add below may still overshoot; in that case we write only the contacts that fit and set errno.
+        max_contact_pairs = collider_info.max_contact_pairs[None]
+        if collider_state.n_contacts[i_b] + n_con > max_contact_pairs:
+            errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS
+        else:
+            start_idx = qd.atomic_add(collider_state.n_contacts[i_b], n_con)
+            n_con = qd.math.clamp(max_contact_pairs - start_idx, 0, n_con)
+            if n_con == 0:
+                errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS
             for i in range(n_con):
                 i_c = start_idx + i
                 pos_i = qd.Vector(
@@ -1323,8 +1331,6 @@ def _func_multicontact_mpr(
                     collider_state,
                     collider_info,
                 )
-        else:
-            errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS
 
 
 @qd.func
@@ -1353,7 +1359,7 @@ def _func_multicontact_gjk_full(
     gjk_static_config: qd.template(),
     support_field_info: array_class.SupportFieldInfo,
     diff_contact_input: array_class.DiffContactInput,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
 ):
     """Run full contact detection (contacts 0-4) using GJK+EPA for pairs that MPR couldn't handle.
     All contacts are collected locally and written contiguously via a single atomic reservation."""
@@ -1540,8 +1546,15 @@ def _func_multicontact_gjk_full(
                         n_con = n_con + 1
 
     if n_con > 0:
-        start_idx = qd.atomic_add(collider_state.n_contacts[i_b], n_con)
-        if start_idx + n_con <= collider_info.max_contact_pairs[None]:
+        # Non-atomic pre-check (see comment in _func_multicontact_mpr).
+        max_contact_pairs = collider_info.max_contact_pairs[None]
+        if collider_state.n_contacts[i_b] + n_con > max_contact_pairs:
+            errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS
+        else:
+            start_idx = qd.atomic_add(collider_state.n_contacts[i_b], n_con)
+            n_con = qd.math.clamp(max_contact_pairs - start_idx, 0, n_con)
+            if n_con == 0:
+                errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS
             for i in range(n_con):
                 i_c = start_idx + i
                 pos_i = qd.Vector(
@@ -1562,11 +1575,9 @@ def _func_multicontact_gjk_full(
                     collider_state,
                     collider_info,
                 )
-        else:
-            errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def _func_narrowphase_multicontact_mixed(
     links_state: array_class.LinksState,
     links_info: array_class.LinksInfo,
@@ -1587,7 +1598,7 @@ def _func_narrowphase_multicontact_mixed(
     gjk_static_config: qd.template(),
     support_field_info: array_class.SupportFieldInfo,
     diff_contact_input: array_class.DiffContactInput,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
     n_gjk_threads: qd.template(),
     n_total_threads: qd.template(),
     max_items_per_thread: qd.template(),
@@ -1733,7 +1744,7 @@ def _func_enqueue_for_multicontact(
         collider_state.narrowphase_work_queues.mpr_penetration_0[idx] = penetration_0
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def _func_narrowphase_contact0(
     geoms_state: array_class.GeomsState,
     geoms_info: array_class.GeomsInfo,
@@ -1749,7 +1760,7 @@ def _func_narrowphase_contact0(
     gjk_state: array_class.GJKState,
     gjk_info: array_class.GJKInfo,
     support_field_info: array_class.SupportFieldInfo,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
     n_envs: qd.template(),
     n_chunks: qd.template(),
 ):
@@ -1985,7 +1996,7 @@ def _func_narrowphase_contact0(
                 collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def func_narrow_phase_convex_vs_convex(
     links_state: array_class.LinksState,
     links_info: array_class.LinksInfo,
@@ -2008,7 +2019,7 @@ def func_narrow_phase_convex_vs_convex(
     sdf_info: array_class.SDFInfo,
     support_field_info: array_class.SupportFieldInfo,
     diff_contact_input: array_class.DiffContactInput,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
 ):
     _B = collider_state.active_buffer.shape[1]
 
@@ -2060,7 +2071,7 @@ def func_narrow_phase_convex_vs_convex(
                     )
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def func_narrow_phase_diff_convex_vs_convex(
     geoms_state: array_class.GeomsState,
     geoms_info: array_class.GeomsInfo,
@@ -2132,7 +2143,7 @@ def func_narrow_phase_diff_convex_vs_convex(
                 )
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def func_narrow_phase_convex_specializations(
     geoms_state: array_class.GeomsState,
     geoms_info: array_class.GeomsInfo,
@@ -2143,7 +2154,7 @@ def func_narrow_phase_convex_specializations(
     collider_state: array_class.ColliderState,
     collider_info: array_class.ColliderInfo,
     collider_static_config: qd.template(),
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
 ):
     _B = collider_state.active_buffer.shape[1]
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
@@ -2189,7 +2200,7 @@ def func_narrow_phase_convex_specializations(
                     )
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def func_narrow_phase_any_vs_terrain(
     geoms_state: array_class.GeomsState,
     geoms_info: array_class.GeomsInfo,
@@ -2201,7 +2212,7 @@ def func_narrow_phase_any_vs_terrain(
     mpr_state: array_class.MPRState,
     mpr_info: array_class.MPRInfo,
     support_field_info: array_class.SupportFieldInfo,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
 ):
     """
     NOTE: for a single non-batched scene with a lot of collisioin pairs, it will be faster if we also parallelize over `self.n_collision_pairs`. However, parallelize over both B and collisioin_pairs (instead of only over B) leads to significantly slow performance for batched scene. We can treat B=0 and B>0 separately, but we will end up with messier code.
@@ -2239,7 +2250,7 @@ def func_narrow_phase_any_vs_terrain(
                     )
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def func_narrow_phase_nonconvex_vs_nonterrain(
     links_state: array_class.LinksState,
     links_info: array_class.LinksInfo,
@@ -2254,7 +2265,7 @@ def func_narrow_phase_nonconvex_vs_nonterrain(
     collider_info: array_class.ColliderInfo,
     collider_static_config: qd.template(),
     sdf_info: array_class.SDFInfo,
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
 ):
     """
     NOTE: for a single non-batched scene with a lot of collisioin pairs, it will be faster if we also parallelize over `self.n_collision_pairs`. However, parallelize over both B and collisioin_pairs (instead of only over B) leads to significantly slow performance for batched scene. We can treat B=0 and B>0 separately, but we will end up with messier code.

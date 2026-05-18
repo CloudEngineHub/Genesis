@@ -1,4 +1,5 @@
 import math
+import sys
 from typing import TYPE_CHECKING, Literal
 
 import quadrants as qd
@@ -15,6 +16,7 @@ from genesis.utils.misc import (
     DeprecationError,
     qd_to_torch,
     qd_to_numpy,
+    qd_zero_grad,
     indices_to_mask,
     broadcast_tensor,
     sanitize_indexed_tensor,
@@ -260,7 +262,7 @@ class RigidSolver(KinematicSolver):
         self.collider = None
         self.constraint_solver = None
 
-        self.qpos: qd.Field | qd.Ndarray | None = None
+        self.qpos: qd.Tensor | qd.Field | qd.Ndarray | None = None
 
         self._is_backward: bool = False
 
@@ -305,6 +307,8 @@ class RigidSolver(KinematicSolver):
             vgeom_start=self.n_vgeoms,
             vvert_start=self.n_vverts,
             vface_start=self.n_vfaces,
+            custom_vvert_start=self.n_custom_vverts,
+            custom_vface_start=self.n_custom_vfaces,
             visualize_contact=visualize_contact,
             morph_heterogeneous=morph_heterogeneous,
             name=name,
@@ -335,6 +339,10 @@ class RigidSolver(KinematicSolver):
         self.n_free_verts_ = max(1, self.n_free_verts)
         self.n_fixed_verts_ = max(1, self.n_fixed_verts)
         self.n_candidate_equalities_ = max(1, self.n_equalities + self._options.max_dynamic_constraints)
+
+        # Resolve precision-dependent tolerance default
+        if self._options.tolerance is None:
+            self._options.tolerance = 1e-5 if gs.qd_float == qd.f32 else 1e-8
 
         super().build()
 
@@ -370,12 +378,51 @@ class RigidSolver(KinematicSolver):
             return gs.broadphase_traversal.SAP
         return gs.broadphase_traversal.ALL_VS_ALL
 
-    def _build_static_config(self):
-        prefer_parallel_linesearch = self._options.prefer_parallel_linesearch
-        # FIXME: Enable gs.metal once Quadrants supports shared memory atomics on Apple Metal.
-        if gs.backend in (gs.cpu, gs.metal) or self._enable_mujoco_compatibility or self.sim.options.requires_grad:
-            prefer_parallel_linesearch = False
+    def _should_use_parallel_init(self):
+        """Use parallel init (ndrange over constraints+envs) when envs alone don't saturate the GPU.
 
+        Uses hardware-derived GPU core count to determine saturation threshold, following the same
+        multi-backend pattern as collider.py (line 219).
+        """
+        if gs.backend == gs.cpu or self.sim.options.requires_grad:
+            return False
+        import torch
+
+        if torch.cuda.is_available():
+            gpu_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            # NVIDIA: 128 CUDA cores per SM. AMD/ROCm: 64 stream processors per CU.
+            cores_per_unit = 64 if torch.version.hip else 128
+            gpu_cores = gpu_props.multi_processor_count * cores_per_unit
+        elif gs.backend == gs.metal:
+            # Upper-bound estimate for Apple Silicon: 40 GPU cores * 128 ALUs
+            gpu_cores = 5120
+        else:
+            # Fallback for other GPU backends (e.g. Vulkan)
+            gpu_cores = 16384
+        return self.n_envs <= gpu_cores
+
+    def _should_transpose_constraint_layout(self) -> bool:
+        """Decide whether to allocate the layout-flippable constraint-state with layout=(1, 0).
+
+        The transposed layout (plus its companion cooperative kernels) wins on workloads with enough per-env compute
+        density to amortize the warp-per-env overhead, and loses when envs are sparse and many: in those cases the
+        legacy 1-thread-per-env path is already coalesced under (len_constraints_, _B) and warp scheduling dominates.
+
+        Empirical pattern from `perso_hugh/doc/linesearch_shuffle.md` (Exp 5):
+          - Wins (>+3%): dex_hand, g1_fall, box_pyramid_3..6; all 4096 envs, n_dofs >= ~18.
+          - Wash / regression: anymal/franka families; 30000 envs, n_dofs <= ~12.
+
+        Heuristic: enable transpose when both (a) n_envs is small enough that env-parallelism does not already
+        saturate the GPU, and (b) per-env DoF count is large enough to keep a 32-lane warp busy on the cooperative
+        reductions.
+        """
+        if gs.backend == gs.cpu or self.sim.options.requires_grad:
+            return False
+        n_envs = self._sim._B
+        n_dofs = self.n_dofs
+        return n_envs <= 8192 and n_dofs >= 16
+
+    def _build_static_config(self):
         static_rigid_sim_config = dict(
             backend=gs.backend,
             para_level=self.sim._para_level,
@@ -393,9 +440,14 @@ class RigidSolver(KinematicSolver):
             sparse_solve=self._options.sparse_solve,
             integrator=self._integrator,
             solver_type=self._options.constraint_solver,
-            prefer_parallel_linesearch={None: -1, False: 0, True: 1}[prefer_parallel_linesearch],
             broadphase_traversal=self._resolve_broadphase_traversal(),
+            parallel_init=self._should_use_parallel_init(),
+            constraint_layout_transposed=self._should_transpose_constraint_layout(),
         )
+
+        # Prefer the monolith solver on CPU (always faster there, perf dispatch is a waste of effort)
+        if gs.backend == gs.cpu or self.sim.options.requires_grad:
+            static_rigid_sim_config["prefer_decomposed_solver"] = 0
 
         if self.is_active:
             # TODO: These alternative tiled algorithms are designed to reduce the impact of latency. However, naive
@@ -405,8 +457,8 @@ class RigidSolver(KinematicSolver):
             # be selected based on dynamic timer-based profiling instead of hard-coded heuristic.
             max_n_dofs_per_entity = max(entity.n_dofs for entity in self.entities) if self.entities else 0
             if gs.backend != gs.cpu:
-                max_shared_mem = 32.0 if gs.backend == gs.metal else 48.0
-                max_n_warps = int(math.sqrt(max_shared_mem * 1024 / (4 if gs.qd_float == qd.f32 else 8))) // 32
+                max_shared_bytes = qd.lang.impl.get_max_shared_memory_bytes(is_lowerbound_ok=True)
+                max_n_warps = int(math.sqrt(max_shared_bytes / (4 if gs.qd_float == qd.f32 else 8))) // 32
                 max_n_threads = max_n_warps * 32
 
                 enable_tiled_cholesky_mass_matrix = 8 <= max_n_dofs_per_entity <= max_n_threads and self.n_envs <= 16384
@@ -436,7 +488,7 @@ class RigidSolver(KinematicSolver):
                     n_geoms=self._n_geoms,
                 )
 
-        self._static_rigid_sim_config = array_class.StructRigidSimStaticConfig(**static_rigid_sim_config)
+        self._static_rigid_sim_config = array_class.RigidSimStaticConfig(**static_rigid_sim_config)
 
         if self._static_rigid_sim_config.use_hibernation:
             if gs.use_ndarray:
@@ -983,8 +1035,9 @@ class RigidSolver(KinematicSolver):
         return qd_to_torch(self._errno) > 0
 
     def check_errno(self):
-        # TODO: Add some class ErrorCode(IntEnum) to manage error codes x)
-        if gs.use_zerocopy:
+        # FIXME: qd.atomic_or return value is broken on Metal — always returns 0.
+        # See repro_metal_kernel_return.py. Falling back to numpy reduction.
+        if gs.use_zerocopy or sys.platform == "darwin":
             errno = np.bitwise_or.reduce(qd_to_numpy(self._errno))
         else:
             errno = kernel_bit_reduction(self._errno)
@@ -1039,7 +1092,7 @@ class RigidSolver(KinematicSolver):
             else:
                 self.constraint_solver.add_inequality_constraints()
 
-            self.constraint_solver.resolve()
+            self.constraint_solver.resolve(self.entities_info, self._rigid_global_info)
 
     def _func_forward_dynamics(self):
         kernel_forward_dynamics(
@@ -1099,8 +1152,8 @@ class RigidSolver(KinematicSolver):
         kernel_update_geoms(
             envs_idx,
             self.entities_info,
-            self.geoms_info,
             self.geoms_state,
+            self.geoms_info,
             self.links_state,
             self._rigid_global_info,
             self._static_rigid_sim_config,
@@ -1205,6 +1258,20 @@ class RigidSolver(KinematicSolver):
 
             # Run Genesis rigid simulation step for non-IPC couplers
             self.substep(f)
+
+    def reset_grad(self):
+        # Rigid additionally owns `geoms_state`, `entities_state`, and the `*_adjoint_cache` structs written by the
+        # backward substep chain. All carry `needs_grad=True` fields that accumulate via `atomic_add` during backward,
+        # so they must start at zero between consecutive `loss.backward()`s.
+        super().reset_grad()
+        if self._requires_grad:
+            qd_zero_grad(self.geoms_state)
+            qd_zero_grad(self.entities_state)
+            qd_zero_grad(self.dofs_state_adjoint_cache)
+            qd_zero_grad(self.links_state_adjoint_cache)
+            qd_zero_grad(self.joints_state_adjoint_cache)
+            qd_zero_grad(self.geoms_state_adjoint_cache)
+            qd_zero_grad(self._rigid_adjoint_cache)
 
     def substep_pre_coupling_grad(self, f):
         # Change to backward mode
@@ -1630,141 +1697,191 @@ class RigidSolver(KinematicSolver):
     def set_links_pos(self, pos, links_idx=None, envs_idx=None):
         raise DeprecationError("This method has been removed. Please use 'set_base_links_pos' instead.")
 
-    def set_base_links_pos(self, pos, links_idx=None, envs_idx=None, *, relative=False):
+    def set_base_links_pos(self, pos, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False):
         if links_idx is None:
             links_idx = self._base_links_idx
-        pos, links_idx, envs_idx = self._sanitize_io_variables(
-            pos, links_idx, self.n_links, "links_idx", envs_idx, (3,), skip_allocation=True
-        )
-        if self.n_envs == 0:
-            pos = pos[None]
 
-        # FIXME: This check is too expensive
-        # if not torch.isin(links_idx, self._base_links_idx).all():
-        #     gs.raise_exception("`links_idx` contains at least one link that is not a base link.")
-
-        # Raise exception for fixed links with at least one geom and non-batched fixed vertices, except if setting same
-        # location for all envs at once
-        set_all_envs = torch.equal(torch.sort(envs_idx).values, self._scene._envs_idx)
-        has_fixed_verts = any(
-            link.is_fixed and link.geoms and not link.entity._batch_fixed_verts
-            for link in (self.links[i_l] for i_l in links_idx)
-        )
-        if has_fixed_verts and not (set_all_envs and (torch.diff(pos, dim=0).abs() < gs.EPS).all()):
-            gs.raise_exception(
-                "Specifying env-specific pos for fixed links with at least one geometry requires setting morph "
-                "option 'batch_fixed_verts=True'."
+        # Zero-copy fast path: single base link, bool mask, non-relative
+        if (
+            gs.use_zerocopy
+            and not relative
+            and isinstance(links_idx, int)
+            and isinstance(envs_idx, torch.Tensor)
+            and envs_idx.dtype == torch.bool
+        ):
+            link = self.links[links_idx]
+            if link.is_fixed:
+                data = qd_to_torch(self.links_state.pos, transpose=True, copy=False)
+                target = data[:, links_idx]
+            else:
+                data = qd_to_torch(self._rigid_global_info.qpos, transpose=True, copy=False)
+                target = data[:, link.q_start : link.q_start + 3]
+            pos = broadcast_tensor(pos, gs.tc_float, target.shape)
+            torch.where(envs_idx[:, None], pos, target, out=target)
+        else:
+            pos, links_idx, envs_idx = self._sanitize_io_variables(
+                pos, links_idx, self.n_links, "links_idx", envs_idx, (3,), skip_allocation=True
             )
+            if self.n_envs == 0:
+                pos = pos[None]
 
-        # Wake up hibernated entities before setting position
-        if self._options.use_hibernation:
-            kernel_wake_up_entities_by_links(
+            # Raise exception for fixed links with at least one geom and non-batched fixed vertices, except if setting
+            # same location for all envs at once
+            set_all_envs = torch.equal(torch.sort(envs_idx).values, self._scene._envs_idx)
+            has_fixed_verts = any(
+                link.is_fixed and link.geoms and not link.entity._batch_fixed_verts
+                for link in (self.links[i_l] for i_l in links_idx)
+            )
+            if has_fixed_verts and not (set_all_envs and (torch.diff(pos, dim=0).abs() < gs.EPS).all()):
+                gs.raise_exception(
+                    "Specifying env-specific pos for fixed links with at least one geometry requires setting morph "
+                    "option 'batch_fixed_verts=True'."
+                )
+
+            # Wake up hibernated entities before setting position (fixed links don't need wake-up)
+            if self._options.use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
+                kernel_wake_up_entities_by_links(
+                    links_idx,
+                    envs_idx,
+                    links_info=self.links_info,
+                    links_state=self.links_state,
+                    entities_state=self.entities_state,
+                    entities_info=self.entities_info,
+                    dofs_state=self.dofs_state,
+                    geoms_state=self.geoms_state,
+                    rigid_global_info=self._rigid_global_info,
+                    static_rigid_sim_config=self._static_rigid_sim_config,
+                )
+
+            kernel_set_links_pos(
+                relative,
+                pos,
                 links_idx,
                 envs_idx,
                 links_info=self.links_info,
                 links_state=self.links_state,
-                entities_state=self.entities_state,
-                entities_info=self.entities_info,
-                dofs_state=self.dofs_state,
-                geoms_state=self.geoms_state,
                 rigid_global_info=self._rigid_global_info,
                 static_rigid_sim_config=self._static_rigid_sim_config,
             )
 
-        kernel_set_links_pos(
-            relative,
-            pos,
-            links_idx,
-            envs_idx,
-            links_info=self.links_info,
-            links_state=self.links_state,
-            rigid_global_info=self._rigid_global_info,
-            static_rigid_sim_config=self._static_rigid_sim_config,
-        )
-
-        kernel_forward_kinematics_links_geoms(
-            envs_idx,
-            links_state=self.links_state,
-            links_info=self.links_info,
-            joints_state=self.joints_state,
-            joints_info=self.joints_info,
-            dofs_state=self.dofs_state,
-            dofs_info=self.dofs_info,
-            geoms_state=self.geoms_state,
-            geoms_info=self.geoms_info,
-            entities_info=self.entities_info,
-            rigid_global_info=self._rigid_global_info,
-            static_rigid_sim_config=self._static_rigid_sim_config,
-        )
-        self._is_forward_pos_updated = True
-        self._is_forward_vel_updated = True
+        if not skip_forward:
+            if not isinstance(envs_idx, torch.Tensor):
+                envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            if envs_idx.dtype == torch.bool:
+                fn = kernel_masked_forward_kinematics_links_geoms
+            else:
+                fn = kernel_forward_kinematics_links_geoms
+            fn(
+                envs_idx,
+                links_state=self.links_state,
+                links_info=self.links_info,
+                joints_state=self.joints_state,
+                joints_info=self.joints_info,
+                dofs_state=self.dofs_state,
+                dofs_info=self.dofs_info,
+                geoms_state=self.geoms_state,
+                geoms_info=self.geoms_info,
+                entities_info=self.entities_info,
+                rigid_global_info=self._rigid_global_info,
+                static_rigid_sim_config=self._static_rigid_sim_config,
+            )
+            self._is_forward_pos_updated = True
+            self._is_forward_vel_updated = True
+        else:
+            self._is_forward_pos_updated = False
+            self._is_forward_vel_updated = False
 
     def set_links_quat(self, quat, links_idx=None, envs_idx=None):
         raise DeprecationError("This method has been removed. Please use 'set_base_links_quat' instead.")
 
-    def set_base_links_quat(self, quat, links_idx=None, envs_idx=None, *, relative=False):
+    def set_base_links_quat(self, quat, links_idx=None, envs_idx=None, *, relative=False, skip_forward=False):
         if links_idx is None:
             links_idx = self._base_links_idx
-        quat, links_idx, envs_idx = self._sanitize_io_variables(
-            quat, links_idx, self.n_links, "links_idx", envs_idx, (4,), skip_allocation=True
-        )
-        if self.n_envs == 0:
-            quat = quat[None]
 
-        # FIXME: This check is too expensive
-        # if not torch.isin(links_idx, self._base_links_idx).all():
-        #     gs.raise_exception("`links_idx` contains at least one link that is not a base link.")
+        # Zero-copy fast path: single base link, bool mask, non-relative
+        if (
+            gs.use_zerocopy
+            and not relative
+            and isinstance(links_idx, int)
+            and isinstance(envs_idx, torch.Tensor)
+            and envs_idx.dtype == torch.bool
+        ):
+            link = self.links[links_idx]
+            if link.is_fixed:
+                data = qd_to_torch(self.links_state.quat, transpose=True, copy=False)
+                target = data[:, links_idx]
+            else:
+                data = qd_to_torch(self._rigid_global_info.qpos, transpose=True, copy=False)
+                target = data[:, link.q_start + 3 : link.q_start + 7]
+            quat = broadcast_tensor(quat, gs.tc_float, target.shape)
+            torch.where(envs_idx[:, None], quat, target, out=target)
+        else:
+            quat, links_idx, envs_idx = self._sanitize_io_variables(
+                quat, links_idx, self.n_links, "links_idx", envs_idx, (4,), skip_allocation=True
+            )
+            if self.n_envs == 0:
+                quat = quat[None]
 
-        set_all_envs = torch.equal(torch.sort(envs_idx).values, self._scene._envs_idx)
-        has_fixed_verts = any(
-            link.is_fixed and link.geoms and not link.entity._batch_fixed_verts
-            for link in (self.links[i_l] for i_l in links_idx)
-        )
-        if has_fixed_verts and not (set_all_envs and (torch.diff(quat, dim=0).abs() < gs.EPS).all()):
-            gs.raise_exception("Impossible to set env-specific quat for fixed links with at least one geometry.")
+            set_all_envs = torch.equal(torch.sort(envs_idx).values, self._scene._envs_idx)
+            has_fixed_verts = any(
+                link.is_fixed and link.geoms and not link.entity._batch_fixed_verts
+                for link in (self.links[i_l] for i_l in links_idx)
+            )
+            if has_fixed_verts and not (set_all_envs and (torch.diff(quat, dim=0).abs() < gs.EPS).all()):
+                gs.raise_exception("Impossible to set env-specific quat for fixed links with at least one geometry.")
 
-        # Wake up hibernated entities before setting quaternion
-        if self._options.use_hibernation:
-            kernel_wake_up_entities_by_links(
+            # Wake up hibernated entities before setting quaternion (fixed links don't need wake-up)
+            if self._options.use_hibernation and not all(self.links[i_l].is_fixed for i_l in links_idx):
+                kernel_wake_up_entities_by_links(
+                    links_idx,
+                    envs_idx,
+                    links_info=self.links_info,
+                    links_state=self.links_state,
+                    entities_state=self.entities_state,
+                    entities_info=self.entities_info,
+                    dofs_state=self.dofs_state,
+                    geoms_state=self.geoms_state,
+                    rigid_global_info=self._rigid_global_info,
+                    static_rigid_sim_config=self._static_rigid_sim_config,
+                )
+
+            kernel_set_links_quat(
+                relative,
+                quat,
                 links_idx,
                 envs_idx,
                 links_info=self.links_info,
                 links_state=self.links_state,
-                entities_state=self.entities_state,
-                entities_info=self.entities_info,
-                dofs_state=self.dofs_state,
-                geoms_state=self.geoms_state,
                 rigid_global_info=self._rigid_global_info,
                 static_rigid_sim_config=self._static_rigid_sim_config,
             )
 
-        kernel_set_links_quat(
-            relative,
-            quat,
-            links_idx,
-            envs_idx,
-            links_info=self.links_info,
-            links_state=self.links_state,
-            rigid_global_info=self._rigid_global_info,
-            static_rigid_sim_config=self._static_rigid_sim_config,
-        )
-
-        kernel_forward_kinematics_links_geoms(
-            envs_idx,
-            links_state=self.links_state,
-            links_info=self.links_info,
-            joints_state=self.joints_state,
-            joints_info=self.joints_info,
-            dofs_state=self.dofs_state,
-            dofs_info=self.dofs_info,
-            geoms_state=self.geoms_state,
-            geoms_info=self.geoms_info,
-            entities_info=self.entities_info,
-            rigid_global_info=self._rigid_global_info,
-            static_rigid_sim_config=self._static_rigid_sim_config,
-        )
-        self._is_forward_pos_updated = True
-        self._is_forward_vel_updated = True
+        if not skip_forward:
+            if not isinstance(envs_idx, torch.Tensor):
+                envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            if envs_idx.dtype == torch.bool:
+                fn = kernel_masked_forward_kinematics_links_geoms
+            else:
+                fn = kernel_forward_kinematics_links_geoms
+            fn(
+                envs_idx,
+                links_state=self.links_state,
+                links_info=self.links_info,
+                joints_state=self.joints_state,
+                joints_info=self.joints_info,
+                dofs_state=self.dofs_state,
+                dofs_info=self.dofs_info,
+                geoms_state=self.geoms_state,
+                geoms_info=self.geoms_info,
+                entities_info=self.entities_info,
+                rigid_global_info=self._rigid_global_info,
+                static_rigid_sim_config=self._static_rigid_sim_config,
+            )
+            self._is_forward_pos_updated = True
+            self._is_forward_vel_updated = True
+        else:
+            self._is_forward_pos_updated = False
+            self._is_forward_vel_updated = False
 
     def set_links_mass_shift(self, mass, links_idx=None, envs_idx=None):
         mass, links_idx, envs_idx = self._sanitize_io_variables(
@@ -1816,19 +1933,20 @@ class RigidSolver(KinematicSolver):
             assign_indexed_tensor(mass_data, mask, mass_data[mask] * ratio_t)
             assign_indexed_tensor(inertial_i_data, mask, inertial_i_data[mask] * ratio_t[..., None, None])
             assign_indexed_tensor(invweight_data, mask, invweight_data[mask] / ratio_t[..., None])
-        else:
-            ratio, links_idx, envs_idx = self._sanitize_io_variables(
-                ratio,
-                links_idx,
-                self.n_links,
-                "links_idx",
-                envs_idx,
-                batched=self._options.batch_links_info,
-                skip_allocation=True,
-            )
-            if self.n_envs == 0 and self._options.batch_links_info:
-                ratio = ratio[None]
-            kernel_adjust_link_inertia(ratio, links_idx, envs_idx, self.links_info, self._static_rigid_sim_config)
+            return
+
+        ratio, links_idx, envs_idx = self._sanitize_io_variables(
+            ratio,
+            links_idx,
+            self.n_links,
+            "links_idx",
+            envs_idx,
+            batched=self._options.batch_links_info,
+            skip_allocation=True,
+        )
+        if self.n_envs == 0 and self._options.batch_links_info:
+            ratio = ratio[None]
+        kernel_adjust_link_inertia(ratio, links_idx, envs_idx, self.links_info, self._static_rigid_sim_config)
 
     def set_geoms_friction_ratio(self, friction_ratio, geoms_idx=None, envs_idx=None):
         friction_ratio, geoms_idx, envs_idx = self._sanitize_io_variables(
@@ -2012,8 +2130,6 @@ class RigidSolver(KinematicSolver):
                 num_values = len(tensor_list)
                 for j, mask_j in enumerate(((*mask, ..., j) for j in range(num_values)) if num_values > 1 else (mask,)):
                     assign_indexed_tensor(data, mask_j, tensor_list[j])
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         tensor_list = list(tensor_list)
@@ -2115,8 +2231,6 @@ class RigidSolver(KinematicSolver):
         if gs.use_zerocopy:
             errno = qd_to_torch(self._errno, copy=False)
             errno[envs_idx] = 0
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
         else:
             kernel_set_zero(envs_idx, self._errno)
 
@@ -2144,8 +2258,6 @@ class RigidSolver(KinematicSolver):
             ctrl_mode[mask] = gs.CTRL_MODE.FORCE
             ctrl_force = qd_to_torch(self.dofs_state.ctrl_force, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_force, mask, force)
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         force, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2165,8 +2277,6 @@ class RigidSolver(KinematicSolver):
             ctrl_pos[mask] = 0.0
             ctrl_vel = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_vel, mask, velocity)
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         velocity, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2186,8 +2296,6 @@ class RigidSolver(KinematicSolver):
             assign_indexed_tensor(ctrl_pos, mask, position)
             ctrl_vel = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             ctrl_vel[mask] = 0.0
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         position, dofs_idx, envs_idx = self._sanitize_io_variables(
@@ -2207,8 +2315,6 @@ class RigidSolver(KinematicSolver):
             assign_indexed_tensor(ctrl_pos, mask, position)
             ctrl_vel = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_vel, mask, velocity)
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
             return
 
         position, dofs_idx, _ = self._sanitize_io_variables(
@@ -2544,8 +2650,9 @@ class RigidSolver(KinematicSolver):
             for tensor in (self.links_state.cfrc_applied_ang, self.links_state.cfrc_applied_vel):
                 out = qd_to_torch(tensor, copy=False)
                 out.zero_()
-        else:
-            kernel_clear_external_force(self.links_state, self._rigid_global_info, self._static_rigid_sim_config)
+            return
+
+        kernel_clear_external_force(self.links_state, self._rigid_global_info, self._static_rigid_sim_config)
 
     @gs.assert_built
     def set_gravity(self, gravity, envs_idx=None):
@@ -2652,7 +2759,7 @@ class RigidSolver(KinematicSolver):
         return gs.List(equality for entity in self._entities for equality in entity.equalities)
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def kernel_step_1(
     links_state: array_class.LinksState,
     links_info: array_class.LinksInfo,
@@ -2679,8 +2786,8 @@ def kernel_step_1(
             joints_info=joints_info,
             dofs_state=dofs_state,
             dofs_info=dofs_info,
-            geoms_info=geoms_info,
             geoms_state=geoms_state,
+            geoms_info=geoms_info,
             entities_info=entities_info,
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
@@ -2716,7 +2823,7 @@ def kernel_step_1(
     )
 
 
-@qd.kernel(fastcache=gs.use_fastcache)
+@qd.kernel(fastcache=True)
 def kernel_step_2(
     dofs_state: array_class.DofsState,
     dofs_info: array_class.DofsInfo,
@@ -2733,7 +2840,7 @@ def kernel_step_2(
     static_rigid_sim_config: qd.template(),
     contact_island_state: array_class.ContactIslandState,
     is_backward: qd.template(),
-    errno: array_class.V_ANNOTATION,
+    errno: qd.Tensor,
 ):
     # Position, Velocity and Acceleration data must be consistent when computing links acceleration, otherwise it
     # would not corresponds to anyting physical. There is no other way than doing this right before integration,
@@ -2807,8 +2914,8 @@ def kernel_step_2(
                 joints_info=joints_info,
                 dofs_state=dofs_state,
                 dofs_info=dofs_info,
-                geoms_info=geoms_info,
                 geoms_state=geoms_state,
+                geoms_info=geoms_info,
                 entities_info=entities_info,
                 rigid_global_info=rigid_global_info,
                 static_rigid_sim_config=static_rigid_sim_config,

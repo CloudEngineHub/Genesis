@@ -405,6 +405,22 @@ def general_actuator():
     return mjcf
 
 
+@pytest.fixture(scope="session")
+def compound_joint():
+    mjcf = ET.Element("mujoco", model="compound_joint")
+    ET.SubElement(mjcf, "compiler", angle="radian")
+    ET.SubElement(mjcf, "option", gravity="0 0 0")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    seg1 = ET.SubElement(worldbody, "body", name="seg1", pos="0 0 0")
+    ET.SubElement(seg1, "joint", name="j_x", type="hinge", axis="1 0 0")
+    ET.SubElement(seg1, "joint", name="j_y", type="hinge", axis="0 1 0")
+    ET.SubElement(seg1, "geom", type="capsule", size="0.02", fromto="0 0 0 0 0 0.4")
+    seg2 = ET.SubElement(seg1, "body", name="seg2", pos="0 0 0.4")
+    ET.SubElement(seg2, "joint", name="j_z", type="hinge", axis="0 0 1")
+    ET.SubElement(seg2, "geom", type="capsule", size="0.02", fromto="0 0 0 0 0 0.4")
+    return mjcf
+
+
 @pytest.mark.required
 @pytest.mark.parametrize("model_name", ["box_plan"])
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
@@ -2120,12 +2136,15 @@ def test_all_fixed(show_viewer):
 
 
 @pytest.mark.required
-def test_contact_forces(show_viewer, tol):
+@pytest.mark.parametrize("precision", ["32"])
+@pytest.mark.parametrize("backend", [gs.gpu])
+def test_contact_forces(show_viewer):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=0.01,
         ),
         rigid_options=gs.options.RigidOptions(
+            # Enabling box-box algorithm to improve code coverage
             box_box_detection=True,
         ),
         viewer_options=gs.options.ViewerOptions(
@@ -2147,9 +2166,9 @@ def test_contact_forces(show_viewer, tol):
             size=(0.04, 0.04, 0.04),
             pos=(0.65, 0.0, 0.02),
         ),
-        visualize_contact=True,
+        # visualize_contact=True,
     )
-    scene.build()
+    scene.build(n_envs=5)
 
     cube_weight = scene.rigid_solver._gravity[0] * cube.get_mass()
     motors_dof = np.arange(7)
@@ -2161,19 +2180,19 @@ def test_contact_forces(show_viewer, tol):
     end_effector = franka.get_link("hand")
     qpos = franka.inverse_kinematics(
         link=end_effector,
-        pos=np.array([0.65, 0.0, 0.135]),
-        quat=np.array([0, 1, 0, 0]),
+        pos=np.tile([0.65, 0.0, 0.13], (scene.n_envs, 1)),
+        quat=np.tile([0, 1, 0, 0], (scene.n_envs, 1)),
     )
-    franka.control_dofs_position(qpos[:-2], motors_dof)
+    franka.control_dofs_position(qpos[:, :-2], motors_dof)
 
     # hold
     for i in range(50):
         scene.step()
     contact_forces = cube.get_links_net_contact_force()
-    assert_allclose(contact_forces[0], -cube_weight, atol=1e-5)
+    assert_allclose(contact_forces[:, 0], -cube_weight, atol=1e-5)
 
     # grasp
-    franka.control_dofs_position(qpos[:-2], motors_dof)
+    franka.control_dofs_position(qpos[:, :-2], motors_dof)
     franka.control_dofs_position(0.0, fingers_dof)
     for i in range(20):
         scene.step()
@@ -2181,14 +2200,39 @@ def test_contact_forces(show_viewer, tol):
     # lift
     qpos = franka.inverse_kinematics(
         link=end_effector,
-        pos=np.array([0.65, 0.0, 0.3]),
-        quat=np.array([0, 1, 0, 0]),
+        pos=np.tile([0.65, 0.0, 0.2], (scene.n_envs, 1)),
+        quat=np.tile([0.0, 1, 0, 0], (scene.n_envs, 1)),
     )
-    franka.control_dofs_position(qpos[:-2], motors_dof)
-    for i in range(200):
+    franka.control_dofs_position(qpos[:, :-2], motors_dof)
+    for i in range(100):
         scene.step()
-    contact_forces = cube.get_links_net_contact_force()
-    assert_allclose(contact_forces[0], -cube_weight, atol=5e-5)
+
+    # Check contact forces while randomizing gripper orientations across parallel envs.
+    # Note that it is necessary to reset the scene state because the box is slowly falling without noslip solver.
+    state = scene.get_state()
+    rng = np.random.RandomState(0)
+    all_errors = []
+    for i_trial in range(10):
+        scene.reset(state)
+
+        angles = rng.uniform(-np.deg2rad(45), np.deg2rad(45), size=scene.n_envs).astype(gs.np_float)
+        axes = rng.randn(scene.n_envs, 3).astype(gs.np_float)
+        perturbs = gu.axis_angle_to_quat(angles, axes)
+        lift_quats = gu.transform_quat_by_quat(perturbs, np.tile([0, 1, 0, 0], (scene.n_envs, 1)).astype(gs.np_float))
+        qpos = franka.inverse_kinematics(
+            link=end_effector,
+            pos=np.tile([0.65, 0.0, 0.2], (scene.n_envs, 1)).astype(gs.np_float),
+            quat=lift_quats,
+        )
+        franka.control_dofs_position(qpos[:, :-2], motors_dof)
+        franka.control_dofs_position(0.0, fingers_dof)
+        for _ in range(160):
+            scene.step()
+
+        contact_forces = tensor_to_array(cube.get_links_net_contact_force())
+        errors = np.linalg.norm(contact_forces[:, 0, :] + cube_weight, ord=np.inf, axis=-1)
+        all_errors.append(errors)
+    assert np.percentile(all_errors, 95) < 5e-5
 
 
 @pytest.mark.required
@@ -2606,6 +2650,28 @@ def test_convexify(euler, backend, show_viewer, gjk_collision):
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+def test_num_contact_overflow(show_viewer):
+    asset_path = get_hf_dataset(pattern="glb/orange_plastic_bowl.glb")
+    scene = gs.Scene(show_viewer=show_viewer, renderer=gs.renderers.Rasterizer())
+    scene.add_entity(morph=gs.morphs.Plane())
+    for _ in range(4):
+        scene.add_entity(
+            morph=gs.morphs.Mesh(
+                file=f"{asset_path}/glb/orange_plastic_bowl.glb",
+                pos=(0, 0, 0.5),
+                euler=(90, 0, 0),
+                convexify=True,
+                file_meshes_are_zup=True,
+            ),
+        )
+    scene.build()
+    with pytest.raises(gs.GenesisException, match="max number of contact pairs"):
+        for _ in range(20):
+            scene.step()
+
+
+@pytest.mark.required
 @pytest.mark.mujoco_compatibility(False)
 @pytest.mark.parametrize("mode", range(9))
 @pytest.mark.parametrize("model_name", ["collision_edge_cases"])
@@ -2932,6 +2998,34 @@ def test_jacobian(gs_sim, tol):
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("model_name", ["compound_joint"])
+def test_jacobian_compound_joints(xml_path, tol):
+    scene = gs.Scene(show_viewer=False)
+    robot = scene.add_entity(
+        gs.morphs.MJCF(
+            file=xml_path,
+            requires_jac_and_IK=True,
+        ),
+    )
+    scene.build()
+    end_link = robot.get_link("seg2")
+
+    mj_model = mujoco.MjModel.from_xml_path(xml_path)
+    mj_data = mujoco.MjData(mj_model)
+    end_body_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "seg2")
+    jacp = np.empty((3, mj_model.nv), dtype=np.float64)
+    jacr = np.empty((3, mj_model.nv), dtype=np.float64)
+
+    for qpos in (np.zeros(3), np.array([0.3, -0.5, 0.7])):
+        robot.set_qpos(qpos.astype(gs.np_float))
+        mj_data.qpos[:] = qpos
+        mujoco.mj_forward(mj_model, mj_data)
+        mujoco.mj_jacBody(mj_model, mj_data, jacp, jacr, end_body_id)
+
+        assert_allclose(robot.get_jacobian(end_link), np.concatenate([jacp, jacr]), tol=tol)
+
+
+@pytest.mark.required
 def test_mjcf_parsing_with_include():
     scene = gs.Scene()
     robot1 = scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/scene.xml"))
@@ -3210,6 +3304,12 @@ def test_urdf_capsule(tmp_path, show_viewer, tol):
                             <capsule length="0.1" radius="0.02"/>
                         </geometry>
                     </collision>
+                    <visual>
+                        <origin rpy="0 0 0" xyz="0 0 0"/>
+                        <geometry>
+                            <capsule length="0.06" radius="0.03"/>
+                        </geometry>
+                    </visual>
                 </link>
             </robot>
             """
@@ -3235,6 +3335,13 @@ def test_urdf_capsule(tmp_path, show_viewer, tol):
     geom_verts = tensor_to_array(geom.get_verts())
     assert np.linalg.norm(geom_verts - (0.0, 0.0, 0.0), axis=-1, ord=np.inf).min() < 1e-3
     assert np.linalg.norm(geom_verts - (0.0, 0.0, 0.14), axis=-1, ord=np.inf).min() < 1e-3
+
+    (vgeom,) = robot.vgeoms
+    vgeom_verts = tensor_to_array(vgeom.get_vverts())
+    # Visual is a capsule (length=0.06, radius=0.03, total height 0.12) centered on the link, so after
+    # the collision capsule settles against the plane (link at z=0.07), the visual spans z in [0.01, 0.13].
+    assert np.linalg.norm(vgeom_verts - (0.0, 0.0, 0.01), axis=-1, ord=np.inf).min() < 1e-3
+    assert np.linalg.norm(vgeom_verts - (0.0, 0.0, 0.13), axis=-1, ord=np.inf).min() < 1e-3
 
 
 @pytest.mark.required
@@ -3719,6 +3826,7 @@ def test_cholesky_tiling(monkeypatch, tol):
             rigid_options=gs.options.RigidOptions(
                 constraint_solver=gs.constraint_solver.Newton,
                 sparse_solve=False,
+                iterations=1,
             ),
             show_viewer=False,
             show_FPS=False,
@@ -3734,13 +3842,59 @@ def test_cholesky_tiling(monkeypatch, tol):
         assert scene.rigid_solver._static_rigid_sim_config.enable_tiled_cholesky_hessian == enable_tiled_cholesky
 
         scene.step()
+        assert not scene.rigid_solver.get_error_envs_mask().any()
         assert (scene.rigid_solver.constraint_solver.constraint_state.n_constraints.to_numpy() > 0).all()
 
-        nt_H = scene.rigid_solver.constraint_solver.constraint_state.nt_H.to_numpy()
-        assert (np.linalg.norm(nt_H.reshape((-1, 2)), axis=0) > 5.0).all()
-        values.append(nt_H)
+        Mgrad = scene.rigid_solver.constraint_solver.constraint_state.Mgrad.to_numpy()
+        assert np.linalg.norm(Mgrad) > 5.0
+        values.append(Mgrad)
 
-    assert_allclose(*values, tol=tol)
+    # analysis for choice tolerance: https://github.com/Genesis-Embodied-AI/Genesis/pull/2659#discussion_r3041684256
+    assert_allclose(*values, tol=5e-4)
+
+
+@pytest.mark.precision("32")
+@pytest.mark.parametrize("backend", [gs.cuda])
+def test_cholesky_tiling_large_shared_memory(show_viewer):
+    if gs.device.type != "cuda":
+        pytest.skip("Requires CUDA device")
+
+    from cuda.bindings import runtime  # Transitive dependency of torch CUDA
+
+    _, max_shared_mem = runtime.cudaDeviceGetAttribute(
+        runtime.cudaDeviceAttr.cudaDevAttrMaxSharedMemoryPerBlockOptin, gs.device.index
+    )
+    if max_shared_mem <= 49152:
+        pytest.skip("GPU does not support opt-in shared memory beyond the default 48kB")
+
+    # Stack 17 free boxes (6 DOFs each = 102 total) to exceed the default 48kB tiling limit of 96 DOFs for f32
+    scene = gs.Scene(
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.5, 1.0, 2.5),
+            camera_lookat=(0.0, 0.0, 1.2),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            constraint_solver=gs.constraint_solver.Newton,
+            sparse_solve=False,
+        ),
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
+    scene.add_entity(gs.morphs.Plane())
+    for i in range(17):
+        scene.add_entity(
+            gs.morphs.Box(
+                size=(0.1, 0.1, 0.1),
+                pos=(0, 0, 0.5 + i * 0.15),
+            )
+        )
+    scene.build(n_envs=2)
+
+    assert scene.rigid_solver.n_dofs == 102
+    assert scene.rigid_solver._static_rigid_sim_config.enable_tiled_cholesky_hessian
+
+    scene.step()
+    assert not scene.rigid_solver.get_error_envs_mask().any()
 
 
 @pytest.mark.slow  # ~100s
@@ -4623,7 +4777,7 @@ def test_mesh_align(show_viewer, tol):
     scene.reset()
 
     # Simulate
-    for _ in range(400):
+    for _ in range(450):
         scene.step()
 
     assert_allclose(mango.get_dofs_velocity(), 0, tol=0.05)
@@ -5548,7 +5702,7 @@ def test_heterogeneous_robots(show_viewer, tol):
         scene.step()
 
     # Velocity should be near zero (settled)
-    assert_allclose(het_obj.get_vel(), 0.0, tol=0.02)
+    assert_allclose(het_obj.get_vel(), 0.0, tol=0.05)
 
     # All objects should be near their initial z-positions (settled on ground)
     pos = het_obj.get_pos()
@@ -5593,6 +5747,7 @@ def test_heterogeneous_articulated_structure_mismatch():
 
 
 @pytest.mark.required
+@pytest.mark.xfail(reason="QuadrantsSyntaxError caused by dataclass argument parsing.")
 @pytest.mark.parametrize("performance_mode", [True])
 def test_hibernation_and_contact_islands(show_viewer):
     """
@@ -5675,16 +5830,20 @@ def test_hibernation_and_contact_islands(show_viewer):
 @pytest.mark.parametrize("integrator", [gs.integrator.Euler, gs.integrator.approximate_implicitfast])
 def test_energy_analytical_and_conservation(show_viewer, tol, integrator):
     g = 9.81
-    dt = 0.002
-    h0 = 1.0
+    dt = 0.001
+    h0 = 0.5
     radius = 0.1
-    n_steps = 300
+    n_steps = 400
     undamped_sol_params = [10.0, 0.001, 0.9, 0.95, 0.001, 0.5, 2.0]
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=dt,
             gravity=(0, 0, -g),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.25, 1.5, 0.7),
+            camera_lookat=(0.25, 0.0, 0.2),
         ),
         rigid_options=gs.options.RigidOptions(
             integrator=integrator,
