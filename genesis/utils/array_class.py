@@ -318,6 +318,11 @@ def get_constraint_state(constraint_solver, solver):
     # Cooperative kernels read the same flag at compile time to switch between serial and warp-cooperative reductions.
     # See perso_hugh/doc/linesearch_shuffle.md.
     con_layout = (1, 0) if solver._static_rigid_sim_config.constraint_layout_transposed else None
+    # The 3D Jacobian and its sparse-column-index sibling extend the flip: canonical (len_constraints_, n_dofs_, _B) ->
+    # physical (_B, n_dofs_, len_constraints_) via layout=(2, 1, 0). This makes cooperative-warp-per-env access (lanes
+    # stride i_c) coalesced for the hot p0 J@search, hessian_direct_tiled, and patch_hessian_delta kernels.
+    # See perso_hugh/doc/linesearch/linesearch_p0_opt.md.
+    jac_layout = (2, 1, 0) if solver._static_rigid_sim_config.constraint_layout_transposed else None
 
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
     efc_AR_shape = maybe_shape((len_constraints_, len_constraints_, _B), solver._options.noslip_iterations > 0)
@@ -390,8 +395,12 @@ def get_constraint_state(constraint_solver, solver):
         efc_force=V(dtype=gs.qd_float, shape=(len_constraints_, _B)),
         efc_D=V(dtype=gs.qd_float, shape=(len_constraints_, _B), layout=con_layout),
         jv=V(dtype=gs.qd_float, shape=(len_constraints_, _B), layout=con_layout),
-        jac=V(dtype=gs.qd_float, shape=jac_shape),
-        jac_relevant_dofs=V(dtype=gs.qd_int, shape=jac_relevant_dofs_shape),
+        jac=V(dtype=gs.qd_float, shape=jac_shape, layout=jac_layout),
+        jac_relevant_dofs=V(
+            dtype=gs.qd_int,
+            shape=jac_relevant_dofs_shape,
+            layout=jac_layout if constraint_solver.sparse_solve else None,
+        ),
         jac_n_relevant_dofs=V(dtype=gs.qd_int, shape=jac_n_relevant_dofs_shape),
         # Backward gradients
         dL_dqacc=V(dtype=gs.qd_float, shape=maybe_shape((solver.n_dofs_, _B), solver._requires_grad)),
@@ -1307,7 +1316,7 @@ def get_sdf_geom_info(n_geoms):
         T_mesh_to_sdf=V_MAT(n=4, m=4, dtype=gs.qd_float, shape=(n_geoms,)),
         sdf_res=V_VEC(3, dtype=gs.qd_int, shape=(n_geoms,)),
         sdf_max=V(dtype=gs.qd_float, shape=(n_geoms,)),
-        sdf_cell_size=V(dtype=gs.qd_float, shape=(n_geoms,)),
+        sdf_cell_size=V_VEC(3, dtype=gs.qd_float, shape=(n_geoms,)),
         sdf_cell_start=V(dtype=gs.qd_int, shape=(n_geoms,)),
     )
 
