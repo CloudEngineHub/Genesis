@@ -144,6 +144,18 @@ def get_rigid_global_info(solver, kinematic_only):
             f"Mass matrix buffer shape (2, n_dofs={solver.n_dofs_}, n_dofs={solver.n_dofs_}, n_envs={_B}) is too large."
         )
 
+    # Flip mass_mat from canonical (n_dofs(i_d1), n_dofs(i_d2), _B) -> physical (_B, n_dofs(i_d2), n_dofs(i_d1)) via
+    # layout=(2, 1, 0): i_d1 becomes innermost / stride-1, which coalesces consumer kernels whose lanes stride i_d1
+    # with a serial inner i_d2 loop. The trade-off is regression on writer-side kernels that pair with cooperative
+    # rewrites to recover under the same constraint_layout_transposed flag.
+    #
+    # mass_mat_L stays canonical. Its dominant consumer is a serial Cholesky-style back-substitution that is already
+    # coalesced under (n_dofs, n_dofs, _B) with lanes varying i_b, so flipping L would regress that path more than
+    # the corresponding writer-side win on the tiled factor_mass.
+    mass_mat_layout = (
+        (2, 1, 0) if not kinematic_only and solver._static_rigid_sim_config.constraint_layout_transposed else None
+    )
+
     # FIXME: Add a better split between kinematic and Genesis
     if kinematic_only:
         return RigidGlobalInfo(
@@ -196,7 +208,7 @@ def get_rigid_global_info(solver, kinematic_only):
         qpos_next=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B), needs_grad=requires_grad),
         links_T=V_MAT(n=4, m=4, dtype=gs.qd_float, shape=(solver.n_links_,)),
         geoms_init_AABB=V_VEC(3, dtype=gs.qd_float, shape=(solver.n_geoms_, 8)),
-        mass_mat=V(dtype=gs.qd_float, shape=mass_mat_shape, needs_grad=requires_grad),
+        mass_mat=V(dtype=gs.qd_float, shape=mass_mat_shape, layout=mass_mat_layout, needs_grad=requires_grad),
         mass_mat_L=V(dtype=gs.qd_float, shape=mass_mat_shape, needs_grad=requires_grad),
         mass_mat_L_bw=V(dtype=gs.qd_float, shape=mass_mat_shape_bw, needs_grad=requires_grad),
         mass_mat_D_inv=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), needs_grad=requires_grad),
@@ -313,16 +325,22 @@ def get_constraint_state(constraint_solver, solver):
     _B = solver._B
     len_constraints_ = constraint_solver.len_constraints_
 
+    # All three constraint-state layout flips (con / jac / dof_vec) gate on the same `constraint_layout_transposed`
+    # static-config flag. See `_should_transpose_constraint_layout` in rigid_solver.py for the heuristic, and the
+    # per-flip docs below.
+    transposed = solver._static_rigid_sim_config.constraint_layout_transposed
     # Layout-flippable constraint-state tensors (Jaref, jv, efc_D, efc_frictionloss, diag, active) keep their
     # canonical (len_constraints_, _B) shape; the static config flag picks the physical layout via ``layout=(1, 0)``.
     # Cooperative kernels read the same flag at compile time to switch between serial and warp-cooperative reductions.
-    # See perso_hugh/doc/linesearch_shuffle.md.
-    con_layout = (1, 0) if solver._static_rigid_sim_config.constraint_layout_transposed else None
+    con_layout = (1, 0) if transposed else None
     # The 3D Jacobian and its sparse-column-index sibling extend the flip: canonical (len_constraints_, n_dofs_, _B) ->
     # physical (_B, n_dofs_, len_constraints_) via layout=(2, 1, 0). This makes cooperative-warp-per-env access (lanes
     # stride i_c) coalesced for the hot p0 J@search, hessian_direct_tiled, and patch_hessian_delta kernels.
-    # See perso_hugh/doc/linesearch/linesearch_p0_opt.md.
-    jac_layout = (2, 1, 0) if solver._static_rigid_sim_config.constraint_layout_transposed else None
+    jac_layout = (2, 1, 0) if transposed else None
+    # DOF-vec family flip: canonical (n_dofs_, _B) -> physical (_B, n_dofs_) via layout=(1, 0). Adjacent-lane reads
+    # striding i_d in cooperative kernels become stride-1; the regression on 1T-per-(i_d, i_b) writers is patched on
+    # a per-consumer basis under the same constraint_layout_transposed flag.
+    dof_vec_layout = (1, 0) if transposed else None
 
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
     efc_AR_shape = maybe_shape((len_constraints_, len_constraints_, _B), solver._options.noslip_iterations > 0)
@@ -364,20 +382,20 @@ def get_constraint_state(constraint_solver, solver):
         ls_alpha_newton=V(dtype=gs.qd_float, shape=(_B,)),
         ls_gtol=V(dtype=gs.qd_float, shape=(_B,)),
         eq_sum=V(dtype=gs.qd_float, shape=(3, _B)),
-        Ma=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        Ma_ws=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        grad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
+        Ma=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        Ma_ws=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        grad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         MinvJT=V(dtype=gs.qd_float, shape=maybe_shape(jac_shape, solver._options.noslip_iterations > 0)),
-        search=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        qfrc_constraint=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        qacc=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        qacc_ws=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        qacc_prev=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        mv=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        cg_prev_grad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        cg_prev_Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
-        nt_vec=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B)),
+        search=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        qfrc_constraint=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        qacc=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        qacc_ws=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        qacc_prev=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        mv=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        cg_prev_grad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        cg_prev_Mgrad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
+        nt_vec=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         nt_H=V(dtype=gs.qd_float, shape=(_B, solver.n_dofs_, solver.n_dofs_)),
         incr_changed_idx=V(dtype=gs.qd_int, shape=(len_constraints_, _B)),
         incr_n_changed=V(dtype=gs.qd_int, shape=(_B,)),
