@@ -727,7 +727,7 @@ def get_collider_state(
     box_axi_shape = maybe_shape((3, _B), static_rigid_sim_config.box_box_detection)
     box_ppts2_shape = maybe_shape((4, 2, _B), static_rigid_sim_config.box_box_detection)
     box_pu_shape = maybe_shape((4, _B), static_rigid_sim_config.box_box_detection)
-    prune_shape = maybe_shape((max(max_contact_pairs, 1), _B), collider_static_config.link_pair_pruning_supported)
+    prune_shape = maybe_shape((max(max_contact_pairs, 1), _B), collider_static_config.has_prunable_contacts)
 
     return ColliderState(
         sort_buffer=get_sort_buffer(solver),
@@ -839,10 +839,15 @@ class ColliderStaticConfig(metaclass=AutoInitMeta):
     has_convex_specialization: bool
     has_nonconvex_nonterrain: bool
     # True when link-pair contact pruning can ever do useful work. False when every link has at most one convex geom
-    # and no terrain is present, because each (link_a, link_b) bucket then holds at most one geom-pair's contacts
-    # (capped at n_contacts_per_pair) and the 2D hull would be at best a marginal reduction. Lets us skip the pruning
-    # kernel call and its scratch buffers entirely.
-    link_pair_pruning_supported: bool
+    # and no terrain is present (each (link_a, link_b) bucket then holds at most one geom-pair's contacts, capped at
+    # n_contacts_per_pair, so the 2D hull is at best a marginal reduction) or when use_contact_island is True (the
+    # contact-island path consumes contact_data in physical layout and does not honor the sort_idx indirection).
+    # Lets us skip the pruning kernel call and its scratch buffers entirely.
+    has_prunable_contacts: bool
+    # True when func_clamp_prune_and_sort_contacts should also spatial-sort contacts by x-position. Gated by both
+    # narrowphase configuration (only meaningful when has_non_box_plane_convex_convex on GPU) and use_contact_island
+    # (the island path does not honor the resulting sort_idx permutation).
+    spatial_sort_supported: bool
     # maximum number of contact pairs per collision pair
     n_contacts_per_pair: int
     # ccd algorithm
@@ -2119,6 +2124,11 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     # based on n_dofs: 32 wins for large problems (e.g. dex_hand, n_dofs=62); 16 wins when n_dofs is small or lands in a
     # padding-unfavorable band (e.g. g1_fall, n_dofs=35).
     cholesky_tile_size: int = 32
+    # When True, the warm-start factor+solve in ``func_solve_init`` is dispatched through
+    # ``func_cholesky_and_solve_fused_tiled`` (single kernel, L kept in shared memory) instead of the separate
+    # ``func_cholesky_factor_direct_tiled`` + ``func_cholesky_solve_tiled`` pair. Requires
+    # ``enable_tiled_cholesky_hessian`` for the fused kernel to be available.
+    enable_fused_factor_solve_init: bool = False
     # When True, some constraint-state tensors (eg Jaref, efc_D, ...) are allocated with ``layout=(1, 0)``,
     # i.e. (_B, len_constraints_) physical storage. This unlocks coalesced cross-lane reads for the
     # subgroup-cooperative refinement in the linesearch and contiguous per-thread access.
