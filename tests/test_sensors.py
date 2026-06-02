@@ -1228,12 +1228,22 @@ def test_raycaster_against_visual(tmp_path, show_viewer, n_envs, kin_raycastable
     assert_allclose(cam_kin.read_image()[..., 15, 20], kin_at_origin, tol=1e-2)
     assert_allclose(cam_rigid.read_image()[..., 15, 20], 0.8, tol=1e-2)
 
+    # Every entity is fixed, so each visual BVH is static (maybe_static) and rebuilt only when a GEOMETRY change is
+    # pending; nothing is pending after the baseline step, so an idle step would rebuild none of them.
+    visual_entries = [entry for entry in cam_kin._shared_metadata.solver_bvhs if entry.raycast_mask is not None]
+    assert visual_entries and all(entry.maybe_static for entry in visual_entries)
+    assert all(not entry.rebuild_subscriber.pending for entry in visual_entries)
+
     # Scale the kinematic sphere by 2x around its center via per-vertex set_vverts. The new radius is 0.4, so the
     # closest point becomes x=-0.4 and the depth at the center pixel drops to 0.6. Scaling perturbs each vvert by a
     # different amount, so only the correct vvert-to-state mapping yields 0.6. cam_rigid is unaffected.
     fk_vverts = tensor_to_array(kin_sphere.get_vverts())
     center = np.array([0.0, 0.0, 0.5], dtype=np.float32)
     kin_sphere.set_vverts((fk_vverts - center) * 2.0 + center)
+    if kin_raycastable:
+        # set_vverts is a GEOMETRY change, so the otherwise-skipped static visual BVH is flagged for rebuild.
+        kin_visual = next(entry for entry in visual_entries if entry.solver is scene.sim.kinematic_solver)
+        assert kin_visual.rebuild_subscriber.pending
     scene.step()
     assert_allclose(cam_kin.read_image()[..., 15, 20], kin_scaled, tol=1e-2)
     assert_allclose(cam_rigid.read_image()[..., 15, 20], 0.8, tol=1e-2)
@@ -1255,6 +1265,8 @@ def test_raycaster_against_visual(tmp_path, show_viewer, n_envs, kin_raycastable
 @pytest.mark.required
 def test_lidar_bvh_parallel_env(show_viewer, tol):
     """Verify each environment receives a different lidar distance when geometries differ."""
+    SHARED_OBSTACLE_1_X = 1.2
+    SHARED_OBSTACLE_2_X = 1.3
     scene = gs.Scene(
         vis_options=gs.options.VisOptions(
             rendered_envs_idx=(1,),
@@ -1323,6 +1335,28 @@ def test_lidar_bvh_parallel_env(show_viewer, tol):
     expected_distances = front_positions - sensor_positions[:, 0]
     assert_allclose(lidar_distances, expected_distances, tol=tol)
 
+    # All links are fixed, so the collision BVH is static: rebuilt only when a set_pos invalidates it, never on an
+    # ordinary step. The per-env obstacle geometry differs here, so it cannot be shared across envs.
+    collision_bvh = next(entry for entry in lidar._shared_metadata.solver_bvhs if entry.raycast_mask is None)
+    assert collision_bvh.maybe_static
+    assert not collision_bvh.shared_across_envs
+
+    # Make the obstacle geometry identical across envs (sensors still differ in x): the per-env trees become bit-
+    # identical, so the cast switches to the shared path - reading one tree (batch 0) for every env. The set_pos calls
+    # must invalidate the static BVH, otherwise the cast keeps casting against the stale heterogeneous trees.
+    shared_sensor_positions = np.array([[0.0, 0.0, 0.5], [0.5, 0.0, 0.5]], dtype=gs.np_float)
+    sensor_mount.set_pos(shared_sensor_positions)
+    obstacle_1.set_pos((SHARED_OBSTACLE_1_X, 0.0, 0.5))
+    obstacle_2.set_pos((SHARED_OBSTACLE_2_X, 0.0, 0.5))
+
+    scene.step()
+
+    assert collision_bvh.shared_across_envs
+
+    shared_distances = lidar.read().distances[:, 0, 0]
+    shared_expected = min(SHARED_OBSTACLE_1_X - 0.1, SHARED_OBSTACLE_2_X - 0.025) - shared_sensor_positions[:, 0]
+    assert_allclose(shared_distances, shared_expected, tol=tol)
+
 
 @pytest.mark.required
 def test_lidar_cache_offset_parallel_env(show_viewer, tol):
@@ -1377,6 +1411,56 @@ def test_lidar_cache_offset_parallel_env(show_viewer, tol):
         sensor_data = sensor.read()
         assert (sensor_data.distances > gs.EPS).any()
         assert (sensor_data.points.abs() > gs.EPS).any()
+
+
+@pytest.mark.required
+def test_raycaster_heterogeneous_object(show_viewer, tol):
+    scene = gs.Scene(show_viewer=show_viewer)
+    scene.add_entity(gs.morphs.Plane())
+    sensor_mount = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=(0.0, 0.0, 0.5),
+            fixed=True,
+            collision=False,
+        )
+    )
+    # Without per-env geom masking an env casts against the union of all variants (they share one vertex buffer). The
+    # variants overlap (same pose) so env 0's inactive variant is the nearer hit there - that is what makes a missing
+    # mask observable: env 0 would shadow its own box with env 1's closer sphere.
+    het_obstacle = scene.add_entity(
+        morph=(
+            gs.morphs.Box(size=(0.2, 0.2, 0.2), pos=(1.0, 0.0, 0.5), fixed=True),
+            gs.morphs.Sphere(radius=0.2, pos=(1.0, 0.0, 0.5), fixed=True),
+        ),
+    )
+    lidar = scene.add_sensor(
+        gs.sensors.Lidar(
+            entity_idx=sensor_mount.idx,
+            pattern=gs.options.sensors.SphericalPattern(n_points=(1, 1), fov=(0.0, 0.0)),
+            max_range=5.0,
+            draw_debug=show_viewer,
+        )
+    )
+
+    scene.build(n_envs=2)
+    scene.step()
+
+    distances = lidar.read().distances[:, 0, 0]
+    assert_allclose(distances, (0.9, 0.8), tol=5e-3)
+
+    # The per-env trees differ (each masks the other variant), so the cast must not share one tree across envs.
+    collision_bvh = next(entry for entry in lidar._shared_metadata.solver_bvhs if entry.raycast_mask is None)
+    assert collision_bvh.maybe_static
+    assert not collision_bvh.shared_across_envs
+
+    # The static BVH is rebuilt only when its geometry actually changes - exactly what is necessary, nothing more: an
+    # idle step records no change (rebuild skipped), while a set_pos records a pending change (rebuild scheduled).
+    subscriber = collision_bvh.rebuild_subscriber
+    scene.step()
+    assert not subscriber.pending
+    het_obstacle.set_pos((1.0, 0.0, 0.5))
+    assert subscriber.pending
 
 
 # ------------------------------------------------------------------------------------------
