@@ -415,39 +415,37 @@ def func_compute_geom_rbound(
 
 
 @qd.func
-def func_compute_tolerance(
+def func_compute_geom_pair_scale(
     i_ga,
     i_gb,
-    i_b,
-    tolerance,
     geoms_info: array_class.GeomsInfo,
     geoms_init_AABB: array_class.GeomsInitAABB,
 ):
-    # Note that the original world-aligned bounding box is used to computed the absolute tolerance from the
-    # relative one. This way, it is a constant that does not depends on the orientation of the geometry, which
-    # makes sense since the scale of the geometries is an intrinsic property and not something that is supposed
-    # to change dynamically.
+    # Intrinsic length scale of a geom pair: half the smaller geom's world-aligned bounding-box diagonal. The
+    # original (rest-pose) AABB is used so the scale is a constant independent of the current orientation, which
+    # makes sense since the size of the geometries is an intrinsic property. Multiply by a relative tolerance to
+    # turn it into an absolute one.
     aabb_size_b = (geoms_init_AABB[i_gb, 7] - geoms_init_AABB[i_gb, 0]).norm()
     aabb_size = aabb_size_b
     if geoms_info.type[i_ga] != gs.GEOM_TYPE.PLANE:
         aabb_size_a = (geoms_init_AABB[i_ga, 7] - geoms_init_AABB[i_ga, 0]).norm()
         aabb_size = qd.min(aabb_size_a, aabb_size_b)
 
-    return 0.5 * tolerance * aabb_size
+    return 0.5 * aabb_size
 
 
 @qd.func
-def func_compute_mj_tolerance(
+def func_compute_geom_pair_scale_mj(
     i_ga,
     i_gb,
-    tolerance,
     geoms_info: array_class.GeomsInfo,
     geoms_init_AABB: array_class.GeomsInitAABB,
 ):
-    """Compute tolerance matching MuJoCo's formula: relative_tolerance * min(rbound_g1, rbound_g2)."""
+    """Geom-pair length scale matching MuJoCo's formula: min(rbound_g1, rbound_g2). Multiply by a relative tolerance
+    to recover MuJoCo's absolute tolerance."""
     rbound_a = func_compute_geom_rbound(i_ga, geoms_info, geoms_init_AABB)
     rbound_b = func_compute_geom_rbound(i_gb, geoms_info, geoms_init_AABB)
-    return tolerance * qd.min(rbound_a, rbound_b)
+    return qd.min(rbound_a, rbound_b)
 
 
 @qd.func
@@ -956,6 +954,7 @@ def func_clamp_prune_and_sort_contacts_coop(
     EPS = rigid_global_info.EPS[None]
 
     _K = qd.static(32)
+    _LOG2_K = qd.static(_K.bit_length() - 1)  # = log2(_K), assuming _K is a power of two.
     qd.loop_config(name="clamp_prune_and_sort_contacts_coop", block_dim=_K)
     for i_flat in range(_B * _K):
         tid = i_flat % _K
@@ -990,9 +989,8 @@ def func_clamp_prune_and_sort_contacts_coop(
                 )
                 ii += _K
 
-            # Phase 1a sort: parallel bitonic sort across 32 lanes when n_con <= 32; fall back to serial-on-lane-0
-            # insertion sort otherwise. Bitonic is 15 compare-exchange stages (k=2..32, j=k/2..1), each a single
-            # subgroup shuffle + compare, replacing the O(n^2/2) lane-0 insertion sort.
+            # Phase 1a sort: bitonic sort across _K lanes when n_con <= _K, serial-on-lane-0 insertion sort
+            # otherwise.
             if n_con <= _K:
                 # Load with sentinel for out-of-range lanes (pushes them to the end of ascending sort).
                 my_key = qd.cast(gs.qd_float(1.0e30), gs.qd_float)
@@ -1001,26 +999,7 @@ def func_clamp_prune_and_sort_contacts_coop(
                     my_key = collider_state.contact_sort_key[tid, i_b]
                     my_idx = collider_state.contact_sort_idx[tid, i_b]
 
-                # 15 bitonic stages: (k, j) pairs walking the standard schedule. Stable compare (tiebreak on idx).
-                for k_log2 in qd.static(range(1, 6)):
-                    k_mask = qd.static(1 << k_log2)
-                    for j_log2 in qd.static(range(k_log2 - 1, -1, -1)):
-                        j = qd.static(1 << j_log2)
-                        partner = qd.u32(tid ^ j)
-                        their_key = qd.simt.subgroup.shuffle(my_key, partner)
-                        their_idx = qd.simt.subgroup.shuffle(my_idx, partner)
-                        i_am_low = (tid & j) == 0
-                        asc = (tid & k_mask) == 0
-                        take_min = i_am_low == asc
-                        their_lt_mine = (their_key < my_key) or (their_key == my_key and their_idx < my_idx)
-                        if take_min:
-                            if their_lt_mine:
-                                my_key = their_key
-                                my_idx = their_idx
-                        else:
-                            if not their_lt_mine and (their_key != my_key or their_idx != my_idx):
-                                my_key = their_key
-                                my_idx = their_idx
+                my_key, my_idx = qd.simt.subgroup.bitonic_sort_kv_tiled(my_key, my_idx, _LOG2_K)
 
                 # Write back the sorted values for the real range.
                 if tid < n_con:
