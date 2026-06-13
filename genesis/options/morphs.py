@@ -6,6 +6,7 @@ rigid object / MPM object / FEM object.
 """
 
 import os
+import xml.etree.ElementTree as ET
 from typing import Annotated, Any, ClassVar, Literal
 from typing_extensions import Self
 
@@ -81,6 +82,21 @@ class Morph(Options):
     quat : tuple, shape (4,), optional
         The initial quaternion (w-x-y-z convention) of the entity at creation time.
         If specified, `euler` will be ignored. Defaults to None.
+    offset_pos : tuple, shape (3,), optional
+        A fixed pose offset applied in the entity's own body frame on top of the `pos`/`euler` (or `pos`/`quat`) pose.
+        It shifts the world pose used internally by the solver but is stripped back out by the relative getters, so
+        `get_pos`/`get_quat` (which are relative by default) still report `pos`/`quat`. The morph pose and the offset
+        compound exactly like a parent and a child frame: the world pose is
+        `transform_pos_quat_by_trans_quat(offset_pos, offset_quat, pos, quat)`, i.e. the offset is expressed in the body
+        frame defined by `pos`/`quat`. So `offset_pos` rotates together with the orientation rather than being a
+        world-frame shift, and when the orientation is identity it simply adds to `pos`. Defaults to (0.0, 0.0, 0.0).
+    offset_euler : tuple, shape (3,), optional
+        The orientation offset `offset_quat` given as an euler angle in degrees (scipy extrinsic x-y-z convention).
+        Setting both `offset_euler` and `offset_quat` raises an error. Defaults to None.
+    offset_quat : tuple, shape (4,), optional
+        A fixed orientation offset (w-x-y-z convention); see `offset_pos` for how it compounds with `pos`/`quat` to
+        form the world pose. Up-axis conversions (e.g. loading a Z-up asset) are stored here.
+        Defaults to (1.0, 0.0, 0.0, 0.0).
     visualization : bool, optional
         Whether the entity needs to be visualized. Set it to False if you need a invisible object only for collision
         purposes. Defaults to True. `visualization` and `collision` cannot both be False.
@@ -99,6 +115,9 @@ class Morph(Options):
     pos: Vec3FType = (0.0, 0.0, 0.0)
     euler: Vec3FType | None = Field(default=None, exclude=True, repr=False)
     quat: UnitVec4FType | None = None
+    offset_pos: Vec3FType = (0.0, 0.0, 0.0)
+    offset_euler: Vec3FType | None = Field(default=None, exclude=True, repr=False)
+    offset_quat: UnitVec4FType = (1.0, 0.0, 0.0, 0.0)
     visualization: StrictBool = True
     collision: StrictBool = True
     requires_jac_and_IK: StrictBool = False
@@ -118,6 +137,11 @@ class Morph(Options):
             data["quat"] = tuple(gu.xyz_to_quat(np.array(euler), rpy=True, degrees=True))
         elif quat is None:
             data["quat"] = (1.0, 0.0, 0.0, 0.0)
+        offset_euler = data.get("offset_euler")
+        if offset_euler is not None and data.get("offset_quat") is not None:
+            gs.raise_exception("'offset_euler' and 'offset_quat' cannot both be set.")
+        if offset_euler is not None:
+            data["offset_quat"] = tuple(gu.xyz_to_quat(np.array(offset_euler), rpy=True, degrees=True))
         return data
 
     def model_post_init(self, context: Any) -> None:
@@ -583,12 +607,17 @@ class FileMorph(Morph):
 
         file = data.get("file", "")
         if isinstance(file, str) and file:
-            abs_file = os.path.abspath(file)
-            if not os.path.exists(abs_file):
-                abs_file = os.path.join(gs.utils.get_assets_dir(), file)
-            if not os.path.exists(abs_file):
-                gs.raise_exception(f"File not found in either current directory or assets directory: '{file}'.")
-            data["file"] = abs_file
+            # Inline XML content (a description built in-memory) parses directly and is passed through untouched to the
+            # loader. A path string does not parse as XML and is resolved against the working and assets directories.
+            try:
+                ET.fromstring(file)
+            except ET.ParseError:
+                abs_file = os.path.abspath(file)
+                if not os.path.exists(abs_file):
+                    abs_file = os.path.join(gs.utils.get_assets_dir(), file)
+                if not os.path.exists(abs_file):
+                    gs.raise_exception(f"File not found in either current directory or assets directory: '{file}'.")
+                data["file"] = abs_file
 
         return data
 
@@ -767,19 +796,19 @@ class Mesh(FileMorph, TetGenMixin):
 
         if is_gltf:
             if self.file_meshes_are_zup:
-                gs.logger.warning(
-                    "Specifying 'file_meshes_are_zup' for GLTF/GLB files is not supported. A rotation will be applied "
-                    "explicitly on the morph instead. Please consider fixing your asset to use Y-UP convention."
+                # GLTF/GLB is Y-up by standard, so a Z-up claim is honored by recording the compensating rotation in
+                # 'offset_quat'. It is post-multiplied on the user orientation to form the world pose, while 'quat'
+                # stays clean and is what relative getters report.
+                gs.logger.info(
+                    "Honoring 'file_meshes_are_zup' for a GLTF/GLB file by recording a compensating rotation in "
+                    "'offset_quat'. Consider fixing your asset to use the standard Y-up convention instead."
                 )
                 y_up_quat = (1.0, -1.0, 0.0, 0.0)
-                if self.quat is None:
-                    self.quat = y_up_quat
-                else:
-                    self.quat = tuple(
-                        gu.transform_quat_by_quat(
-                            np.array(y_up_quat, dtype=gs.np_float), np.array(self.quat, dtype=gs.np_float)
-                        )
+                self.offset_quat = tuple(
+                    gu.transform_quat_by_quat(
+                        np.array(y_up_quat, dtype=gs.np_float), np.array(self.offset_quat, dtype=gs.np_float)
                     )
+                )
                 if self.scale is not None:
                     scale_arr = np.atleast_1d(np.array(self.scale))
                     if scale_arr.size == 3:
@@ -919,7 +948,13 @@ class MJCF(FileMorph):
         return data
 
     def model_post_init(self, context: Any) -> None:
-        if not self.is_format(MJCF_FORMAT):
+        # Inline XML content parses directly and bypasses the file extension check.
+        try:
+            ET.fromstring(self.file)
+            is_inline_xml = True
+        except (ET.ParseError, TypeError):
+            is_inline_xml = False
+        if not is_inline_xml and not self.is_format(MJCF_FORMAT):
             gs.raise_exception(f"Expected `{MJCF_FORMAT}` extension for MJCF file: {self.file}")
 
 
