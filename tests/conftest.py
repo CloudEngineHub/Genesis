@@ -21,8 +21,6 @@ from _pytest.mark import Expression, MarkMatcher
 from PIL import Image
 from syrupy.extensions.image import PNGImageSnapshotExtension
 
-from .utils import IMG_BLUR_KERNEL_SIZE, IMG_NUM_ERR_THR, IMG_STD_ERR_THR, assert_pixel_match
-
 # Mock tkinter module for backward compatibility because it is a hard dependency for old Genesis versions
 has_tkinter = False
 try:
@@ -75,7 +73,6 @@ if not has_display and has_egl:
     os.environ["PYGLET_HEADLESS"] = "1"
 
 IS_INTERACTIVE_VIEWER_AVAILABLE = has_display or has_egl
-
 
 TOL_SINGLE = 5e-5
 TOL_DOUBLE = 1e-9
@@ -130,6 +127,22 @@ def pytest_cmdline_main(config: pytest.Config) -> None:
         eval(config.option.markexpr, {"__builtins__": {}}, {key: None for key in declared_markers})
     except NameError as e:
         raise pytest.UsageError(f"Unknown marker in CLI expression: '{e.name}'")
+
+    # Benchmarks are opt-in and exclusive: they run only via '-m benchmarks' alone. Exclude benchmarks from
+    # any expression that does not name them so they never run implicitly (e.g. '-m "not slow"' would match
+    # them since benchmarks are not slow), and reject combining the 'benchmarks' marker with anything else.
+    markexpr = config.option.markexpr
+    if markexpr and "benchmarks" not in markexpr:
+        config.option.markexpr = f"({markexpr}) and not benchmarks"
+    elif (
+        markexpr
+        and markexpr.strip() != "benchmarks"
+        and Expression.compile(markexpr).evaluate(MarkMatcher.from_markers((pytest.mark.benchmarks,)))
+    ):
+        raise pytest.UsageError(
+            "The 'benchmarks' marker is exclusive and cannot be combined with other markers; "
+            "run benchmarks with '-m benchmarks' alone."
+        )
 
     # Only launch memory monitor from the main process, not from xdist workers
     mem_filepath = config.getoption("--mem-monitoring-filepath")
@@ -885,18 +898,25 @@ def box_obj_path(asset_tmp_path, cube_verts_and_faces):
 
 
 class PixelMatchSnapshotExtension(PNGImageSnapshotExtension):
-    _std_err_threshold: float = IMG_STD_ERR_THR
-    _ratio_err_threshold: float = IMG_NUM_ERR_THR
-    _blurred_kernel_size: int = IMG_BLUR_KERNEL_SIZE
+    _std_err_threshold: float | None = None
+    _ratio_err_threshold: float | None = None
+    _blurred_kernel_size: int | None = None
 
     def matches(self, *, serialized_data, snapshot_data) -> bool:
+        # Imported here rather than at module top: conftest must not be coupled to any other test module at load
+        # time, as that can cause hard-to-debug side effects.
+        from .utils import IMG_BLUR_KERNEL_SIZE, IMG_NUM_ERR_THR, IMG_STD_ERR_THR, assert_pixel_match
+
+        std_err_threshold = IMG_STD_ERR_THR if self._std_err_threshold is None else self._std_err_threshold
+        ratio_err_threshold = IMG_NUM_ERR_THR if self._ratio_err_threshold is None else self._ratio_err_threshold
+        blurred_kernel_size = IMG_BLUR_KERNEL_SIZE if self._blurred_kernel_size is None else self._blurred_kernel_size
         try:
             assert_pixel_match(
                 Image.open(BytesIO(serialized_data)),
                 Image.open(BytesIO(snapshot_data)),
-                std_err_threshold=self._std_err_threshold,
-                ratio_err_threshold=self._ratio_err_threshold,
-                blurred_kernel_size=self._blurred_kernel_size,
+                std_err_threshold=std_err_threshold,
+                ratio_err_threshold=ratio_err_threshold,
+                blurred_kernel_size=blurred_kernel_size,
             )
         except AssertionError:
             return False
