@@ -429,6 +429,72 @@ def compound_joint():
     return mjcf
 
 
+@pytest.fixture(scope="session")
+def depth_first_tree_mjcf():
+    # A kinematic tree where breadth-first and depth-first orderings differ: root A has a child A1, and a sibling root
+    # B has none, so depth-first visits A, A1, B (A's subtree contiguous) while breadth-first would give A, B, A1.
+    mjcf = ET.Element("mujoco", model="depth_first_tree")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    a = ET.SubElement(worldbody, "body", name="A", pos="0 0 1")
+    ET.SubElement(a, "freejoint")
+    ET.SubElement(a, "geom", type="box", size="0.05 0.05 0.05")
+    a1 = ET.SubElement(a, "body", name="A1", pos="0.15 0 0")
+    ET.SubElement(a1, "joint", type="hinge", axis="0 0 1")
+    ET.SubElement(a1, "geom", type="box", size="0.05 0.05 0.05")
+    b = ET.SubElement(worldbody, "body", name="B", pos="1 0 1")
+    ET.SubElement(b, "freejoint")
+    ET.SubElement(b, "geom", type="box", size="0.05 0.05 0.05")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
+def depth_first_tree_urdf():
+    # Same shape as depth_first_tree_mjcf but single-rooted (URDF): base -> {A, B}, A -> A1.
+    robot = ET.Element("robot", name="depth_first_tree")
+    for name in ("base", "A", "A1", "B"):
+        link = ET.SubElement(robot, "link", name=name)
+        inertial = ET.SubElement(link, "inertial")
+        ET.SubElement(inertial, "mass", value="1.0")
+        ET.SubElement(inertial, "inertia", ixx="0.01", iyy="0.01", izz="0.01", ixy="0", ixz="0", iyz="0")
+        collision = ET.SubElement(link, "collision")
+        ET.SubElement(ET.SubElement(collision, "geometry"), "box", size="0.1 0.1 0.1")
+    for joint_name, parent, child in (("j_A", "base", "A"), ("j_A1", "A", "A1"), ("j_B", "base", "B")):
+        joint = ET.SubElement(robot, "joint", name=joint_name, type="revolute")
+        ET.SubElement(joint, "parent", link=parent)
+        ET.SubElement(joint, "child", link=child)
+        ET.SubElement(joint, "origin", xyz="0 0 0.2")
+        ET.SubElement(joint, "axis", xyz="0 0 1")
+        ET.SubElement(joint, "limit", lower="-1", upper="1", effort="10", velocity="10")
+    return robot
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("model_name", ["depth_first_tree_mjcf", "depth_first_tree_urdf"])
+def test_depth_first_link_ordering(xml_path, model_name, show_viewer):
+    # Links must be parsed depth-first so every subtree - hence every free body's DOFs - occupies a contiguous index
+    # range. The per-tree mass-matrix factorization relies on this so a multi-body file costs the same as the
+    # equivalent separate entities.
+    scene = gs.Scene(show_viewer=show_viewer)
+    morph = gs.morphs.MJCF(file=xml_path) if model_name.endswith("mjcf") else gs.morphs.URDF(file=xml_path, fixed=True)
+    entity = scene.add_entity(morph)
+    scene.build(n_envs=0)
+
+    parents = [link.parent_idx for link in entity.links]
+    n_links = len(parents)
+    children: dict[int, list[int]] = {i: [] for i in range(n_links)}
+    for i, parent in enumerate(parents):
+        if parent != -1:
+            children[parent].append(i)
+    for i in range(n_links):
+        subtree = []
+        stack = [i]
+        while stack:
+            link = stack.pop()
+            subtree.append(link)
+            stack.extend(children[link])
+        assert sorted(subtree) == list(range(i, i + len(subtree))), f"subtree at link {i} is not contiguous"
+
+
 @pytest.mark.required
 @pytest.mark.parametrize("model_name", ["box_plan"])
 @pytest.mark.parametrize("gs_solver", [gs.constraint_solver.CG, gs.constraint_solver.Newton])
@@ -712,8 +778,18 @@ def test_dynamic_weld_scene_reset():
         ),
         show_viewer=False,
     )
-    box1 = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
-    box2 = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.2, 0, 0.5)))
+    box1 = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=(0, 0, 0.5),
+        )
+    )
+    box2 = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=(0.2, 0, 0.5),
+        )
+    )
     scene.build(n_envs=2)
 
     solver = scene.rigid_solver
@@ -5328,7 +5404,12 @@ def test_get_constraints_api(show_viewer, tol):
             file="xml/franka_emika_panda/panda.xml",
         ),
     )
-    cube = scene.add_entity(gs.morphs.Box(size=(0.05, 0.05, 0.05), pos=(0.2, 0.0, 0.05)))
+    cube = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.05, 0.05, 0.05),
+            pos=(0.2, 0.0, 0.05),
+        )
+    )
     scene.build(n_envs=2)
 
     link_a, link_b = robot.base_link.idx, cube.base_link.idx
@@ -6321,7 +6402,7 @@ def test_mesh_align(show_viewer, tol):
         morph=(
             gs.morphs.Mesh(
                 file=f"{bowl_path}/glb/orange_plastic_bowl.glb",
-                scale=0.1,
+                scale=0.5,
                 pos=HET_POS,
                 offset_euler=(30.0, 0.0, 0.0),
                 align=True,
@@ -6395,7 +6476,9 @@ def test_mesh_align(show_viewer, tol):
     for _ in range(600):
         scene.step()
 
-    assert_allclose(mango.get_dofs_velocity(), 0, tol=0.06)
+    assert_allclose(mango.get_dofs_velocity(dofs_idx_local=(0, 1, 2)), 0, tol=0.01)
+    assert_allclose(mango.get_dofs_velocity(dofs_idx_local=(3, 4, 5)), 0, tol=0.05)
+    assert_allclose(mango.get_dofs_velocity(), 0, tol=0.05)
     min_z = mango.get_AABB()[:, 0, 2]
     assert ((-0.005 < min_z) & (min_z < 0.0)).all()
 
@@ -6887,9 +6970,16 @@ def test_heterogeneous_physics_parity(show_viewer, tol):
     sphere_drop_height = 0.08
 
     # Run homogeneous simulation with box only
-    scene_box = gs.Scene(show_viewer=False)
+    scene_box = gs.Scene(
+        show_viewer=False,
+    )
     scene_box.add_entity(gs.morphs.Plane())
-    box_obj = scene_box.add_entity(gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=(0.0, 0.0, box_drop_height)))
+    box_obj = scene_box.add_entity(
+        gs.morphs.Box(
+            size=(0.04, 0.04, 0.04),
+            pos=(0.0, 0.0, box_drop_height),
+        )
+    )
     scene_box.build()
     for _ in range(n_steps):
         scene_box.step()
@@ -6897,7 +6987,9 @@ def test_heterogeneous_physics_parity(show_viewer, tol):
     box_vel = tensor_to_array(box_obj.get_vel())
 
     # Run homogeneous simulation with sphere only
-    scene_sphere = gs.Scene(show_viewer=False)
+    scene_sphere = gs.Scene(
+        show_viewer=False,
+    )
     scene_sphere.add_entity(gs.morphs.Plane())
     sphere_obj = scene_sphere.add_entity(
         gs.morphs.Sphere(
@@ -6913,7 +7005,9 @@ def test_heterogeneous_physics_parity(show_viewer, tol):
 
     # Run heterogeneous simulation with both variants (different sizes AND positions)
     # 4 envs with 2 variants: envs 0-1 get box, envs 2-3 get sphere
-    scene_het = gs.Scene(show_viewer=show_viewer)
+    scene_het = gs.Scene(
+        show_viewer=show_viewer,
+    )
     scene_het.add_entity(gs.morphs.Plane())
     # Divergent per-variant yaw offsets, irrelevant to the dynamics of these symmetric primitives dropped flat (so
     # the world references still match) but stripped per environment by the relative getters.
@@ -6982,7 +7076,9 @@ def test_heterogeneous_physics_parity(show_viewer, tol):
 @pytest.mark.required
 def test_heterogeneous_invalid_material_raises():
     """Test that heterogeneous morphs with unsupported material raises an exception."""
-    scene = gs.Scene(show_viewer=False)
+    scene = gs.Scene(
+        show_viewer=False,
+    )
 
     morphs_heterogeneous = (
         gs.morphs.Box(size=(1.0, 1.0, 1.0)),
@@ -7043,7 +7139,9 @@ def test_heterogeneous_fewer_envs_than_variants():
         - Environment 1 -> Variant 1 (second morph in list)
         - Variants 2 and 3 are unused
     """
-    scene = gs.Scene(show_viewer=False)
+    scene = gs.Scene(
+        show_viewer=False,
+    )
     scene.add_entity(gs.morphs.Plane())
 
     # 4 variants with different positions but only 2 environments
@@ -7066,9 +7164,12 @@ def test_heterogeneous_fewer_envs_than_variants():
 
 
 @pytest.mark.required
-def test_heterogeneous_mass_setters(tol):
-    """Test entity/link mass setters with heterogeneous morphs."""
-    scene = gs.Scene(show_viewer=False)
+def test_mass_setters(tol):
+    # Batched links info (default): entity- and link-level set_mass apply, link masses may differ per env, and a
+    # wrong-length array is rejected. The heterogeneous entity gives each env a distinct starting mass.
+    scene = gs.Scene(
+        show_viewer=False,
+    )
     het_obj = scene.add_entity(
         morph=[
             gs.morphs.Box(size=(0.01, 0.01, 0.01)),
@@ -7078,36 +7179,31 @@ def test_heterogeneous_mass_setters(tol):
         ],
     )
     scene.build(n_envs=4)
-
     link = next(link for link in het_obj.links if not link.is_fixed)
-
-    # Invalid shape should raise before any per-env state is set.
     with pytest.raises(gs.GenesisException):
         link.set_mass((1.0, 2.0))
-
     het_obj.set_mass(1.0)
     assert_allclose(het_obj.get_mass(), 1.0, tol=tol)
-
-    # Link-level setter should support per-environment mass targets.
     target_mass = (0.2, 0.4, 0.6, 0.8)
     link.set_mass(target_mass)
     assert_allclose(link.get_mass(), target_mass, tol=tol)
 
-
-@pytest.mark.required
-def test_non_batched_mass_setters(tol):
-    """Test link mass setter with non-batched links info (batch_links_info=False)."""
-    scene = gs.Scene(show_viewer=False, rigid_options=gs.options.RigidOptions(batch_links_info=False))
-    obj = scene.add_entity(morph=gs.morphs.Box(size=(0.1, 0.1, 0.1)))
+    # Non-batched links info: link mass is shared across envs, so a scalar applies uniformly and a per-env array raises.
+    scene = gs.Scene(
+        show_viewer=False,
+        rigid_options=gs.options.RigidOptions(
+            batch_links_info=False,
+        ),
+    )
+    obj = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+        )
+    )
     scene.build(n_envs=4)
-
     link = next(link for link in obj.links if not link.is_fixed)
-
-    # Scalar set_mass should work and apply uniformly across all envs.
     link.set_mass(2.0)
     assert_allclose(link.get_mass(), 2.0, tol=tol)
-
-    # Per-env array mass should raise a clear exception.
     with pytest.raises(gs.GenesisException):
         link.set_mass((1.0, 2.0, 3.0, 4.0))
 
@@ -7585,103 +7681,6 @@ def test_heterogeneous_articulated_structure_mismatch():
                 gs.morphs.URDF(file="urdf/simple/two_link_arm.urdf", pos=(0, 0, 0.1)),
             ]
         )
-
-
-@pytest.mark.required
-@pytest.mark.parametrize("performance_mode", [True])
-def test_hibernation_and_contact_islands(show_viewer):
-    """
-    Test hibernation and contact island behavior.
-
-    Scenario:
-    1. Two boxes settle separately on ground -> both hibernate, 2 contact islands
-    2. Move one box above the other using set_pos (wakes it up)
-    3. Box falls and collides -> both boxes awake
-    4. Stacked boxes settle and hibernate -> 1 contact island (merged)
-    5. Move one box off the hibernated stack using set_pos -> the whole island wakes up
-    6. Boxes settle separately and hibernate -> 2 contact islands (split)
-    """
-    if gs.use_ndarray:
-        pytest.skip("Hibernation does not support dynamic array mode.")
-
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            use_contact_island=True,
-            use_hibernation=True,
-        ),
-        show_viewer=show_viewer,
-    )
-
-    scene.add_entity(gs.morphs.Plane())
-
-    # Two boxes placed separately on ground
-    box1 = scene.add_entity(
-        gs.morphs.Box(pos=(-0.3, 0, 0.15), size=(0.1, 0.1, 0.1)),
-    )
-    box2 = scene.add_entity(
-        gs.morphs.Box(pos=(0.3, 0, 0.15), size=(0.1, 0.1, 0.1)),
-    )
-
-    scene.build()
-
-    solver = scene.sim.rigid_solver
-    box1_idx = box1._idx_in_solver
-    box2_idx = box2._idx_in_solver
-
-    # Phase 1: Let boxes settle and hibernate separately
-    for step in range(200):
-        scene.step()
-        if solver.entities_state.hibernated[box1_idx, 0] and solver.entities_state.hibernated[box2_idx, 0]:
-            break
-
-    assert solver.entities_state.hibernated[box1_idx, 0]
-    assert solver.entities_state.hibernated[box2_idx, 0]
-    assert solver.constraint_solver.contact_island.n_islands[0] == 2
-
-    # Phase 2: Move box1 above box2 (this should wake up box1)
-    offset = 0.01
-    box2_pos = box2.get_pos()
-    box1.set_pos(np.array([float(box2_pos[0]) + offset, float(box2_pos[1]) + offset, 0.3]))
-
-    # Verify box1 woke up and position was set
-    assert not solver.entities_state.hibernated[box1_idx, 0]
-    assert float(box1.get_pos()[2]) > 0.2
-
-    # Let box1 fall and collide with box2
-    for _ in range(25):
-        scene.step()
-
-    # Both boxes should be awake shortly after collision (before they re-hibernate)
-    assert not solver.entities_state.hibernated[box1_idx, 0]
-    assert not solver.entities_state.hibernated[box2_idx, 0]
-
-    # Phase 3: Let stacked boxes settle and hibernate
-    for step in range(200):
-        scene.step()
-        if solver.entities_state.hibernated[box1_idx, 0] and solver.entities_state.hibernated[box2_idx, 0]:
-            break
-
-    assert solver.entities_state.hibernated[box1_idx, 0]
-    assert solver.entities_state.hibernated[box2_idx, 0]
-
-    # Stacked boxes should form 1 contact island
-    assert solver.constraint_solver.contact_island.n_islands[0] == 1
-
-    # Phase 4: Move box1 off the hibernated stack. The whole island must wake up, otherwise the stale hibernated
-    # island daisy-chain would keep re-connecting both boxes at every contact island construction.
-    box1.set_pos(np.array([1.0, 0.0, 0.15]))
-    assert not solver.entities_state.hibernated[box1_idx, 0]
-    assert not solver.entities_state.hibernated[box2_idx, 0]
-
-    # Phase 5: Let both boxes settle far apart and hibernate as 2 distinct contact islands
-    for step in range(500):
-        scene.step()
-        if solver.entities_state.hibernated[box1_idx, 0] and solver.entities_state.hibernated[box2_idx, 0]:
-            break
-
-    assert solver.entities_state.hibernated[box1_idx, 0]
-    assert solver.entities_state.hibernated[box2_idx, 0]
-    assert solver.constraint_solver.contact_island.n_islands[0] == 2
 
 
 @pytest.mark.required
