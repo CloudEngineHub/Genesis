@@ -351,6 +351,40 @@ def double_ball_pendulum():
 
 
 @pytest.fixture(scope="session")
+def long_chain():
+    # Single kinematic tree with enough DOFs that its mass submatrix exceeds GPU shared memory, so the cooperative
+    # >shared-cap mass assemble runs - the path whose lower-triangular linear-index inversion must stay exact on GPUs
+    # with an imprecise sqrt.
+    mjcf = ET.Element("mujoco", model="long_chain")
+    ET.SubElement(mjcf, "compiler", angle="radian")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    body = ET.SubElement(worldbody, "body", name="root", pos="0 0 2")
+    ET.SubElement(body, "geom", type="sphere", size="0.03", density="500")
+    for i in range(128):
+        body = ET.SubElement(body, "body", name=f"l{i}", pos="0 0 0.1")
+        ET.SubElement(body, "joint", name=f"j{i}", type="hinge", axis=("1 0 0", "0 1 0", "0 0 1")[i % 3], damping="0.1")
+        ET.SubElement(body, "geom", type="capsule", fromto="0 0 0 0 0 0.1", size="0.02", density="500")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
+def two_fixed_branches():
+    # One entity whose worldbody holds two independent chains, each rigidly attached to the (fixed) world. Their DOFs
+    # are kinematically decoupled, so the mass matrix is block-diagonal and must partition into one block per branch.
+    mjcf = ET.Element("mujoco", model="two_fixed_branches")
+    ET.SubElement(mjcf, "compiler", angle="radian")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    for name, x in (("a", 0.0), ("b", 1.0)):
+        body = ET.SubElement(worldbody, "body", name=f"{name}root", pos=f"{x} 0 1")
+        ET.SubElement(body, "geom", type="capsule", fromto="0 0 0 0 0 0.06", size="0.02", density="500")
+        for i in range(4):
+            body = ET.SubElement(body, "body", name=f"{name}{i}", pos="0 0 0.06")
+            ET.SubElement(body, "joint", name=f"j{name}{i}", type="hinge", axis="0 1 0", damping="0.1")
+            ET.SubElement(body, "geom", type="capsule", fromto="0 0 0 0 0 0.06", size="0.02", density="500")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
 def hinge_slide():
     mjcf = ET.Element("mujoco", model="hinge_slide")
 
@@ -3292,7 +3326,8 @@ def test_apply_external_forces(xml_path, show_viewer):
 
 @pytest.mark.slow  # ~250s
 @pytest.mark.required
-def test_mass_mat(show_viewer, tol):
+@pytest.mark.parametrize("model_name", ["long_chain"])
+def test_mass_mat(xml_path, show_viewer, tol):
     # Create and build the scene
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -3315,8 +3350,17 @@ def test_mass_mat(show_viewer, tol):
         vis_mode="collision",
         visualize_contact=True,
     )
+    # High-DOF single tree: its mass submatrix exceeds GPU shared memory, exercising the cooperative >shared-cap
+    # assemble (the low-DOF frankas exercise the under-cap shared-memory factor instead).
+    long_chain = scene.add_entity(
+        gs.morphs.MJCF(
+            file=xml_path,
+            pos=(5, 0, 2),
+        ),
+    )
     scene.build()
 
+    # Two identical entities must yield identical mass matrices, and the LTDL factor must reconstruct it.
     mass_mat_1 = franka1.get_mass_mat(decompose=False)
     mass_mat_2 = franka2.get_mass_mat(decompose=False)
     assert mass_mat_1.shape == (franka1.n_dofs, franka1.n_dofs)
@@ -3325,6 +3369,53 @@ def test_mass_mat(show_viewer, tol):
     mass_mat_L, mass_mat_D_inv = franka1.get_mass_mat(decompose=True)
     mass_mat = mass_mat_L.T @ torch.diag(1.0 / mass_mat_D_inv) @ mass_mat_L
     assert_allclose(mass_mat, mass_mat_1, tol=tol)
+
+    # The cooperative >shared-cap assemble maps a flat lane index to a lower-triangular (row, col) via a float sqrt;
+    # on GPUs whose sqrt undershoots perfect squares (Apple Metal: sqrt(15129) -> 122.999 instead of 123) a naive
+    # inversion lands one row short on every j=0 boundary and silently drops the long-range coupling entries, leaving
+    # the assembled mass matrix indefinite. A real joint-space mass matrix is always symmetric positive-definite.
+    mass_mat_chain = tensor_to_array(long_chain.get_mass_mat(decompose=False))
+    assert_allclose(mass_mat_chain, mass_mat_chain.T, tol=tol)
+    assert np.linalg.eigvalsh(0.5 * (mass_mat_chain + mass_mat_chain.T)).min() > 0.0
+
+    # On GPU the high-DOF chain factors through the register-tiled path (auto-enabled above the shared-memory cap when
+    # RigidOptions.register_tiled_mass is left to its default); its LTDL factor must reconstruct the mass matrix to the
+    # same accuracy as the under-cap path.
+    mass_mat_chain_L, mass_mat_chain_D_inv = long_chain.get_mass_mat(decompose=True)
+    mass_mat_chain_rec = mass_mat_chain_L.T @ torch.diag(1.0 / mass_mat_chain_D_inv) @ mass_mat_chain_L
+    assert_allclose(mass_mat_chain_rec, mass_mat_chain, tol=tol)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("model_name", ["two_fixed_branches"])
+def test_mass_block_partition(xml_path, show_viewer, tol):
+    # Two chains rigidly attached to the fixed world are kinematically independent: the mass matrix is block-diagonal,
+    # so it must partition into one mass block per branch (factoring two n/2 blocks instead of one dense n block).
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+        show_viewer=show_viewer,
+    )
+    entity = scene.add_entity(
+        gs.morphs.MJCF(
+            file=xml_path,
+        ),
+    )
+    scene.build(n_envs=0)
+
+    n_dofs = entity.n_dofs
+    branch = n_dofs // 2
+    block_start = qd_to_numpy(scene.rigid_solver._rigid_global_info.dofs_mass_block_start)
+    block_end = qd_to_numpy(scene.rigid_solver._rigid_global_info.dofs_mass_block_end)
+    assert_allclose(block_start, [0] * branch + [branch] * branch, tol=0)
+    assert_allclose(block_end, [branch] * branch + [n_dofs] * branch, tol=0)
+
+    # The two branches do not couple, and the LTDL factor reconstructs the (block-diagonal) mass matrix.
+    mass_mat = tensor_to_array(entity.get_mass_mat(decompose=False))
+    assert_allclose(mass_mat[:branch, branch:], 0.0, tol=tol)
+    mass_mat_L, mass_mat_D_inv = entity.get_mass_mat(decompose=True)
+    assert_allclose(mass_mat_L.T @ torch.diag(1.0 / mass_mat_D_inv) @ mass_mat_L, mass_mat, tol=tol)
 
 
 @pytest.mark.required
@@ -4053,10 +4144,10 @@ def test_convexify(euler, show_viewer, gjk_collision):
     # FIXME: The cup is falling on Windows OS because the convex decomposition provided by CoACD is different than
     # other platform, and much worst in practice, with the bottom of the tank that is not planar (even discontinuous).
     # cam.start_recording()
-    for i in range(1000):
+    for i in range(1100):
         scene.step()
         # cam.render()
-        if i > 900:
+        if i > 1000:
             assert_allclose(gs_sim.rigid_solver.get_dofs_velocity(), 0.0, atol=1.0 if sys.platform == "win32" else 0.6)
     # cam.stop_recording(save_to_filename="video.mp4", fps=60)
 

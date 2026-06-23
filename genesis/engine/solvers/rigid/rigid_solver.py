@@ -510,6 +510,10 @@ class RigidSolver(KinematicSolver):
             enable_joint_limit=self._enable_joint_limit,
             box_box_detection=self._box_box_detection,
             use_contact_island=self._use_contact_island,
+            # The per-island solve engages wherever islands are on by default (CPU, where it composes with the sparse
+            # skyline). The GPU block below narrows it to exclude the whole-env-fits-shared no-hibernation case, which
+            # factors faster through the whole-env path (its block-diagonal Cholesky is the exact per-island result).
+            enable_per_island_solve=self._use_contact_island,
             sparse_solve=sparse_solve,
             sparse_envelope=sparse_envelope,
             integrator=self._integrator,
@@ -578,6 +582,14 @@ class RigidSolver(KinematicSolver):
                     not mass_matrix_fits_shared or envs_undersaturate
                 )
 
+                # Register-streaming tiled mass factor for the >shared-cap forward GPU path: it factors each mass block
+                # (kinematic tree) in registers via the same primitive as the Hessian, and is faster than and
+                # numerically matches the cooperative LDL^T. Reuses cholesky_tile_size (always 32 here, since the path
+                # needs a per-entity block exceeding shared memory).
+                enable_register_tiled_mass = (
+                    enable_tiled_cholesky_mass_matrix and not mass_matrix_fits_shared and not self._requires_grad
+                )
+
                 # Route the per-step warm-start factor+solve through the fused kernel whenever the shared tiled solve is
                 # available (factor tiled and L fits shared). The monolith body's incremental rank-1 update needs L in
                 # nt_H, so the fused kernel also writes L back via the ``write_L_to_nt_H`` argument; see
@@ -591,13 +603,25 @@ class RigidSolver(KinematicSolver):
                 static_rigid_sim_config.update(
                     enable_tiled_cholesky_mass_matrix=enable_tiled_cholesky_mass_matrix,
                     mass_matrix_fits_shared=mass_matrix_fits_shared,
+                    enable_register_tiled_mass=enable_register_tiled_mass,
                     enable_tiled_cholesky_hessian=enable_tiled_cholesky_hessian,
                     hessian_fits_shared=hessian_fits_shared,
                     cholesky_tile_size=cholesky_tile_size,
                     enable_fused_factor_solve_init=enable_fused_factor_solve_init,
+                    enable_per_island_solve=(
+                        self._use_contact_island and (self._use_hibernation or not hessian_fits_shared)
+                    ),
                     tiled_n_dofs_per_entity=tiled_n_dofs_per_entity,
                     tiled_n_dofs=tiled_n_dofs,
                     tiled_n_island_dofs=tiled_n_island_dofs,
+                    # Persistent block grid for the cooperative per-island factor+solve: enough T-lane blocks to fill the
+                    # GPU (one block ~= one tile = cholesky_tile_size lanes). The blocks grid-stride over the (env,
+                    # island) work-list, so a small batch with many islands fans out across blocks instead of
+                    # serializing inside one block-per-env. The count is independent of the body/env count (only the GPU
+                    # size and cholesky_tile_size, which already varies the kernels via n_dofs): an ndarray-mode kernel
+                    # must compile once and run for any n_objs/n_envs, and a block with no work exits at the grid-stride
+                    # guard (blk >= work_size) within the same scheduling wave, so over-launching a tiny work-list is free.
+                    island_factor_n_blocks=max(1, max_tiled_envs // cholesky_tile_size),
                 )
 
                 # Manually pin the solve arm only where the winner is determinable in advance AND confirmed across
@@ -855,33 +879,29 @@ class RigidSolver(KinematicSolver):
                 j_l = self.links[j_l].parent_idx
         self._rigid_global_info.mass_parent_mask.from_numpy(mass_parent_mask)
 
-        # Partition each entity's DOFs into contiguous, independently-factorable blocks. The mass matrix is
-        # block-diagonal across kinematic trees, so the per-block bounds let the assemble/factor/solve restrict to one
-        # tree's DOFs instead of the whole (possibly multi-free-body) entity. Trees are merged into one block only when
-        # their DOF intervals interleave (so a block stays a contiguous range); a single-tree entity yields one block
-        # spanning the whole entity, leaving its behavior unchanged.
+        # Partition each entity's DOFs into contiguous, independently-factorable blocks. M is block-diagonal between
+        # DOFs whose links are not kinematic ancestor/descendant of one another, so the per-block bounds let the
+        # assemble/factor/solve restrict to one block instead of the whole entity. A block is the set of DOFs coupled
+        # through a chain of moving joints; a fixed link (0 DOFs) does not couple, so several bodies attached to the
+        # world - or the independent arms of a fixed-base robot - factor as separate per-branch blocks. Each DOF's block
+        # is rooted at the topmost DOF-bearing ancestor reachable before the world; DOFs are numbered depth-first, so a
+        # block is a contiguous range whose root link's first DOF is the block start.
         links_by_idx = {link.idx: link for link in self.links}
-        tree_lo: dict[int, int] = {}
-        tree_hi: dict[int, int] = {}
+        block_start = np.arange(self.n_dofs_, dtype=gs.np_int)
         for link in self.links:
             if link.n_dofs == 0:
                 continue
-            root = link
-            while root.parent_idx != -1:
-                root = links_by_idx[root.parent_idx]
-            tree_lo[root.idx] = min(tree_lo.get(root.idx, link.dof_start), link.dof_start)
-            tree_hi[root.idx] = max(tree_hi.get(root.idx, link.dof_end), link.dof_end)
-        block_start = np.arange(self.n_dofs_, dtype=gs.np_int)
-        block_end = np.arange(1, self.n_dofs_ + 1, dtype=gs.np_int)
-        merged: list[list[int]] = []
-        for lo, hi in sorted(zip(tree_lo.values(), tree_hi.values())):
-            if merged and lo < merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], hi)
-            else:
-                merged.append([lo, hi])
-        for lo, hi in merged:
-            block_start[lo:hi] = lo
-            block_end[lo:hi] = hi
+            root_link = link
+            node = link
+            while node.parent_idx != -1:
+                node = links_by_idx[node.parent_idx]
+                if node.n_dofs > 0:
+                    root_link = node
+            block_start[link.dof_start : link.dof_end] = root_link.dof_start
+        block_end = np.empty(self.n_dofs_, dtype=gs.np_int)
+        for i_d in range(self.n_dofs_):
+            block_end[block_start[i_d]] = i_d + 1
+        block_end = block_end[block_start]
         self._rigid_global_info.dofs_mass_block_start.from_numpy(block_start)
         self._rigid_global_info.dofs_mass_block_end.from_numpy(block_end)
 
