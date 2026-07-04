@@ -4142,13 +4142,16 @@ def test_convexify(euler, show_viewer, gjk_collision):
 
     # Check resting conditions repeateadly rather not just once, for numerical robustness.
     # cam.start_recording()
+    qvel_norminf_all = []
     n_settle = 1250 if euler == (74, 15, 90) else 1000
     for i in range(n_settle + 100):
         scene.step()
         # cam.render()
         if i > n_settle:
-            # FIXME: Why is the tolerance so large? This is basically not checking anything...
-            assert_allclose(gs_sim.rigid_solver.get_dofs_velocity(), 0.0, atol=1.0)
+            qvel = gs_sim.rigid_solver.get_dofs_velocity()
+            qvel_norminf = torch.linalg.norm(qvel, ord=math.inf)
+            qvel_norminf_all.append(qvel_norminf)
+    np.testing.assert_array_less(torch.median(torch.stack(qvel_norminf_all, dim=0)).cpu(), 0.05)
     # cam.stop_recording(save_to_filename="video.mp4", fps=60)
 
     for obj in objs:
@@ -4204,7 +4207,7 @@ def test_convexify_stress(show_viewer):
             scene.add_entity(
                 gs.morphs.MJCF(
                     file=asset_files[name],
-                    pos=(gx * 0.1 - 0.15, gy * 0.13 - 0.19, 0.11 + gz * 0.12),
+                    pos=((gx + 0.5 * (gz % 2)) * 0.1 - 0.18, (gy + 0.5 * (gz % 2)) * 0.145 - 0.265, 0.11 + gz * 0.08),
                     euler=(90.0, 0.0, 0.0),
                 ),
                 vis_mode="collision",
@@ -4213,7 +4216,7 @@ def test_convexify_stress(show_viewer):
     scene.build()
 
     # Wait for the pile to collapse and settle at rest
-    for i in range(1500):
+    for i in range(1000):
         scene.step()
 
     # The pile has settled at rest, fully contained in the tank (no ground/tank penetration, no ejection).
@@ -4402,6 +4405,55 @@ def test_nan_reset(gs_sim, mode):
         gs_sim.scene.step()
     qvel = gs_sim.rigid_solver.get_dofs_velocity()
     assert not torch.isnan(qvel).any()
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["32"])
+def test_mpr_thin_box_stack_no_lateral_phantom(show_viewer, tol):
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            use_gjk_collision=False,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.1, -0.08, 0.06),
+            camera_lookat=(0.0, 0.0, 0.01),
+            camera_fov=20,
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        gs.morphs.Box(
+            pos=(0.0, 0.0, 0.005),
+            size=(0.002, 0.02, 0.01),
+            fixed=True,
+        ),
+        surface=gs.surfaces.Default(
+            color=(0, 0, 1),
+        ),
+    )
+    box = scene.add_entity(
+        gs.morphs.Box(
+            pos=(0.0, 0.0, 0.01495),
+            size=(0.002, 0.0199, 0.01),
+        ),
+        surface=gs.surfaces.Default(
+            color=(1, 0, 0),
+        ),
+        visualize_contact=True,
+    )
+    scene.build()
+
+    scene.step()
+    contacts = scene.rigid_solver.collider.get_contacts(to_torch=False)
+    normals = contacts["normal"]
+    assert len(normals) > 0
+    assert_allclose(np.abs(normals[..., 2]), 1, atol=1e2 * tol)
+
+    for _ in range(100):
+        scene.step()
+    pos = box.get_pos()
+    assert_allclose(pos[..., :2], 0, atol=1e1 * tol)
+    assert_allclose(pos[..., 2], 0.015, atol=1e1 * tol)
 
 
 @pytest.mark.required
