@@ -102,7 +102,6 @@ class Collider:
         self._prune_deep_penetration_ratio = 3.0
         self._prune_max_contacts_per_link_pair = 32
         self._prune_max_contacts_floor = 512
-        self._noslip_max_contacts = 128
 
         self._init_static_config()
         self._use_split_narrowphase = (
@@ -128,20 +127,31 @@ class Collider:
             self._init_multicontact_gjk_state()
 
         if gs.use_zerocopy:
-            self._contact_data: dict[str, torch.Tensor] = {}
-            for key, name in (
-                ("link_a", "link_a"),
-                ("link_b", "link_b"),
-                ("geom_a", "geom_a"),
-                ("geom_b", "geom_b"),
-                ("penetration", "penetration"),
-                ("position", "pos"),
-                ("normal", "normal"),
-                ("force", "force"),
-            ):
-                self._contact_data[key] = qd_to_torch(
-                    getattr(self._collider_state.contact_data, name), transpose=True, copy=False
-                )
+            # Probe every view the zero-copy contact query needs (including the per-call n_contacts and
+            # contact_sort_idx ones, which qd_to_torch caches on their fields). If any field sits past 2**31 bytes
+            # in its SNode tree no zero-copy view exists, and get_contacts falls back to the gather-kernel path.
+            self._contact_data: dict[str, torch.Tensor] | None = {}
+            try:
+                qd_to_torch(self._collider_state.n_contacts, copy=False)
+                qd_to_torch(self._collider_state.contact_sort_idx, transpose=True, copy=False)
+                qd_to_torch(self._collider_state.first_time, copy=False)
+                qd_to_torch(self._collider_state.contact_cache.normal, copy=False)
+                qd_to_torch(self._collider_state.contact_cache.penetration, copy=False)
+                for key, name in (
+                    ("link_a", "link_a"),
+                    ("link_b", "link_b"),
+                    ("geom_a", "geom_a"),
+                    ("geom_b", "geom_b"),
+                    ("penetration", "penetration"),
+                    ("position", "pos"),
+                    ("normal", "normal"),
+                    ("force", "force"),
+                ):
+                    self._contact_data[key] = qd_to_torch(
+                        getattr(self._collider_state.contact_data, name), transpose=True, copy=False
+                    )
+            except ValueError:
+                self._contact_data = None
 
         # Make sure that the initial state is clean
         self.clear()
@@ -662,13 +672,6 @@ class Collider:
             max_contacts_pruned_total = max(int(max_contacts_pruned.sum()), self._prune_max_contacts_floor)
             max_contacts = min(max_contacts, max_contacts_pruned_total)
 
-        # The noslip dual matrix efc_AR is quadratic in the contact budget, so noslip scenes get a much tighter
-        # default cap: measured noslip workloads (manipulation-style scenes) peak below ~70 simultaneous contact
-        # points, while the worst-case candidate budget is orders of magnitude larger. A denser scene hits the
-        # max_contacts clamp and halts with a request to set 'max_contacts' explicitly, which overrides this cap.
-        if self._solver._options.noslip_iterations > 0 and self._solver._options.max_contacts is None:
-            max_contacts = min(max_contacts, self._noslip_max_contacts)
-
         self._collider_info.max_possible_pairs[None] = n_possible_pairs
         self._collider_info.max_collision_pairs[None] = max_collision_pairs
         self._collider_info.max_collision_pairs_broad[None] = max_collision_pairs_broad
@@ -703,7 +706,7 @@ class Collider:
 
     def reset(self, envs_idx=None, *, cache_only: bool = True) -> None:
         self._contact_data_cache.clear()
-        if gs.use_zerocopy:
+        if gs.use_zerocopy and self._contact_data is not None:
             envs_idx = slice(None) if envs_idx is None else envs_idx
             if not cache_only:
                 first_time = qd_to_torch(self._collider_state.first_time, copy=False)
@@ -740,6 +743,7 @@ class Collider:
 
         if (
             gs.use_zerocopy
+            and self._contact_data is not None
             and not self._solver._use_hibernation
             and (not isinstance(envs_idx, torch.Tensor) or (not IS_OLD_TORCH or envs_idx.dtype == torch.bool))
         ):
@@ -991,7 +995,7 @@ class Collider:
             not self._collider_static_config.has_prunable_contacts
             and not self._collider_static_config.spatial_sort_supported
         )
-        if gs.use_zerocopy:
+        if gs.use_zerocopy and self._contact_data is not None:
             n_contacts = qd_to_torch(self._collider_state.n_contacts, copy=False)
             if as_tensor or n_envs == 0:
                 n_contacts_max = (n_contacts if n_envs == 0 else n_contacts.max()).item()
