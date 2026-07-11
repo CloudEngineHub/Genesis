@@ -460,7 +460,7 @@ class RigidSolver(KinematicSolver):
         # envelope factorization. The differentiable adjoint solve reads the dense Hessian, so the composition is
         # restricted to the forward (non-grad) path. On GPU the dense tiled path is faster, so sparse is dropped and
         # islands stand alone.
-        if gs.backend == gs.cpu and self._use_contact_island and sparse_solve and not self.sim.options.requires_grad:
+        if sparse_solve and gs.backend == gs.cpu and self._use_contact_island and not self.sim.options.requires_grad:
             pass  # compose islands + sparse Jacobian
         elif sparse_solve and gs.backend == gs.cpu:
             self._use_contact_island = False
@@ -487,14 +487,15 @@ class RigidSolver(KinematicSolver):
         # The subgroup-cooperative constraint kernels (and the batch-first layout they expect) win when per-env compute
         # density amortizes the warp-per-env overhead, and lose when envs are sparse and many (the 1-thread-per-env path
         # is already coalesced under (len_constraints_, _B)). They are also the layout the decomposed solve arm requires.
-        # Empirically the cooperative path wins around 4096 envs at n_dofs >= ~18 and washes out by ~30000 envs at
-        # n_dofs <= ~12; the n_envs <= 8192 and n_dofs >= 16 thresholds bound that crossover. Sparse solve is excluded
-        # (the cooperative qfrc kernel and the flipped-layout jac readers are dense-only).
+        # Empirically the cooperative path wins from ~4096 envs at n_dofs >= ~18 and loses once the env dimension alone
+        # saturates the GPU, so the env bound is get_gpu_core_count() (the threshold envs_undersaturate uses below), not
+        # a fixed literal, combined with n_dofs >= 16. Sparse solve is excluded (the cooperative qfrc kernel and the
+        # flipped-layout jac readers are dense-only).
         enable_cooperative_constraint_kernels = (
             gs.backend != gs.cpu
             and not self.sim.options.requires_grad
             and not sparse_solve
-            and self._sim._B <= 8192
+            and self._sim._B <= get_gpu_core_count()
             and self.n_dofs >= 16
         )
         constraint_layout_batch_first = (
@@ -1056,6 +1057,23 @@ class RigidSolver(KinematicSolver):
                     # Still fallback to mean vertex position if no better option...
                     geoms_center.append(np.mean(tmesh.vertices, axis=0))
 
+            # A geom is hollow when its own center lies in a cavity rather than inside its material (bowl, mug,
+            # nut), i.e. its own SDF is positive at its center. This is a static property of the collision
+            # geometry, precomputed here so the narrowphase never has to probe it at runtime. SPHERE/PLANE/TERRAIN
+            # SDFs are analytic and never hollow.
+            geoms_is_hollow = []
+            for geom, center in zip(geoms, geoms_center):
+                is_hollow = False
+                if geom.type not in (gs.GEOM_TYPE.SPHERE, gs.GEOM_TYPE.PLANE, gs.GEOM_TYPE.TERRAIN):
+                    grid_pos = geom.T_mesh_to_sdf[:3, :3] @ center + geom.T_mesh_to_sdf[:3, 3]
+                    cell = np.minimum(np.maximum(np.floor(grid_pos).astype(gs.np_int), 0), geom.sdf_res - 2)
+                    frac = grid_pos - cell
+                    corners = geom.sdf_val[cell[0] : cell[0] + 2, cell[1] : cell[1] + 2, cell[2] : cell[2] + 2]
+                    weights_x, weights_y, weights_z = ([1.0 - frac[i], frac[i]] for i in range(3))
+                    sd_center = np.einsum("i,j,k,ijk->", weights_x, weights_y, weights_z, corners)
+                    is_hollow = sd_center > gs.EPS
+                geoms_is_hollow.append(is_hollow)
+
             kernel_init_geom_fields(
                 geoms_pos=np.array([geom.init_pos for geom in geoms], dtype=gs.np_float),
                 geoms_center=np.array(geoms_center, dtype=gs.np_float),
@@ -1082,6 +1100,7 @@ class RigidSolver(KinematicSolver):
                 geoms_coup_restitution=np.array([geom.coup_restitution for geom in geoms], dtype=gs.np_float),
                 geoms_is_fixed=np.array([geom.is_fixed for geom in geoms], dtype=gs.np_bool),
                 geoms_is_decomp=np.array([geom.metadata.get("decomposed", False) for geom in geoms], dtype=gs.np_bool),
+                geoms_is_hollow=np.array(geoms_is_hollow, dtype=gs.np_bool),
                 # Quadrants variables
                 geoms_info=self.geoms_info,
                 geoms_state=self.geoms_state,
