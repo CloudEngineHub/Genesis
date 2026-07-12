@@ -531,8 +531,8 @@ def test_genuine_interpenetration(show_viewer):
     # so show_viewer displays the whole sample set at the end.
     pairs_viz = []
 
-    def measure(label, links):
-        max_depth, crossings = get_genuine_interpenetration(links)
+    def measure(label, links, is_exact=True):
+        max_depth, crossings = get_genuine_interpenetration(links, is_exact=is_exact)
         by_pair = {(c.link_a, c.link_b): c.depth for c in crossings}
         for i_la, geoms_a in enumerate(links):
             for i_lb in range(i_la + 1, len(links)):
@@ -556,12 +556,13 @@ def test_genuine_interpenetration(show_viewer):
     RADIUS = 0.03
     # Overlapping spheres: one crossing whose depth is the overlap, up to the tessellation chord error.
     for overlap in (2e-3, 5e-3, 15e-3):
-        max_depth, crossings = measure(
-            f"spheres overlapping {overlap * 1e3:g}mm",
-            [[sphere(RADIUS, (0, 0, 0))], [sphere(RADIUS, (2 * RADIUS - overlap, 0, 0))]],
-        )
+        pair = [[sphere(RADIUS, (0, 0, 0))], [sphere(RADIUS, (2 * RADIUS - overlap, 0, 0))]]
+        max_depth, crossings = measure(f"spheres overlapping {overlap * 1e3:g}mm", pair)
         assert len(crossings) == 1
         assert_allclose(max_depth, overlap, atol=1.5e-4)
+        max_depth_fast, crossings_fast = measure(f"spheres overlapping {overlap * 1e3:g}mm fast", pair, is_exact=False)
+        assert len(crossings_fast) == 1
+        assert_allclose(max_depth_fast, overlap, atol=5e-4)
 
     # Touching / separated spheres: no crossing, no depth.
     max_depth, crossings = measure(
