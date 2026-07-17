@@ -61,7 +61,14 @@ def get_model_name(file_path):
     return None
 
 
-def build_model(xml, discard_visual, default_armature=None, merge_fixed_links=False, links_to_keep=()):
+def build_model(
+    xml,
+    discard_visual,
+    default_armature=None,
+    merge_fixed_links=False,
+    exclude_ground_plane=False,
+    links_to_keep=(),
+):
     if isinstance(xml, (str, Path, urdfpy.URDF)):
         if isinstance(xml, urdfpy.URDF):
             is_urdf_file = True
@@ -103,6 +110,15 @@ def build_model(xml, discard_visual, default_armature=None, merge_fixed_links=Fa
                     mjcf.append(child)
                 mjcf.remove(elem)
                 root_parent_stack.append((include_root, include_path))
+
+        # Drop ground planes authored directly under the worldbody so a model that embeds its own floor can be
+        # loaded into a scene that already provides a ground. Removing the source geoms before compilation leaves
+        # planes authored under child bodies untouched, even when the compiler fuses them into the worldbody.
+        if not is_urdf_file and exclude_ground_plane:
+            for worldbody in mjcf.findall("worldbody"):
+                for geom in tuple(worldbody.findall("geom")):
+                    if geom.attrib.get("type") == "plane":
+                        worldbody.remove(geom)
 
         # Make sure compiler options are defined
         compiler = mjcf.find("compiler")
@@ -209,7 +225,15 @@ def parse_xml(morph, surface):
         links_to_keep = morph.links_to_keep
 
     # Build model from XML (either URDF or MJCF)
-    mj = build_model(morph.file, not morph.visualization, morph.default_armature, merge_fixed_links, links_to_keep)
+    exclude_ground_plane = isinstance(morph, gs.morphs.MJCF) and morph.exclude_ground_plane
+    mj = build_model(
+        morph.file,
+        not morph.visualization,
+        morph.default_armature,
+        merge_fixed_links,
+        exclude_ground_plane,
+        links_to_keep,
+    )
 
     # We have another more informative warning later so we suppress this one
     # gs.logger.warning(f"(MJCF) Approximating tendon by joint actuator for `{j_info['name']}`")
