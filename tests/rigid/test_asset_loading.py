@@ -59,6 +59,24 @@ def test_mjcf_parsing_with_include():
 
 
 @pytest.mark.required
+def test_mjcf_include_rewrites_asset_mesh_and_skips_default_mesh(mjcf_include_default_and_asset_mesh):
+    scene_path, extents = mjcf_include_default_and_asset_mesh
+
+    scene = gs.Scene()
+    entity = scene.add_entity(
+        gs.morphs.MJCF(
+            file=scene_path,
+        )
+    )
+    scene.build()
+
+    (geom,) = entity.geoms
+    assert geom.type == gs.GEOM_TYPE.MESH
+    aabb = geom.get_AABB()
+    assert_allclose(aabb[1] - aabb[0], extents, tol=gs.EPS)
+
+
+@pytest.mark.required
 def test_ground_plane_preservation(box_plan):
     mjcf = ET.tostring(box_plan, encoding="unicode")
 

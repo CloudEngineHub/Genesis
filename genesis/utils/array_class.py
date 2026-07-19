@@ -450,15 +450,17 @@ class ConstraintState:
     qacc_ws: qd.Tensor
     qacc_prev: qd.Tensor
     cost_ws: qd.Tensor
-    gauss: qd.Tensor
     cost: qd.Tensor
-    prev_cost: qd.Tensor
     gtol: qd.Tensor
     mv: qd.Tensor
     jv: qd.Tensor
+    # The linesearch evaluates costs in shifted form, cost(alpha) - cost(0), so the achieved improvement stays
+    # resolvable in float32 near convergence (subtracting two large absolute costs rounds the delta to zero).
+    # quad_gauss and eq_sum hold only the [linear, quadratic] coefficients: the constant cancels analytically in the
+    # shift. ls_improvement carries -cost(alpha_accepted), i.e. the improvement, to the solver termination check.
     quad_gauss: qd.Tensor
     ls_alpha: qd.Tensor
-    ls_p0_cost: qd.Tensor
+    ls_improvement: qd.Tensor
     ls_alpha_newton: qd.Tensor
     ls_gtol: qd.Tensor
     eq_sum: qd.Tensor
@@ -468,7 +470,6 @@ class ConstraintState:
     cg_prev_grad: qd.Tensor
     cg_prev_Mgrad: qd.Tensor
     cg_beta: qd.Tensor
-    cg_pg_dot_pMg: qd.Tensor
     # Optional Newton fields
     # Hessian matrix of the optimization problem as a dense 2D tensor.
     # Note that only the lower triangular part is updated for efficiency because this matrix is symmetric by definition.
@@ -595,20 +596,17 @@ def get_constraint_state(constraint_solver, solver, collider):
         is_warmstart=V(dtype=gs.qd_bool, shape=(_B,)),
         improved=V(dtype=gs.qd_bool, shape=(_B,)),
         cost_ws=V(dtype=gs.qd_float, shape=(_B,)),
-        gauss=V(dtype=gs.qd_float, shape=(_B,)),
         cost=V(dtype=gs.qd_float, shape=(_B,)),
-        prev_cost=V(dtype=gs.qd_float, shape=(_B,)),
         gtol=V(dtype=gs.qd_float, shape=(_B,)),
         ls_it=V(dtype=gs.qd_int, shape=(_B,)),
         ls_result=V(dtype=gs.qd_int, shape=(_B,)),
         cg_beta=V(dtype=gs.qd_float, shape=(_B,)),
-        cg_pg_dot_pMg=V(dtype=gs.qd_float, shape=(_B,)),
-        quad_gauss=V(dtype=gs.qd_float, shape=(3, _B)),
+        quad_gauss=V(dtype=gs.qd_float, shape=(2, _B)),
         ls_alpha=V(dtype=gs.qd_float, shape=(_B,)),
-        ls_p0_cost=V(dtype=gs.qd_float, shape=(_B,)),
+        ls_improvement=V(dtype=gs.qd_float, shape=(_B,)),
         ls_alpha_newton=V(dtype=gs.qd_float, shape=(_B,)),
         ls_gtol=V(dtype=gs.qd_float, shape=(_B,)),
-        eq_sum=V(dtype=gs.qd_float, shape=(3, _B)),
+        eq_sum=V(dtype=gs.qd_float, shape=(2, _B)),
         Ma=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         Ma_ws=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
         grad=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), layout=dof_vec_layout),
@@ -1758,6 +1756,10 @@ class LinksState:
     j_ang: qd.Tensor
     cd_ang: qd.Tensor
     cd_vel: qd.Tensor
+    # Whether any contact or connect/weld equality row involves the link this step. Written by the constraint
+    # assembly (the deterministic post-sort view of the contacts), consumed by the midpoint-integration eligibility;
+    # the raw collider contact buffer is only valid through the contact_sort_idx indirection.
+    is_constrained: qd.Tensor
     cd_ang_bw: qd.Tensor
     cd_vel_bw: qd.Tensor
     mass_sum: qd.Tensor
@@ -1811,6 +1813,7 @@ def get_links_state(solver):
         j_ang=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         cd_ang=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         cd_vel=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
+        is_constrained=V(dtype=gs.qd_bool, shape=shape),
         cd_ang_bw=V(dtype=gs.qd_vec3, shape=shape_bw, needs_grad=requires_grad),
         cd_vel_bw=V(dtype=gs.qd_vec3, shape=shape_bw, needs_grad=requires_grad),
         mass_sum=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
