@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "psutil",
-    "quadrants==1.1.1",
+    "quadrants==1.1.3",
     "pydantic>=2.11.0",
     "numpy>=1.26.4",
     "frozendict",
@@ -85,6 +85,9 @@ dev = [
     # Note that 'pytest-rerunfailures' is incompatible with 'pytest-forked'
     # - 16.0 is causing pytest-xdist to crash in case of failure or skipped tests
     # "pytest-rerunfailures!=16.0",
+    # GPU queries for the test infrastructure (tests/gpu_info.py); non-macOS so the CUDA device check runs on
+    # Linux and Windows. AMD's 'amdsmi' ships with ROCm, not PyPI, so the AMD backend is import-gated instead.
+    "nvidia-ml-py; platform_system != 'Darwin'",
     "setproctitle", # allows renaming the test processes on the cluster
     "syrupy",
     "huggingface_hub[hf_xet]",
