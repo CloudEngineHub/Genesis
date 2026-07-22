@@ -19,6 +19,7 @@ from genesis.utils.raycast_qd import closest_point_on_triangle, get_triangle_ver
 from .raycaster import RaycastContext
 
 from .base_sensor import RigidSensorMetadataMixin, RigidSensorMixin, SimpleSensor, SimpleSensorMetadata
+from .contact_force import ContactFilterMetadataMixin, _func_link_is_filtered
 from .probe import (
     ProbeSensorMetadataMixin,
     ProbeSensorMixin,
@@ -96,6 +97,7 @@ _MAX_GEOMS_PER_SENSOR = 64
 @qd.kernel
 def _kernel_build_sensor_contact_idx(
     sensor_link_idx: qd.types.ndarray(),
+    filter_links_idx: qd.types.ndarray(),
     sensor_contacts_idx: qd.types.ndarray(),
     sensor_n_contacts: qd.types.ndarray(),
     collider_state: array_class.ColliderState,
@@ -104,8 +106,11 @@ def _kernel_build_sensor_contact_idx(
     Per-(env, sensor) compact contact index for the KinematicTaxel pre-pass.
 
     Parallelizes over ``(n_batches, n_sensors)`` so the main kernel's per-probe contact-list scan drops from
-    O(n_probes * n_contacts) to O(n_probes * sensor_n_contacts). Cap-overflows (count >= last dim of
-    ``sensor_contacts_idx``) silently truncate; see the module-level ``_MAX_CONTACTS_PER_SENSOR`` comment.
+    O(n_probes * n_contacts) to O(n_probes * sensor_n_contacts). The counterpart filter is applied here, before the
+    per-sensor cap: a contact whose only tie to the sensor link is through a filtered counterpart is dropped and
+    never consumes a cap slot, so a large filtered manifold (e.g. the ground) cannot starve an allowed contact.
+    Cap-overflows (count >= last dim of ``sensor_contacts_idx``) silently truncate; see the module-level
+    ``_MAX_CONTACTS_PER_SENSOR`` comment.
     """
     n_sensors = sensor_link_idx.shape[0]
     n_batches = sensor_n_contacts.shape[0]
@@ -119,7 +124,9 @@ def _kernel_build_sensor_contact_idx(
                 break
             link_a = collider_state.contact_data.link_a[i_c, i_b]
             link_b = collider_state.contact_data.link_b[i_c, i_b]
-            if link_a == link or link_b == link:
+            is_on_a = link_a == link and not _func_link_is_filtered(i_s, link_b, filter_links_idx)
+            is_on_b = link_b == link and not _func_link_is_filtered(i_s, link_a, filter_links_idx)
+            if is_on_a or is_on_b:
                 sensor_contacts_idx[i_b, i_s, count] = i_c
                 count = count + 1
         sensor_n_contacts[i_b, i_s] = count
@@ -128,6 +135,7 @@ def _kernel_build_sensor_contact_idx(
 @qd.kernel
 def _kernel_build_sensor_geom_idx(
     sensor_link_idx: qd.types.ndarray(),
+    filter_links_idx: qd.types.ndarray(),
     sensor_geoms_idx: qd.types.ndarray(),
     sensor_n_geoms: qd.types.ndarray(),
     collider_state: array_class.ColliderState,
@@ -138,6 +146,9 @@ def _kernel_build_sensor_geom_idx(
     Parallelizes over ``(n_batches, n_sensors)``, recording each contact's opposing geom (the side not on the
     sensor link). Deduping collapses the multicontact fan-out (tens of contacts on one pressing object -> one
     geom) so the SDF path's per-probe loop runs once per distinct contacting geom, not once per contact point.
+    A contact whose counterpart link is in sensor ``i_s``'s ``filter_links_idx`` row is skipped here, so the SDF
+    query loop never sees the filtered geom (the raycast path filters symmetrically in
+    ``_kernel_build_sensor_candidate_geom_mask``), keeping the filter out of the per-probe hot loops.
     Cap-overflows (count >= last dim of ``sensor_geoms_idx``) silently truncate; see the module-level
     ``_MAX_GEOMS_PER_SENSOR`` comment.
     """
@@ -154,7 +165,8 @@ def _kernel_build_sensor_geom_idx(
             # A self-contact (sensor link on both sides) is deduped naturally below.
             for side in qd.static(range(2)):
                 c_link = link_a if side == 0 else link_b
-                if c_link == link:
+                counterpart_link = link_b if side == 0 else link_a
+                if c_link == link and not _func_link_is_filtered(i_s, counterpart_link, filter_links_idx):
                     i_g = (
                         collider_state.contact_data.geom_b[i_c, i_b]
                         if side == 0
@@ -503,7 +515,8 @@ def _kernel_build_sensor_candidate_geom_mask(
     to skip triangles whose owning geom isn't in the sensor's current contact list. Only the geom on the side opposite
     the sensor link is marked (mirroring the SDF path's ``i_g = <other geom>`` selection); marking the sensor's own
     geom would let the BVH closest-point test latch onto the sensor's own surface, pinning the reported depth to
-    ``probe_radius`` regardless of the pressing object.
+    ``probe_radius`` regardless of the pressing object. The counterpart filter is already applied while building
+    ``sensor_contacts_idx``, so every listed contact is an allowed one.
     """
     n_batches = sensor_n_contacts.shape[0]
     n_sensors = sensor_n_contacts.shape[1]
@@ -523,6 +536,7 @@ def _kernel_build_sensor_candidate_geom_mask(
 
 @qd.func
 def _func_query_contact_depth_penetration_bvh(
+    i_t: int,
     i_b: int,
     i_s: int,
     probe_pos: qd.types.vector(3),
@@ -557,14 +571,14 @@ def _func_query_contact_depth_penetration_bvh(
     while stack_idx > 0:
         stack_idx -= 1
         node_idx = node_stack[stack_idx]
-        node = bvh_nodes[i_b, node_idx]
+        node = bvh_nodes[i_t, node_idx]
 
         if not func_sphere_intersects_aabb(probe_pos, best_dist_sq, node.bound.min, node.bound.max):
             continue
 
         if node.left == -1:
             sorted_leaf_idx = node_idx - (n_triangles - 1)
-            i_f = qd.cast(bvh_morton_codes[i_b, sorted_leaf_idx][1], gs.qd_int)
+            i_f = qd.cast(bvh_morton_codes[i_t, sorted_leaf_idx][1], gs.qd_int)
             i_g = dyn_info.faces.geom_idx[i_f]
             if not sensor_candidate_geom_mask[i_b, i_s, i_g]:
                 continue
@@ -596,6 +610,7 @@ def _func_query_contact_depth_penetration_bvh(
 
 @qd.func
 def _func_query_contact_depth_bvh(
+    i_t: int,
     i_b: int,
     i_s: int,
     probe_pos: qd.types.vector(3),
@@ -630,14 +645,14 @@ def _func_query_contact_depth_bvh(
     while stack_idx > 0:
         stack_idx -= 1
         node_idx = node_stack[stack_idx]
-        node = bvh_nodes[i_b, node_idx]
+        node = bvh_nodes[i_t, node_idx]
 
         if not func_sphere_intersects_aabb(probe_pos, best_dist_sq, node.bound.min, node.bound.max):
             continue
 
         if node.left == -1:
             sorted_leaf_idx = node_idx - (n_triangles - 1)
-            i_f = qd.cast(bvh_morton_codes[i_b, sorted_leaf_idx][1], gs.qd_int)
+            i_f = qd.cast(bvh_morton_codes[i_t, sorted_leaf_idx][1], gs.qd_int)
             i_g = dyn_info.faces.geom_idx[i_f]
             if not sensor_candidate_geom_mask[i_b, i_s, i_g]:
                 continue
@@ -678,6 +693,8 @@ def _func_query_contact_depth_bvh(
 def _kernel_contact_depth_probe_bvh(
     probe_sensor_idx: qd.types.ndarray(),
     links_idx: qd.types.ndarray(),
+    env_bvh_idx_a: qd.types.ndarray(),
+    env_bvh_idx_b: qd.types.ndarray(),
     sensor_cache_start: qd.types.ndarray(),
     sensor_probe_start: qd.types.ndarray(),
     probe_positions_local: qd.types.ndarray(),
@@ -724,6 +741,7 @@ def _kernel_contact_depth_probe_bvh(
         )
 
         max_penetration_gt, max_penetration_m, signed_dist = _func_query_contact_depth_penetration_bvh(
+            env_bvh_idx_a[i_b],
             i_b,
             i_s,
             probe_pos,
@@ -741,6 +759,7 @@ def _kernel_contact_depth_probe_bvh(
             # triangle out-penetrates a nearer outside one - so the globally nearest answer is the one with the
             # smaller signed-distance magnitude, taken wholesale.
             max_penetration_gt_b, max_penetration_m_b, signed_dist_b = _func_query_contact_depth_penetration_bvh(
+                env_bvh_idx_b[i_b],
                 i_b,
                 i_s,
                 probe_pos,
@@ -765,6 +784,8 @@ def _kernel_contact_depth_probe_bvh(
 def _kernel_kinematic_taxel_bvh(
     probe_sensor_idx: qd.types.ndarray(),
     links_idx: qd.types.ndarray(),
+    env_bvh_idx_a: qd.types.ndarray(),
+    env_bvh_idx_b: qd.types.ndarray(),
     sensor_cache_start: qd.types.ndarray(),
     sensor_probe_start: qd.types.ndarray(),
     probe_positions_local: qd.types.ndarray(),
@@ -834,6 +855,7 @@ def _kernel_kinematic_taxel_bvh(
             contact_normal_m,
             signed_dist,
         ) = _func_query_contact_depth_bvh(
+            env_bvh_idx_a[i_b],
             i_b,
             i_s,
             probe_pos,
@@ -857,6 +879,7 @@ def _kernel_kinematic_taxel_bvh(
                 contact_normal_m_b,
                 signed_dist_b,
             ) = _func_query_contact_depth_bvh(
+                env_bvh_idx_b[i_b],
                 i_b,
                 i_s,
                 probe_pos,
@@ -931,11 +954,16 @@ class KinematicTactileSensorMixin(ContactDepthQuerySensorMixin, ProbeSensorMixin
     subclasses add their own metadata.
     """
 
+    def build(self):
+        super().build()
+        self._shared_metadata.append_filter(self._options.filter_link_idx)
+
 
 @dataclass
 class ContactDepthProbeMetadata(
     ViscoelasticHysteresisMetadataMixin,
     ProbeSensorMetadataMixin,
+    ContactFilterMetadataMixin,
     ContactPrefilterMetadataMixin,
     ContactDepthQueryMetadataMixin,
     RigidSensorMetadataMixin,
@@ -991,6 +1019,7 @@ class ContactDepthProbeSensor(
         if (shared_metadata.contact_depth_query or "sdf") == "sdf":
             _kernel_build_sensor_geom_idx(
                 shared_metadata.links_idx,
+                shared_metadata.filter_links_idx,
                 shared_metadata.sensor_geoms_idx,
                 shared_metadata.sensor_n_geoms,
                 solver.collider._collider_state,
@@ -1015,6 +1044,7 @@ class ContactDepthProbeSensor(
         else:
             _kernel_build_sensor_contact_idx(
                 shared_metadata.links_idx,
+                shared_metadata.filter_links_idx,
                 shared_metadata.sensor_contacts_idx,
                 shared_metadata.sensor_n_contacts,
                 solver.collider._collider_state,
@@ -1035,6 +1065,8 @@ class ContactDepthProbeSensor(
             _kernel_contact_depth_probe_bvh(
                 shared_metadata.probe_sensor_idx,
                 shared_metadata.links_idx,
+                entry_a.env_bvh_idx,
+                entry_b.env_bvh_idx,
                 shared_metadata.sensor_cache_start,
                 shared_metadata.sensor_probe_start,
                 shared_metadata.probe_positions,
@@ -1163,6 +1195,7 @@ class KinematicTaxelMetadata(
     ViscoelasticHysteresisMetadataMixin,
     SpatialCrosstalkMetadataMixin,
     ProbeSensorMetadataMixin,
+    ContactFilterMetadataMixin,
     ContactPrefilterMetadataMixin,
     ContactDepthQueryMetadataMixin,
     RigidSensorMetadataMixin,
@@ -1259,6 +1292,7 @@ class KinematicTaxelSensor(
         if (shared_metadata.contact_depth_query or "sdf") == "sdf":
             _kernel_build_sensor_geom_idx(
                 shared_metadata.links_idx,
+                shared_metadata.filter_links_idx,
                 shared_metadata.sensor_geoms_idx,
                 shared_metadata.sensor_n_geoms,
                 solver.collider._collider_state,
@@ -1293,6 +1327,7 @@ class KinematicTaxelSensor(
         else:
             _kernel_build_sensor_contact_idx(
                 shared_metadata.links_idx,
+                shared_metadata.filter_links_idx,
                 shared_metadata.sensor_contacts_idx,
                 shared_metadata.sensor_n_contacts,
                 solver.collider._collider_state,
@@ -1313,6 +1348,8 @@ class KinematicTaxelSensor(
             _kernel_kinematic_taxel_bvh(
                 shared_metadata.probe_sensor_idx,
                 shared_metadata.links_idx,
+                entry_a.env_bvh_idx,
+                entry_b.env_bvh_idx,
                 shared_metadata.sensor_cache_start,
                 shared_metadata.sensor_probe_start,
                 shared_metadata.probe_positions,

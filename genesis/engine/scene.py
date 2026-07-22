@@ -995,13 +995,16 @@ class Scene(RBC):
         self._reset(state, envs_idx=envs_idx)
         self._recorder_manager.reset(envs_idx)
 
-    def _reset(self, state: SimState | None = None, *, envs_idx=None):
+    def _reset(self, state: SimState | None = None, *, envs_idx=None, keep_init: bool = False):
         if self._is_built:
             if state is None:
                 state = self._init_state
             else:
                 assert isinstance(state, SimState), "state must be a SimState object"
-                self._init_state = state
+                # keep_init=True restores the state while leaving the registered init untouched, so a later bare
+                # reset() still rewinds to the true initial state.
+                if not keep_init:
+                    self._init_state = state
             self._sim.reset(state, envs_idx)
         else:
             self._init_state = self._get_state()
@@ -1021,6 +1024,40 @@ class Scene(RBC):
 
     def _reset_grad(self):
         self._backward_ready = True
+
+    @gs.assert_built
+    def backward(self, loss: torch.Tensor, *args, **kwargs):
+        """
+        Differentiates `loss` through the recorded rollout and restores the pre-backward physics state.
+
+        Unrolling the gradient tape rewinds the physics state to step 0, so this method snapshots the current state
+        first, runs the backward pass, and restores the snapshot afterwards. The scene then sits at the same physics
+        state as before the call, with gradients populated and forward / backward re-armed, ready to continue the
+        rollout or to be reset. The registered initial state (`reset()` with no argument) is preserved.
+
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Scalar loss to differentiate. Extra positional and keyword arguments (e.g. `gradient`, `retain_graph`)
+            are forwarded to `torch.autograd.backward`.
+
+        Returns
+        -------
+        snapshot : SimState
+            The physics state the scene was restored to.
+        """
+        # Snapshot the current state before the gradient-tape unroll rewinds physics to step 0.
+        snapshot = self.get_state()
+        # The sim unroll (self._backward) re-enters the torch graph from each step's queried states, so the graph
+        # must survive the initial autograd pass.
+        kwargs.setdefault("retain_graph", True)
+        # The functional torch.autograd.backward fills torch and queried-state grads while leaving the sim unroll to
+        # the explicit self._backward call below, keeping gs.Tensor.backward's automatic scene._backward out of it.
+        torch.autograd.backward(loss, *args, **kwargs)
+        self._backward()
+        # keep_init=True preserves the registered initial state so a later bare reset() still rewinds to it.
+        self._reset(snapshot, keep_init=True)
+        return snapshot
 
     def _get_state(self):
         return self._sim.get_state()

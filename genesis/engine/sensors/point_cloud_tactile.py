@@ -1047,6 +1047,7 @@ def _dilate_kernel_builder(meta_entry: GridFFTMeta, fft_n: tuple[int, int]) -> t
 
 @qd.func
 def _func_elastomer_min_signed_dist_bvh(
+    i_t: int,
     i_b: int,
     i_s: int,
     probe_world: qd.types.vector(3),
@@ -1081,14 +1082,14 @@ def _func_elastomer_min_signed_dist_bvh(
     while stack_idx > 0:
         stack_idx -= 1
         node_idx = node_stack[stack_idx]
-        node = bvh_nodes[i_b, node_idx]
+        node = bvh_nodes[i_t, node_idx]
 
         if not func_sphere_intersects_aabb(probe_world, best_dist_sq, node.bound.min, node.bound.max):
             continue
 
         if node.left == -1:
             sorted_leaf_idx = node_idx - (n_triangles - 1)
-            i_f = qd.cast(bvh_morton_codes[i_b, sorted_leaf_idx][1], gs.qd_int)
+            i_f = qd.cast(bvh_morton_codes[i_t, sorted_leaf_idx][1], gs.qd_int)
             i_g = dyn_info.faces.geom_idx[i_f]
             if not track_geom_mask[i_b, i_s, i_g]:
                 continue
@@ -1121,6 +1122,8 @@ def _func_elastomer_min_signed_dist_bvh(
 def _kernel_elastomer_probe_depth_bvh(
     probe_sensor_idx: qd.types.ndarray(),
     links_idx: qd.types.ndarray(),
+    env_bvh_idx_a: qd.types.ndarray(),
+    env_bvh_idx_b: qd.types.ndarray(),
     probe_positions_local: qd.types.ndarray(),
     probe_radii: qd.types.ndarray(),
     track_geom_mask: qd.types.ndarray(),
@@ -1156,12 +1159,22 @@ def _kernel_elastomer_probe_depth_bvh(
         probe_world = link_pos + gu.qd_transform_by_quat(probe_local, link_quat)
 
         signed = _func_elastomer_min_signed_dist_bvh(
-            i_b, i_s, probe_world, bvh_nodes_a, bvh_morton_codes_a, track_geom_mask, dyn_state, dyn_info, max_query_dist
+            env_bvh_idx_a[i_b],
+            i_b,
+            i_s,
+            probe_world,
+            bvh_nodes_a,
+            bvh_morton_codes_a,
+            track_geom_mask,
+            dyn_state,
+            dyn_info,
+            max_query_dist,
         )
         if is_split:
             # The collision faces are partitioned over two trees (see RaycastContext.activate); |signed| is the
             # distance the query minimizes, so the smaller magnitude is the globally nearest triangle's answer.
             signed_b = _func_elastomer_min_signed_dist_bvh(
+                env_bvh_idx_b[i_b],
                 i_b,
                 i_s,
                 probe_world,
@@ -1463,6 +1476,8 @@ def _kernel_elastomer_surface_state_bvh(
 @qd.kernel(fastcache=False)
 def _kernel_elastomer_surface_state_via_global_bvh(
     links_idx: qd.types.ndarray(),
+    env_bvh_idx_a: qd.types.ndarray(),
+    env_bvh_idx_b: qd.types.ndarray(),
     sensor_elastomer_geom_start: qd.types.ndarray(),
     elastomer_geom_idx: qd.types.ndarray(),
     bvh_chunk_sensor_idx: qd.types.ndarray(),
@@ -1584,6 +1599,7 @@ def _kernel_elastomer_surface_state_via_global_bvh(
                         surface_pos_sensor_buf[i_b, i_o, k] = point_sensor[k]
 
                     min_sdf = _func_elastomer_min_signed_dist_bvh(
+                        env_bvh_idx_a[i_b],
                         i_b,
                         i_s,
                         point_world,
@@ -1597,6 +1613,7 @@ def _kernel_elastomer_surface_state_via_global_bvh(
                     if is_split:
                         # See _kernel_elastomer_probe_depth_bvh for the two-tree fold.
                         min_sdf_b = _func_elastomer_min_signed_dist_bvh(
+                            env_bvh_idx_b[i_b],
                             i_b,
                             i_s,
                             point_world,
@@ -2224,6 +2241,8 @@ class ElastomerTaxelSensor(
             _kernel_elastomer_probe_depth_bvh(
                 shared_metadata.probe_sensor_idx,
                 shared_metadata.links_idx,
+                entry_a.env_bvh_idx,
+                entry_b.env_bvh_idx,
                 shared_metadata.probe_positions,
                 shared_metadata.probe_radii,
                 shared_metadata.sensor_candidate_geom_mask,
@@ -2302,6 +2321,8 @@ class ElastomerTaxelSensor(
                 entry_a, entry_b = collision_bvh_contexts[0], collision_bvh_contexts[-1]
                 _kernel_elastomer_surface_state_via_global_bvh(
                     shared_metadata.links_idx,
+                    entry_a.env_bvh_idx,
+                    entry_b.env_bvh_idx,
                     shared_metadata.sensor_elastomer_geom_start,
                     shared_metadata.elastomer_geom_idx,
                     bvh.chunk_sensor_idx,
