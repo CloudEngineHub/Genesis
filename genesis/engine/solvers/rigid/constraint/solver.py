@@ -449,12 +449,12 @@ class ConstraintSolver:
         )
 
     def backward(self):
+        """Adjoint solve of the constraint force computation.
+
+        The caller must pre-populate the upstream gradient constraint_state.dL_dqacc (see
+        RigidSolver._constraint_force_grad)."""
         if not self._solver._requires_grad:
             gs.raise_exception("Please set `requires_grad` to True in SimOptions to enable differentiable mode.")
-
-        # Upstream gradient dL_dqacc is expected to be pre-populated in
-        # constraint_state.dL_dqacc by the caller (see
-        # kernel_load_dL_dqacc_from_acc_grad).
 
         # 1. We first need to find a solution to A^T * u = g system.
         backward_constraint_solver.kernel_solve_adjoint_u(
@@ -2765,7 +2765,7 @@ def func_island_tiled_factor_solve_all(
     MAX_DOFS = qd.static(rigid_config.tiled_n_island_dofs)
     T = qd.static(rigid_config.cholesky_tile_size)
     n_work = constraint_state.island.factor_worklist_size[0]
-    qd.loop_config(block_dim=T)
+    qd.loop_config(name="island_tiled_factor_solve", block_dim=T)
     for i in range(N_BLOCKS * T):
         blk = i // T
         tid = i % T
