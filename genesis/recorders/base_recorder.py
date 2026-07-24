@@ -1,34 +1,17 @@
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Callable, Generic, Mapping, TypeVar
-
-import numpy as np
-import torch
+from typing import TYPE_CHECKING, Callable, Generic, TypeVar
 
 import genesis as gs
 from genesis.options.recorders import RecorderOptions
-from genesis.typing import is_sequence
-from genesis.utils import tensor_to_array
+from genesis.utils import data_to_array
 
 if TYPE_CHECKING:
     from .recorder_manager import RecorderManager
 
 
 T = TypeVar("T")
-
-
-def _to_numpy(data):
-    """Recursively move all GPU tensors nested in ``data`` to CPU numpy arrays, preserving container structure."""
-    if isinstance(data, torch.Tensor):
-        return tensor_to_array(data)
-    if isinstance(data, np.ndarray):
-        return data
-    if isinstance(data, Mapping):
-        return {k: _to_numpy(v) for k, v in data.items()}
-    if is_sequence(data):
-        return type(data)(_to_numpy(v) for v in data)
-    return data
 
 
 class Recorder(Generic[T]):
@@ -207,15 +190,14 @@ class Recorder(Generic[T]):
             return
 
         global_time = global_step * self._manager._step_dt
-        data = self._data_func()
+        # Sanitize to CPU numpy once at the boundary: process() code never has to branch on torch vs numpy, and no
+        # GPU tensor is ever queued for cross-thread access in threaded mode.
+        data = data_to_array(self._data_func())
 
         if not self.run_in_thread:
             # non-threaded mode: process data synchronously
             self.process(data, global_time)
             return
-
-        # threaded mode: move GPU tensors to CPU before queuing to avoid cross-thread GPU access
-        data = _to_numpy(data)
 
         # threaded mode: put data in queue
         try:
