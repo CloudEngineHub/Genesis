@@ -5,12 +5,15 @@ import numpy as np
 import pytest
 import torch
 
+import av
+
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.options.sensors import RasterizerCameraOptions
 from genesis.utils import set_random_seed
 from genesis.utils.image_exporter import FrameImageExporter, as_grayscale_image
 from genesis.utils.misc import tensor_to_array
+from genesis.utils.video_encoder import VideoEncoder
 
 from ..conftest import IS_INTERACTIVE_VIEWER_AVAILABLE, SKIP_NO_VIEWER
 from ..utils import assert_allclose, assert_equal, assert_pixel_match, rgb_array_to_png_bytes
@@ -303,7 +306,7 @@ def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, render
         robot.set_dofs_velocity(qvel, envs_idx=([i] if n_envs else None))
 
     # Run a few simulation steps while monitoring the result
-    cam_debug.start_recording()
+    cam_debug.start_recording(save_to_filename=(tmp_path / "video.mp4"))
 
     frames_prev = None
     for i in range(NUM_STEPS):
@@ -392,8 +395,12 @@ def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, render
         assert isinstance(rgb_debug, np.ndarray)
         assert rgb_debug.shape == (480, 640, 3)
 
-    assert len(cam_debug._recorded_imgs) == NUM_STEPS
-    cam_debug.stop_recording(save_to_filename=(tmp_path / "video.mp4"))
+    cam_debug.stop_recording()
+
+    # Every simulation step must have contributed exactly one frame at the default framerate, which is higher than
+    # the step rate of this scene
+    with av.open(tmp_path / "video.mp4") as container:
+        assert sum(1 for _ in container.decode(video=0)) == NUM_STEPS
 
     # Verify that the output is correct pixel-wise over multiple simulation steps
     try:
@@ -574,7 +581,7 @@ def test_deterministic(tmp_path, renderer_type, renderer, show_viewer, tol):
         tol_env = 0.002
         tol_step = gs.EPS
 
-    cam.start_recording()
+    cam.start_recording(save_to_filename=(tmp_path / "video.mp4"))
     for _ in range(7):
         dofs_lower_bound, dofs_upper_bound = robot.get_dofs_limit()
         qpos = dofs_lower_bound + (dofs_upper_bound - dofs_lower_bound) * torch.as_tensor(
@@ -628,7 +635,7 @@ def test_deterministic(tmp_path, renderer_type, renderer, show_viewer, tol):
         rgb_step_diff = np.abs(np.diff(steps_rgb_arrays, axis=0))
         assert rgb_step_diff.mean() < tol_step, "Per-step renders do not match"
 
-    cam.stop_recording(save_to_filename=(tmp_path / "video.mp4"))
+    cam.stop_recording()
 
 
 @pytest.mark.required
@@ -1321,8 +1328,10 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
     CAM_RES = (256, 256)
     RENDERED_ENVS = (1, 2)
 
-    # FIXME: Small discrepancies between different hardware due to contact visualization with onscreen viewer
-    STD_ERR_THR_MARKERS_OFF, STD_ERR_THR_MARKERS_ON = 1.0, 3.5 if force_show_viewer else 1.05
+    # One threshold for every frame. Marker lines land on slightly different pixels from one rasterizer to the next,
+    # which the offscreen frames absorb through a blur; the viewer frame holds up without one.
+    STD_ERR_THR = 1.5
+    BLUR_OFFSCREEN = 3
 
     scene = gs.Scene(
         vis_options=gs.options.VisOptions(
@@ -1334,7 +1343,8 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
             shadow=False,
         ),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(2.0, 0.2, 1.5),
+            # Far enough back for the whole ground to fit in frame, as every camera below requires
+            camera_pos=(3.0, 0.3, 2.0),
             camera_lookat=(0.0, 0.0, 0.4),
             res=CAM_RES,
             run_in_thread=False,
@@ -1345,12 +1355,16 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
         show_viewer=force_show_viewer,
         show_FPS=False,
     )
-    scene.add_entity(gs.morphs.Plane())
+    scene.add_entity(
+        gs.morphs.Plane(
+            # Software rendering backends misrasterize geometry reaching outside the frustum, so every vertex of the
+            # ground stays in frame from each camera below. Collision keeps its own infinite plane.
+            plane_size=(1.4, 1.4),
+        )
+    )
     franka = scene.add_entity(
         gs.morphs.MJCF(
             file="xml/franka_emika_panda/panda.xml",
-            # Add small negative offset to force contact with the ground
-            pos=(0.0, 0.0, -0.01),
         ),
         visualize_contact=True,
     )
@@ -1372,14 +1386,14 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
     )
     scene.build(n_envs=4, env_spacing=(0.3, 0.3))
 
-    # Hardcoded joint positions from a converged 200-step simulation with randomized initial states.
-    # Each env has a distinct pose so per-env renders differ visually.
+    # Hardcoded joint positions from a converged 200-step simulation with randomized initial states, each arm resting
+    # against the ground so the contact markers have contacts to draw, in a pose distinct from the other envs.
     franka.set_dofs_position(
         [
-            [0.199, 1.763, -0.148, -0.224, -0.790, 0.822, 0.051, 0.002, 0.002],
-            [0.372, 1.763, 0.172, -0.369, 1.498, -0.018, -0.040, 0.000, 0.000],
-            [-0.114, -1.763, -2.885, -0.234, -1.195, 0.159, 0.316, 0.000, 0.000],
-            [-0.254, -1.763, 2.193, -0.217, 1.109, 0.501, 0.727, 0.001, 0.001],
+            [1.728, -1.763, -2.157, -2.275, -0.327, 2.201, 1.833, 0.018, 0.018],
+            [-2.717, -1.763, -2.217, -2.566, 0.226, 2.933, 1.307, 0.017, 0.017],
+            [-1.411, 1.763, 0.657, -2.817, 1.597, 3.567, 2.872, 0.000, 0.000],
+            [-2.098, 1.763, -1.004, -2.421, -0.227, 2.850, -0.136, 0.020, 0.020],
         ]
     )
     scene.step()
@@ -1392,13 +1406,8 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
         pyrender_viewer.on_draw()
         viewer_rgb = pyrender_viewer._renderer.jit.read_color_buf(*pyrender_viewer._viewport_size, rgba=False)
 
-        try:
-            png_snapshot.extension._std_err_threshold = STD_ERR_THR_MARKERS_ON
-            assert rgb_array_to_png_bytes(viewer_rgb) == png_snapshot
-        except AssertionError:
-            if sys.platform == "darwin" and scene.visualizer.is_software:
-                pytest.xfail("Flaky on MacOS with Apple Software Renderer.")
-            raise
+        png_snapshot.extension._std_err_threshold = STD_ERR_THR
+        assert rgb_array_to_png_bytes(viewer_rgb) == png_snapshot
 
     # Render both cameras
     rgb, *_ = cam.render(rgb=True)
@@ -1433,17 +1442,12 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
     assert rgb is not None
 
     # Non-debug camera should NOT show markers — snapshot per env validates only robots are visible
-    png_snapshot.extension._std_err_threshold = STD_ERR_THR_MARKERS_OFF
+    png_snapshot.extension._std_err_threshold = STD_ERR_THR
+    png_snapshot.extension._blurred_kernel_size = BLUR_OFFSCREEN
     for rgb_i in rgb:
-        try:
-            assert rgb_array_to_png_bytes(rgb_i) == png_snapshot
-        except AssertionError:
-            if sys.platform == "darwin" and scene.visualizer.is_software:
-                pytest.xfail("Flaky on MacOS with Apple Software Renderer.")
-            raise
+        assert rgb_array_to_png_bytes(rgb_i) == png_snapshot
 
     # Debug camera SHOULD show markers (frames, contact arrows) — snapshot per env validates markers
-    png_snapshot.extension._std_err_threshold = STD_ERR_THR_MARKERS_ON
     for rgb_debug_i in rgb_debug:
         assert rgb_array_to_png_bytes(rgb_debug_i) == png_snapshot
 
@@ -1532,3 +1536,196 @@ def test_rasterizer_sensor_env_spacing_invariance(renderer, context_mode):
     # Per-env sensor images must be invariant to env_spacing — the offset is purely for
     # visual separation in the interactive viewer and must be transparent to sensors.
     assert np.abs(img_ref.astype(np.float32) - img_test.astype(np.float32)).mean() < 1.0
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
+def test_video_recording_lifecycle(tmp_path, monkeypatch, renderer, show_viewer):
+    DT = 0.01
+    # One frame every other step, so that a span of N_STEPS resolves 2 frames and the paused span below skips 2
+    FPS = 50.0
+    N_STEPS = 4
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(2.5, 0.0, 1.5),
+            camera_lookat=(0.0, 0.0, 0.5),
+        ),
+        renderer=renderer,
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        gs.morphs.Plane(),
+    )
+    scene.add_entity(
+        gs.morphs.Box(
+            pos=(0.0, 0.0, 0.5),
+            size=(0.2, 0.2, 0.2),
+        ),
+    )
+    cam = scene.add_camera(
+        res=(64, 64),
+        pos=(2.5, 0.0, 1.5),
+        lookat=(0.0, 0.0, 0.5),
+    )
+    scene.build()
+
+    # Encoding is lossy, so the frames handed to the encoder are intercepted to compare them exactly
+    frames_encoded = []
+    write = VideoEncoder.write
+
+    def write_intercepted(self, frame):
+        frames_encoded.append(frame.copy())
+        write(self, frame)
+
+    monkeypatch.setattr("genesis.utils.video_encoder.VideoEncoder.write", write_intercepted)
+
+    with pytest.raises(gs.GenesisException, match="Recording not started"):
+        cam.stop_recording()
+    with pytest.raises(gs.GenesisException, match="Recording not started"):
+        cam.pause_recording()
+
+    # One frame every 1 / FPS of simulated time, whether or not 'render' is ever called by the user
+    video_path = tmp_path / "paused.mp4"
+    cam.start_recording(save_to_filename=video_path, fps=FPS)
+    with pytest.raises(gs.GenesisException, match="Recording already started"):
+        cam.start_recording()
+    for _ in range(N_STEPS):
+        scene.step()
+        cam.render()
+
+    # A paused span leaves the video untouched, and starting again carries on with the very same file
+    cam.pause_recording()
+    with pytest.raises(gs.GenesisException, match="cannot change"):
+        cam.start_recording(fps=2.0 * FPS)
+    for _ in range(N_STEPS):
+        scene.step()
+    cam.start_recording()
+    for _ in range(N_STEPS):
+        scene.step()
+    cam.stop_recording()
+
+    # Refreshing the visualization after the step is what puts the state that step produced in the video: the last
+    # frame is the final state itself, and the one before it is genuinely different
+    rgb_final, *_ = cam.render(rgb=True, depth=False, segmentation=False, normal=False)
+    assert_equal(frames_encoded[-1], rgb_final)
+    assert not np.array_equal(frames_encoded[-2], rgb_final)
+
+    # The two recorded spans each contribute one frame per cadence, and the paused one contributes none
+    steps_per_frame = round(1.0 / (FPS * DT))
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        assert stream.average_rate == FPS
+        assert sum(1 for _ in container.decode(stream)) == 2 * N_STEPS // steps_per_frame
+
+    # Recording again writes a separate video, and the framerate may differ from the previous one
+    video_path_fast = tmp_path / "fast.mp4"
+    cam.start_recording(save_to_filename=video_path_fast, fps=2.0 * FPS)
+    for _ in range(N_STEPS):
+        scene.step()
+    cam.stop_recording()
+
+    with av.open(video_path_fast) as container:
+        stream = container.streams.video[0]
+        assert stream.average_rate == 2.0 * FPS
+        # Twice the framerate resolves twice as many frames out of the same simulated span, capped at one per step
+        assert sum(1 for _ in container.decode(stream)) == N_STEPS
+
+    # Steps vetoed by another callback advance no simulated time, so they contribute no frame, and a recording that
+    # never gets one leaves no file behind
+    video_path_vetoed = tmp_path / "vetoed.mp4"
+    cam.start_recording(save_to_filename=video_path_vetoed, fps=FPS)
+    scene.register_pre_step_callback(lambda: True)
+    for _ in range(N_STEPS):
+        scene.step()
+    cam.stop_recording()
+
+    assert not video_path_vetoed.exists()
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
+def test_transparent_surfaces_show_what_lies_behind_them(renderer, show_viewer):
+    ALPHA = 0.5
+    RES = 64
+    # Wholly inside the field of view, high enough above the pair to project clear of the patch sampled below. Geometry
+    # straddling the frustum boundary is misrasterized by software rendering backends, so it stays clear of the edge.
+    PARKED = (0.0, 0.0, 1.2)
+    CENTRE = slice(RES // 2 - 3, RES // 2 + 3)
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            # The boxes are placed by hand and their overlap is what is measured, so nothing may pull them down
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        vis_options=gs.options.VisOptions(
+            shadow=False,
+            # Black leaves each surface worth exactly its own contribution, so the composite below needs no offset
+            background_color=(0.0, 0.0, 0.0),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(2.5, 0.0, 0.5),
+            camera_lookat=(0.0, 0.0, 0.5),
+        ),
+        renderer=renderer,
+        show_viewer=show_viewer,
+    )
+    # Same size and lined up along the axis the camera sits on, so that the nearer one covers the farther one
+    red = scene.add_entity(
+        gs.morphs.Box(
+            pos=(0.6, 0.0, 0.5),
+            size=(0.2, 0.2, 0.2),
+        ),
+        surface=gs.surfaces.Default(
+            color=(1.0, 0.0, 0.0, ALPHA),
+        ),
+    )
+    blue = scene.add_entity(
+        gs.morphs.Box(
+            pos=(-0.6, 0.0, 0.5),
+            size=(0.2, 0.2, 0.2),
+        ),
+        surface=gs.surfaces.Default(
+            color=(0.0, 0.0, 1.0, ALPHA),
+        ),
+    )
+    cam = scene.add_camera(
+        res=(RES, RES),
+        pos=(2.5, 0.0, 0.5),
+        lookat=(0.0, 0.0, 0.5),
+    )
+    scene.build()
+
+    def centre_patch(pos_red, pos_blue):
+        red.set_pos(pos_red)
+        blue.set_pos(pos_blue)
+        scene.step()
+        rgb, *_ = cam.render()
+        return tensor_to_array(rgb)[CENTRE, CENTRE].reshape(-1, 3).mean(axis=0)
+
+    # Where the two overlap, the near surface composites over whatever the far one left, so the pair is worth the near
+    # one plus what survives of the far one. A far surface painted before the near one keeps that contribution; painted
+    # afterwards it fails the depth test and vanishes, leaving the near box alone.
+    patch_red = centre_patch((0.6, 0.0, 0.5), PARKED)
+    patch_blue = centre_patch(PARKED, (-0.6, 0.0, 0.5))
+    patch_pair = centre_patch((0.6, 0.0, 0.5), (-0.6, 0.0, 0.5))
+    assert_allclose(patch_pair, patch_red + (1.0 - ALPHA) * patch_blue, atol=1.0)
+
+    # Rendering the same scene again gives the same image, whichever order two surfaces at the same depth end up in
+    rgb, *_ = cam.render()
+    assert_equal(cam.render()[0], rgb)
+
+    # Bringing the blue box in front of the red one swaps which of the two composites over the other
+    patch_blue_ahead = centre_patch(PARKED, (1.2, 0.0, 0.5))
+    patch_pair_swapped = centre_patch((0.6, 0.0, 0.5), (1.2, 0.0, 0.5))
+    assert_allclose(patch_pair_swapped, patch_blue_ahead + (1.0 - ALPHA) * patch_red, atol=1.0)
+
+    # Crossing the camera over to the other side reverses which one is in front just the same
+    cam.set_pose(pos=(-2.5, 0.0, 0.5), lookat=(0.0, 0.0, 0.5))
+    patch_red_across = centre_patch((0.6, 0.0, 0.5), PARKED)
+    patch_blue_across = centre_patch(PARKED, (-0.6, 0.0, 0.5))
+    patch_pair_across = centre_patch((0.6, 0.0, 0.5), (-0.6, 0.0, 0.5))
+    assert_allclose(patch_pair_across, patch_blue_across + (1.0 - ALPHA) * patch_red_across, atol=1.0)
