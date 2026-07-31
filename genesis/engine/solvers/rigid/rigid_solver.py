@@ -293,6 +293,29 @@ class RigidSolver(KinematicSolver):
         if options.friction_cone == gs.friction_cone.elliptic and self._requires_grad:
             gs.raise_exception("The elliptic friction cone is not supported yet when 'requires_grad' is True.")
 
+        # Bounding friction against the developed normal force needs the contact to split into a normal row and a
+        # friction disc, which only the elliptic cone provides. MuJoCo compatibility keeps the coupled cone regardless,
+        # since letting sliding inflate the normal force is part of the behaviour being reproduced. The disc radius is
+        # relatched every iteration, making the solve a successive approximation whose objective moves underneath the
+        # solver; only Newton re-derives its curvature each iteration and lands on the fixed point, while conjugate
+        # gradient carries a search history that the moving objective invalidates, leaving friction short.
+        signorini_blocker = ""
+        if self._enable_mujoco_compatibility:
+            signorini_blocker = "'enable_mujoco_compatibility' is True"
+        elif options.friction_cone != gs.friction_cone.elliptic:
+            signorini_blocker = "it requires 'friction_cone' to be 'gs.friction_cone.elliptic'"
+        elif options.constraint_solver != gs.constraint_solver.Newton:
+            signorini_blocker = "it requires 'constraint_solver' to be 'gs.constraint_solver.Newton'"
+        if options.contact_resolution is None:
+            options.contact_resolution = (
+                gs.contact_resolution.convex if signorini_blocker else gs.contact_resolution.signorini
+            )
+        elif options.contact_resolution == gs.contact_resolution.signorini and signorini_blocker:
+            gs.raise_exception(
+                f"'contact_resolution' cannot be 'gs.contact_resolution.signorini' when {signorini_blocker}."
+            )
+        self._contact_resolution = options.contact_resolution
+
         # A high tangential-to-normal impedance ratio suppresses the tangential creep of regularized friction that
         # lets resting structures slowly slide apart under their own weight. With the elliptic cone the tangential
         # rows are stiffened independently, so it resolves to a high ratio - except under MuJoCo compatibility, where
@@ -556,6 +579,7 @@ class RigidSolver(KinematicSolver):
             batch_joints_info=self._options.batch_joints_info,
             enable_mujoco_compatibility=self._enable_mujoco_compatibility,
             enable_elliptic_friction=self._options.friction_cone == gs.friction_cone.elliptic,
+            enable_signorini_contact=self._contact_resolution == gs.contact_resolution.signorini,
             enable_torsional_friction=self._options.enable_torsional_friction,
             enable_rolling_friction=self._options.enable_rolling_friction,
             enable_multi_contact=self._enable_multi_contact,
@@ -1218,6 +1242,20 @@ class RigidSolver(KinematicSolver):
     def _init_constraint_solver(self):
         # Islands are a per-island Newton solve inside ConstraintSolver.resolve, gated on use_contact_island.
         self.constraint_solver = ConstraintSolver(self)
+
+    def update_forward_pos(self):
+        """Run forward kinematics over links and geoms if they are not already up to date for the current pose.
+
+        Geoms are refreshed alongside links, unlike the geom-less base solver: the flag this sets also authorizes the
+        next step to skip its own Cartesian-space update, which covers geoms too. Refreshing links alone would leave
+        collision - and any raycast deriving its vertices from geom poses - reading a one-step-stale pose.
+        """
+        if self._is_forward_pos_updated:
+            return
+        kernel_forward_kinematics_links_geoms(
+            self.scene._envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config
+        )
+        self._is_forward_pos_updated = True
 
     def substep(self, f):
         # from genesis.utils.tools import create_timer
