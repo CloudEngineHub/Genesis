@@ -14,17 +14,12 @@ import torch
 import trimesh
 
 import genesis as gs
-
-import genesis.utils.array_class as array_class
 import genesis.engine.solvers.rigid.rigid_solver as rigid_solver
-from genesis.engine.materials.rigid import Rigid
-from genesis.utils.misc import assign_indexed_tensor, tensor_to_array, qd_to_torch, qd_to_numpy, indices_to_mask
+import genesis.utils.array_class as array_class
+from genesis.utils.misc import indices_to_mask, qd_to_numpy, qd_to_torch, tensor_to_array
 from genesis.utils.sdf import SDF
 
-from . import mpr
-from . import gjk
-from . import support_field
-
+from . import gjk, mpr, narrowphase, support_field
 from .broadphase import func_broad_phase
 from .contact import (
     collider_kernel_get_contacts,
@@ -35,9 +30,8 @@ from .contact import (
     kernel_collider_clear,
     kernel_masked_collider_clear,
 )
-from . import narrowphase
+from .constants import CCD_ALGORITHM_CODE
 from .narrowphase import (
-    CCD_ALGORITHM_CODE,
     func_narrow_phase_any_vs_terrain,
     func_narrow_phase_convex_specializations,
     func_narrow_phase_diff_convex_vs_convex,
@@ -521,13 +515,15 @@ class Collider:
             # Differentiable contact detection (diff_gjk) reconstructs each contact from a triangular face of the
             # Minkowski difference. A sphere or ellipsoid has no flat facet, so a pair of them yields an everywhere
             # smoothly curved Minkowski boundary on which EPA never converges, and no contact is ever generated -
-            # the bodies silently tunnel. Faceted partners (box, mesh) and the analytical plane branch are unaffected.
+            # the bodies silently tunnel. Faceted partners (box, mesh) and the analytical plane branch are unaffected,
+            # and sphere-sphere pairs are reconstructed in closed form (func_differentiable_sphere_contact).
             if self._solver._requires_grad:
                 is_smooth_a = (valid_type_a == gs.GEOM_TYPE.SPHERE) | (valid_type_a == gs.GEOM_TYPE.ELLIPSOID)
                 is_smooth_b = (valid_type_b == gs.GEOM_TYPE.SPHERE) | (valid_type_b == gs.GEOM_TYPE.ELLIPSOID)
-                if np.any(both_convex & ~specialized & is_smooth_a & is_smooth_b):
+                is_sphere_sphere = (valid_type_a == gs.GEOM_TYPE.SPHERE) & (valid_type_b == gs.GEOM_TYPE.SPHERE)
+                if np.any(both_convex & ~specialized & is_smooth_a & is_smooth_b & ~is_sphere_sphere):
                     gs.raise_exception(
-                        "Differentiable contact detection is not supported for sphere-sphere, sphere-ellipsoid or "
+                        "Differentiable contact detection is not supported for sphere-ellipsoid or "
                         "ellipsoid-ellipsoid collision pairs (requires_grad=True). Approximate them with a faceted "
                         "geometry (e.g. a convex mesh) or disable requires_grad."
                     )
@@ -972,10 +968,11 @@ class Collider:
                 self._solver._errno,
             )
 
-        # Plane-convex contacts come from analytic paths that leave diff_contact_input unfilled; populate it here so
-        # the differentiable narrow-phase reverse can reconstruct them (see kernel_fill_diff_contact_input_plane).
+        # Plane-convex and sphere-sphere contacts come from analytic paths that leave diff_contact_input unfilled;
+        # populate it here so the differentiable narrow-phase reverse can reconstruct them (see
+        # kernel_fill_diff_contact_input_analytic).
         if self._solver.rigid_config.requires_grad:
-            narrowphase.kernel_fill_diff_contact_input_plane(
+            narrowphase.kernel_fill_diff_contact_input_analytic(
                 self._solver.dyn_state, self._collider_state, self._solver.dyn_info, self._solver.rigid_config
             )
 
@@ -1129,6 +1126,7 @@ class Collider:
             self._collider_state,
             self._collider_state.diff_contact_input,
             self._solver.dyn_info,
+            self._solver.rigid_info,
             self._collider_info,
             self._solver.rigid_config,
             self._solver._errno,
