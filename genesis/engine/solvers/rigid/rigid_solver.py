@@ -745,6 +745,13 @@ class RigidSolver(KinematicSolver):
                     # arm has nothing to exploit, so the scalar one-thread-per-env monolith is the clear winner.
                     rigid_config["prefer_decomposed_solver"] = 0
 
+                # The autotuner picks between two numerically distinct arms by timing them as the simulation runs, so
+                # which one runs at a given step follows the machine rather than the scene. Pinning the arm is what
+                # makes a trajectory reproducible; the decomposed one takes whatever the static scene description
+                # leaves open, every case that description settles in the monolith's favor being pinned above already.
+                if gs.use_deterministic_algorithms and rigid_config.get("prefer_decomposed_solver", -1) == -1:
+                    rigid_config["prefer_decomposed_solver"] = 1
+
             # Add terms for static inner loops, use -1 if not requires_grad to avoid re-compilation
             if self.sim.options.requires_grad:
                 rigid_config.update(
@@ -1876,6 +1883,12 @@ class RigidSolver(KinematicSolver):
                 return self._queried_states[s_global][0]
 
             state = RigidSolverState(self._scene, s_global)
+
+            # A captured state must be self-consistent: links_pos / links_quat have to be the Cartesian pose implied by
+            # the qpos captured alongside them, otherwise restoring it does not reproduce the configuration it was taken
+            # from. The step loop leaves that pose one integration behind qpos whenever it defers the post-integrate
+            # refresh, so catch up here - a no-op when the pose is already current, which is the common case.
+            self.update_forward_pos()
 
             kernel_get_state(
                 state.i_pos_shift,
@@ -3472,12 +3485,6 @@ def kernel_step_2(
 
     func_integrate(dyn_state, dyn_info, rigid_info, rigid_config, is_backward)
 
-    if qd.static(rigid_config.use_hibernation):
-        func_hibernate__for_all_awake_islands_either_hiberanate_or_update_aabb_sort_buffer(
-            dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config, errno
-        )
-        func_aggregate_awake_entities(dyn_state, dyn_info, rigid_info, rigid_config)
-
     if qd.static(not is_backward):
         func_copy_next_to_curr(dyn_state, rigid_info, rigid_config, errno)
 
@@ -3486,3 +3493,12 @@ def kernel_step_2(
                 dyn_state, dyn_info, rigid_info, rigid_config, force_update_fixed_geoms=False, is_backward=is_backward
             )
             func_forward_velocity(dyn_state, dyn_info, rigid_info, rigid_config, is_backward)
+
+    # Hibernating comes last, after the post-integrate refresh above: both only visit awake entities, so deciding to
+    # sleep first would drop the newly-hibernated island from that refresh and freeze its Cartesian pose one
+    # integration behind the qpos this step just advanced, for as long as it sleeps.
+    if qd.static(rigid_config.use_hibernation):
+        func_hibernate__for_all_awake_islands_either_hiberanate_or_update_aabb_sort_buffer(
+            dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config, errno
+        )
+        func_aggregate_awake_entities(dyn_state, dyn_info, rigid_info, rigid_config)

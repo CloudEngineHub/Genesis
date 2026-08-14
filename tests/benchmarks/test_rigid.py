@@ -11,11 +11,8 @@ import torch
 
 import genesis as gs
 
-from ..utils import (
-    get_hf_dataset,
-    get_git_commit_timestamp,
-    pprint_oneline,
-)
+from ..utils.assets import get_git_commit_timestamp, get_hf_dataset
+from ..utils.misc import pprint_oneline
 
 STEP_DT = 0.01
 DURATION_WARMUP = 45.0
@@ -31,6 +28,8 @@ pytestmark = [
     pytest.mark.benchmarks,
     pytest.mark.cache(False),
     pytest.mark.debug(False),
+    # Benchmarks measure the solve implementation the autotuner actually settles on, so the choice is left to it
+    pytest.mark.use_deterministic_algorithms(False),
 ]
 
 

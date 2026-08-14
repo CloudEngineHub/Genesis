@@ -11,12 +11,9 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
-from ..utils import (
-    assert_allclose,
-    display_collision_pairs,
-    get_genuine_interpenetration,
-    get_hf_dataset,
-)
+from ..utils.assertions import assert_allclose
+from ..utils.assets import get_hf_dataset
+from ..utils.collision import display_collision_pairs, get_genuine_interpenetration
 
 
 # Force CPU because it would be too slow otherwise
@@ -888,6 +885,8 @@ def test_many_objects_collision(convexify, show_viewer, tol):
     asset_files = {name: f"{get_hf_dataset(pattern=f'{name}/*')}/{name}/{xml}" for name, xml in assets}
     objs = []
     obj_names = []
+    # Force numpy seed because the settled pile is extremely sensitive to the initial poses
+    np.random.seed(42)
     for i in range(80):
         gx, gy, gz = i % 4, (i // 4) % 4, i // 16
         name = assets[(gx + gy + gz) % len(assets)][0]

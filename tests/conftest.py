@@ -743,8 +743,23 @@ def debug(request):
     return debug
 
 
+@pytest.fixture
+def use_deterministic_algorithms(request):
+    use_deterministic_algorithms = None
+    for mark in request.node.iter_markers("use_deterministic_algorithms"):
+        if mark.args:
+            if use_deterministic_algorithms is not None:
+                pytest.fail("'use_deterministic_algorithms' can only be specified once.")
+            (use_deterministic_algorithms,) = mark.args
+    if use_deterministic_algorithms is None:
+        use_deterministic_algorithms = True
+    return use_deterministic_algorithms
+
+
 @pytest.fixture(scope="function", autouse=True)
-def initialize_genesis(request, monkeypatch, tmp_path, backend, precision, performance_mode, debug, cache):
+def initialize_genesis(
+    request, monkeypatch, tmp_path, backend, precision, performance_mode, debug, cache, use_deterministic_algorithms
+):
     import genesis as gs
 
     # Early return if backend is None
@@ -801,23 +816,9 @@ def initialize_genesis(request, monkeypatch, tmp_path, backend, precision, perfo
             seed=0,
             logging_level=logging_level,
             performance_mode=performance_mode,
+            use_deterministic_algorithms=use_deterministic_algorithms,
         )
         gc.collect()
-
-        # Prefer the decomposed solver on GPU so both code paths (decomposed on GPU, monolith on CPU) are tested
-        # Skip for benchmarks - let auto-detection choose freely
-        expr = Expression.compile(request.config.option.markexpr)
-        is_benchmarks = expr.evaluate(MarkMatcher.from_markers((pytest.mark.benchmarks,)))
-        if not is_benchmarks:
-            from genesis.utils.array_class import RigidSimStaticConfig
-
-            _RigidSimStaticConfig_init_orig = RigidSimStaticConfig.__init__
-
-            def _RigidSimStaticConfig_init(self, *args, **kwargs):
-                kwargs.setdefault("prefer_decomposed_solver", int(gs.backend != gs.cpu))
-                _RigidSimStaticConfig_init_orig(self, *args, **kwargs)
-
-            monkeypatch.setattr(RigidSimStaticConfig, "__init__", _RigidSimStaticConfig_init)
 
         if gs.backend != gs.cpu and gs.device.index is not None:
             # The device torch selected must be one this worker is allowed to use. Anything else - including a
@@ -849,7 +850,7 @@ def mj_sim(
     gjk_collision,
     friction_cone,
 ):
-    from .utils import build_mujoco_sim
+    from .utils.simulators import build_mujoco_sim
 
     return build_mujoco_sim(
         xml_path,
@@ -879,7 +880,7 @@ def gs_sim(
     show_viewer,
     mj_sim,
 ):
-    from .utils import build_genesis_sim
+    from .utils.simulators import build_genesis_sim
 
     return build_genesis_sim(
         xml_path,
@@ -951,7 +952,7 @@ class PixelMatchSnapshotExtension(PNGImageSnapshotExtension):
     def matches(self, *, serialized_data, snapshot_data) -> bool:
         # Imported here rather than at module top: conftest must not be coupled to any other test module at load
         # time, as that can cause hard-to-debug side effects.
-        from .utils import IMG_BLUR_KERNEL_SIZE, IMG_NUM_ERR_THR, IMG_STD_ERR_THR, assert_pixel_match
+        from .utils.assertions import IMG_BLUR_KERNEL_SIZE, IMG_NUM_ERR_THR, IMG_STD_ERR_THR, assert_pixel_match
 
         std_err_threshold = IMG_STD_ERR_THR if self._std_err_threshold is None else self._std_err_threshold
         ratio_err_threshold = IMG_NUM_ERR_THR if self._ratio_err_threshold is None else self._ratio_err_threshold
@@ -985,7 +986,7 @@ def png_snapshot(request, snapshot):
             assert path.is_file()
             path.unlink()
     else:
-        from .utils import get_hf_dataset
+        from .utils.assets import get_hf_dataset
 
         # The snapshots repository mirrors the tests tree ('rendering/__snapshots__/test_offscreen/...'), so the
         # snapshot directory path relative to the tests root is also its path in the repository.
