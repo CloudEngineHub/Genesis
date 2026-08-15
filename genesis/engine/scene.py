@@ -1421,7 +1421,7 @@ class Scene(RBC):
 
             Ts = np.zeros((N_new, 4, 4))
             for i in range(N_new):
-                pos, quat = entity.forward_kinematics(qposs[indices[i]])
+                pos, quat = self.rigid_solver.forward_kinematics_query(entity, qposs[indices[i]])
                 Ts[i] = tensor_to_array(gu.trans_quat_to_T(pos[link_idx], quat[link_idx]))
 
             return self._visualizer.context.draw_debug_frames(
@@ -1597,7 +1597,13 @@ class Scene(RBC):
         if self.n_envs == 0:
             gs.raise_exception("`envs_idx` is not supported for non-parallelized scene.")
 
-        if isinstance(envs_idx, (slice, range)):
+        if isinstance(envs_idx, slice):
+            if envs_idx.step is not None and envs_idx.step < 0:
+                return sanitize_index(envs_idx, -1, self.n_envs, 0, "envs_idx")
+            return self._envs_idx[envs_idx]
+        if isinstance(envs_idx, range):
+            if envs_idx.step < 0:
+                return sanitize_index(envs_idx, -1, self.n_envs, 0, "envs_idx")
             return self._envs_idx[envs_idx]
         if isinstance(envs_idx, (int, np.integer)):
             n_envs = self.n_envs
