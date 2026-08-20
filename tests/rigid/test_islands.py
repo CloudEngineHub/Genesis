@@ -464,8 +464,8 @@ def test_hibernation_with_pruning(show_viewer, n_envs):
             gs.morphs.Mesh(
                 file="meshes/duck.obj",
                 scale=0.02,
-                pos=(0.4 * i, 0.0, 0.1),
-                euler=(90.0, 0.0, 0.0),
+                pos=(0.4 * i, 0.0, 0.05),
+                euler=(90.0, 90.0, 0.0),
             ),
         )
         for i in range(2)
@@ -476,7 +476,7 @@ def test_hibernation_with_pruning(show_viewer, n_envs):
     def asleep():
         return all(qd_to_numpy(solver.dyn_state.entities.is_hibernated, duck.idx).all() for duck in ducks)
 
-    for _ in range(200):
+    for _ in range(120):
         scene.step()
         assert all((tensor_to_array(duck.get_pos())[..., 2] > -0.05).all() for duck in ducks)
         if asleep():
@@ -699,7 +699,7 @@ def test_hibernation_wakes_on_user_input(show_viewer, n_envs):
 
     z0 = z_of(box_force)
     for _ in range(6):
-        solver.apply_links_external_force([0.0, 0.0, 40.0], links_idx=[box_force.base_link_idx])
+        solver.apply_links_external_wrench([0.0, 0.0, 40.0], links_idx=box_force.base_link_idx)
         scene.step()
     assert not asleep(box_force) and (z_of(box_force) > z0 + 0.02).all()
     assert all(map(asleep, (box_pos, box_vel, box_qpos, box_cforce, box_cvel, box_cpos)))
@@ -876,7 +876,7 @@ def test_hibernation_wakes_on_daisy_chain(show_viewer, n_envs):
         scene.step()
     assert asleep(box_a) and asleep(box_b) and asleep(box_far)
 
-    solver.apply_links_external_force([20.0, 0.0, 0.0], links_idx=[box_a.base_link_idx])
+    solver.apply_links_external_wrench([20.0, 0.0, 0.0], links_idx=box_a.base_link_idx)
     scene.step()
     assert not asleep(box_a)
     assert not asleep(box_b)

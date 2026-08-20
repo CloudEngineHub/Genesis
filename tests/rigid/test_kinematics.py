@@ -57,8 +57,7 @@ def test_link_velocity(gs_sim, tol):
             0.0,
         ]
     )
-    link_COM0 = gs_sim.rigid_solver.get_links_pos(ref="link_com")[0]
-    link_COM1 = gs_sim.rigid_solver.get_links_pos(ref="link_com")[1]
+    link_COM0, link_COM1 = gs_sim.rigid_solver.get_links_pos(ref=gs.link_ref_frame.link_COM)
 
     assert_allclose(link_COM0, COM_0, tol=tol)
     assert_allclose(link_COM1, COM_1, tol=tol)
@@ -80,7 +79,7 @@ def test_link_velocity(gs_sim, tol):
     assert_allclose(xvel_0, 0.0, tol=tol)
     xvel_1_ = omega_0 * np.array([-xpos_1[1], xpos_1[0], 0.0])
     assert_allclose(xvel_1, xvel_1_, tol=tol)
-    civel_0, civel_1 = gs_sim.rigid_solver.get_links_vel(ref="link_com")
+    civel_0, civel_1 = gs_sim.rigid_solver.get_links_vel(ref=gs.link_ref_frame.link_COM)
     civel_0_ = omega_0 * np.array([-COM_0[1], COM_0[0], 0.0])
     assert_allclose(civel_0, civel_0_, tol=tol)
     civel_1_ = omega_0 * np.array([-COM_1[1], COM_1[0], 0.0]) + (omega_1 - omega_0) * np.array(
@@ -401,18 +400,32 @@ def test_inverse_kinematics_local_point(n_envs, show_viewer, tol):
         target_pos = target_pos_base[0]
         target_quat = target_quat_base[0]
 
+    targets = ((target_pos, target_quat),)
+    if n_envs > 0:
+        targets += ((target_pos[0], target_quat[0]),)
+
     # Solve IK with local_point (local_offset stays 1D - it gets broadcast internally)
-    qpos, err = robot.inverse_kinematics(
-        link=end_effector,
-        pos=target_pos,
-        quat=target_quat,
-        local_point=local_offset,
-        pos_tol=tol,
-        rot_tol=tol,
-        max_solver_iters=100,
-        return_error=True,
-    )
-    assert_allclose(err, 0.0, atol=tol)
+    qpos_solutions = []
+    for query_pos, query_quat in targets:
+        qpos_solution, err = robot.inverse_kinematics(
+            link=end_effector,
+            pos=query_pos,
+            quat=query_quat,
+            local_point=local_offset,
+            # Reuse the first environment's solution so identical targets compare the same IK branch.
+            init_qpos=qpos_solutions[0][0] if qpos_solutions else None,
+            pos_tol=tol,
+            rot_tol=tol,
+            max_solver_iters=100,
+            return_error=True,
+        )
+        assert_allclose(err, 0.0, atol=tol)
+        qpos_solutions.append(qpos_solution)
+
+    qpos = qpos_solutions[0]
+    if n_envs > 0:
+        assert_equal(qpos_solutions[1], qpos_solutions[1][0])
+        assert_allclose(qpos_solutions[1][0], qpos[0], tol=tol)
 
     # Apply the solution
     robot.set_qpos(qpos)
