@@ -590,11 +590,14 @@ def test_concave_slanted_wall(timestep, decimate, show_viewer):
     scene.add_entity(morph=gs.morphs.Plane())
     asset_path = get_hf_dataset(pattern="glb/orange_plastic_bowl.glb")
     for i in range(NUM_BOWLS):
+        # Independent yaws: the collision mesh seats on a few vertices, so under one shared orientation every nested
+        # pair tilts by the same small angle in the same direction and the pile arcs by the sum of those tilts.
+        # Independent orientations let the tilts average out, as in a real pile of bowls.
         scene.add_entity(
             morph=gs.morphs.Mesh(
                 file=f"{asset_path}/glb/orange_plastic_bowl.glb",
                 pos=(0, 0, 0.0 + i * (BOWL_THICKNESS - 0.15 * timeconst)),
-                euler=(90, 0, 0),
+                euler=(90, 0, np.random.uniform(0.0, 360.0)),
                 convexify=False,
                 decimate=decimate,
                 file_meshes_are_zup=True,
@@ -954,7 +957,7 @@ def test_many_objects_collision(convexify, show_viewer, tol):
         power = (force * v_rel).sum(dim=-1)
         keys = zip(link_a.tolist(), link_b.tolist(), map(tuple, (pos / 2e-3).round().tolist()))
         for key, contact_power in zip(keys, power.tolist()):
-            contact_energy[key] = contact_energy.get(key, 0.0) + contact_power * scene.sim_options.dt
+            contact_energy[key] = contact_energy.get(key, 0.0) + contact_power * scene.options.sim.dt
         energy_trace.append(tensor_to_array(scene.rigid_solver.get_total_energy()))
         if show_viewer:
             vmax_trace.append(com_vel.norm(dim=-1).max())

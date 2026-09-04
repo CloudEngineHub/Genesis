@@ -10,6 +10,7 @@ import genesis.utils.geom as gu
 import genesis.utils.sdf as sdf
 from genesis.engine.boundaries import CubeBoundary
 from genesis.engine.entities import MPMEntity
+from genesis.engine.materials import MPM
 from genesis.engine.states.solvers import MPMSolverState
 from genesis.options.solvers import MPMOptions
 from genesis.utils.misc import DeprecationError, qd_to_torch
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 
 @qd.data_oriented
 class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+    material_cls = MPM.Base
     # ------------------------------------------------------------------------------------
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
@@ -40,7 +42,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         self._enable_CPIC = options.enable_CPIC
         self._constraints_initialized = False
 
-        self._n_vvert_supports = self.scene.vis_options.n_support_neighbors
+        self._n_vvert_supports = self.scene.options.vis.n_support_neighbors
 
         # `_particle_volume_scale` is used to avoid potential numerical instability, as the actual `_particle_volume` may be very small.
         # Note that the magnitude of `_particle_volume` doesn't affect MPM simulation itself, but it is used to compute particle
@@ -253,7 +255,9 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
     def is_active(self):
         return self.n_particles > 0
 
-    def add_entity(self, idx, material, morph, surface, name: str | None = None) -> "MPMEntity":
+    def add_entity(
+        self, idx, material, morph, surface, visualize_contact=False, name: str | None = None, desc=None
+    ) -> "MPMEntity":
         self.add_material(material)
 
         # create entity

@@ -4,21 +4,7 @@ import torch
 
 import genesis as gs
 from genesis.options.morphs import Morph
-from genesis.options.solvers import (
-    BaseCouplerOptions,
-    FEMOptions,
-    IPCCouplerOptions,
-    KinematicOptions,
-    LegacyCouplerOptions,
-    MPMOptions,
-    PBDOptions,
-    RigidOptions,
-    SAPCouplerOptions,
-    SFOptions,
-    SPHOptions,
-    SimOptions,
-    ToolOptions,
-)
+from genesis.options.solvers import IPCCouplerOptions, LegacyCouplerOptions, SAPCouplerOptions
 from genesis.repr_base import RBC
 from genesis.utils.misc import indices_to_mask
 
@@ -40,8 +26,9 @@ from .states.cache import QueriedStates
 from .states.solvers import SimState
 
 if TYPE_CHECKING:
+    from genesis.engine.entities.base_entity import Entity, EntityDescription
     from genesis.engine.scene import Scene
-    from genesis.engine.entities.base_entity import Entity
+    from genesis.options.scene import SceneOptions
 
     from .solvers.base_solver import Solver
 
@@ -57,72 +44,36 @@ class Simulator(RBC):
     ----------
     scene : gs.Scene
         The scene object that the simulator is associated with.
-    options : gs.SimOptions
-        A SimOptions object that contains all simulator-level options.
-    tool_options : gs.ToolOptions
-        A ToolOptions object that contains all the options for the ToolSolver.
-    rigid_options : gs.RigidOptions
-        A RigidOptions object that contains all the options for the RigidSolver.
-    mpm_options : gs.MPMOptions
-        An MPMOptions object that contains all the options for the MPMSolver.
-    sph_options : gs.SPHOptions
-        An SPHOptions object that contains all the options for the SPHSolver.
-    fem_options : gs.FEMOptions
-        An FEMOptions object that contains all the options for the FEMSolver.
-    sf_options : gs.SFOptions
-        An SFOptions object that contains all the options for the SFSolver.
-    pbd_options : gs.PBDOptions
-        A PBDOptions object that contains all the options for the PBDSolver.
-    coupler_options : gs.CouplerOptions
-        A CouplerOptions object that contains all the options for the coupler.
+    options : SceneOptions
+        Every option the scene was created with. The simulator keeps the one that configures itself and hands each
+        solver, the coupler and the visualizer the one that configures it. All of them stay reachable as
+        ``sim.scene.options``.
     """
 
-    def __init__(
-        self,
-        scene: "Scene",
-        options: SimOptions,
-        tool_options: ToolOptions,
-        rigid_options: RigidOptions,
-        kinematic_options: KinematicOptions,
-        mpm_options: MPMOptions,
-        sph_options: SPHOptions,
-        fem_options: FEMOptions,
-        sf_options: SFOptions,
-        pbd_options: PBDOptions,
-        coupler_options: BaseCouplerOptions,
-    ):
+    def __init__(self, scene: "Scene", options: "SceneOptions"):
         self._scene = scene
 
         # options
-        self.options = options
-        self.tool_options = tool_options
-        self.rigid_options = rigid_options
-        self.kinematic_options = kinematic_options
-        self.mpm_options = mpm_options
-        self.sph_options = sph_options
-        self.fem_options = fem_options
-        self.sf_options = sf_options
-        self.pbd_options = pbd_options
-        self.coupler_options = coupler_options
+        self.options = options.sim
 
-        self._dt: float = options.dt
-        self._substep_dt: float = options.dt / options.substeps
-        self._substeps: int = options.substeps
-        self._substeps_local: int | None = options.substeps_local
-        self._requires_grad: bool = options.requires_grad
-        self._steps_local: int | None = options._steps_local
+        self._dt: float = self.options.dt
+        self._substep_dt: float = self.options.dt / self.options.substeps
+        self._substeps: int = self.options.substeps
+        self._substeps_local: int | None = self.options.substeps_local
+        self._requires_grad: bool = self.options.requires_grad
+        self._steps_local: int | None = self.options._steps_local
 
         self._cur_substep_global = 0
 
         # solvers
-        self.tool_solver = ToolSolver(self.scene, self, self.tool_options)
-        self.rigid_solver = RigidSolver(self.scene, self, self.rigid_options)
-        self.kinematic_solver = KinematicSolver(self.scene, self, self.kinematic_options)
-        self.mpm_solver = MPMSolver(self.scene, self, self.mpm_options)
-        self.sph_solver = SPHSolver(self.scene, self, self.sph_options)
-        self.pbd_solver = PBDSolver(self.scene, self, self.pbd_options)
-        self.fem_solver = FEMSolver(self.scene, self, self.fem_options)
-        self.sf_solver = SFSolver(self.scene, self, self.sf_options)
+        self.tool_solver = ToolSolver(self.scene, self, options.tool)
+        self.rigid_solver = RigidSolver(self.scene, self, options.rigid)
+        self.kinematic_solver = KinematicSolver(self.scene, self, options.kinematic)
+        self.mpm_solver = MPMSolver(self.scene, self, options.mpm)
+        self.sph_solver = SPHSolver(self.scene, self, options.sph)
+        self.pbd_solver = PBDSolver(self.scene, self, options.pbd)
+        self.fem_solver = FEMSolver(self.scene, self, options.fem)
+        self.sf_solver = SFSolver(self.scene, self, options.sf)
 
         self._solvers: list["Solver"] = gs.List(
             [
@@ -140,15 +91,16 @@ class Simulator(RBC):
         self._active_solvers: list["Solver"] = gs.List()
 
         # coupler
-        if isinstance(self.coupler_options, SAPCouplerOptions):
-            self._coupler = SAPCoupler(self, self.coupler_options)
-        elif isinstance(self.coupler_options, LegacyCouplerOptions):
-            self._coupler = LegacyCoupler(self, self.coupler_options)
-        elif isinstance(self.coupler_options, IPCCouplerOptions):
-            self._coupler = IPCCoupler(self, self.coupler_options)
+        if isinstance(options.coupler, SAPCouplerOptions):
+            self._coupler = SAPCoupler(self, options.coupler)
+        elif isinstance(options.coupler, LegacyCouplerOptions):
+            self._coupler = LegacyCoupler(self, options.coupler)
+        elif isinstance(options.coupler, IPCCouplerOptions):
+            self._coupler = IPCCoupler(self, options.coupler)
         else:
             gs.raise_exception(
-                f"Coupler options {self.coupler_options} not supported. Please use SAPCouplerOptions, LegacyCouplerOptions, or IPCCouplerOptions."
+                f"Coupler options {options.coupler} not supported. Please use SAPCouplerOptions, "
+                "LegacyCouplerOptions, or IPCCouplerOptions."
             )
 
         # states
@@ -160,32 +112,39 @@ class Simulator(RBC):
         # sensors
         self._sensor_manager = SensorManager(self)
 
-    def _add_entity(self, morph: Morph, material, surface, visualize_contact=False, name: str | None = None):
-        if isinstance(material, gs.materials.Tool):
-            entity = self.tool_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.Rigid):
-            entity = self.rigid_solver.add_entity(
-                self.n_entities, material, morph, surface, visualize_contact, name=name
-            )
-        elif isinstance(material, gs.materials.Kinematic):
-            entity = self.kinematic_solver.add_entity(
-                self.n_entities, material, morph, surface, visualize_contact=False, name=name
-            )
-        elif isinstance(material, gs.materials.MPM.Base):
-            entity = self.mpm_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.SPH.Base):
-            entity = self.sph_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.PBD.Base):
-            entity = self.pbd_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.FEM.Base):
-            entity = self.fem_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.Hybrid):
+    def _add_entity(
+        self,
+        morph: Morph | None = None,
+        material=None,
+        surface=None,
+        visualize_contact=False,
+        name: str | None = None,
+        desc: "EntityDescription | None" = None,
+    ):
+        if desc is not None:
+            material = desc.material
+        if visualize_contact and not isinstance(material, gs.materials.Rigid):
+            gs.raise_exception("'visualize_contact' only applies to rigid entities.")
+        if isinstance(material, gs.materials.Hybrid):
             # Note that adding to solver is handled in the hybrid entity
             entity = HybridEntity(self.n_entities, self.scene, material, morph, surface, name=name)
         else:
-            gs.raise_exception(f"Material not supported.: {material}")
-
+            # Several solvers may declare a class the material belongs to, since 'Rigid' derives from 'Kinematic'. The
+            # one declaring the most derived class simulates it (see 'Solver.material_cls').
+            solver = None
+            for candidate in self._solvers:
+                if candidate.material_cls is None or not isinstance(material, candidate.material_cls):
+                    continue
+                if solver is None or issubclass(candidate.material_cls, solver.material_cls):
+                    solver = candidate
+            if solver is None:
+                gs.raise_exception(f"No solver simulates entities of material {type(material).__name__}.")
+            entity = solver.add_entity(
+                self.n_entities, material, morph, surface, visualize_contact, name=name, desc=desc
+            )
         self._entities.append(entity)
+        if entity.desc is not None:
+            self.scene._desc.entities.append(entity.desc)
         return entity
 
     def _add_force_field(self, force_field):
