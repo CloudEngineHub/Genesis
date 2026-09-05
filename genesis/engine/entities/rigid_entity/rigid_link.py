@@ -109,10 +109,12 @@ class KinematicLink(RBC):
         Parameters
         ----------
         envs_idx : int or array of int, optional
-            The indices of the environments to get the position. If None, get the position of all environments. Default is None.
+            The indices of the environments to get the position. If None, get the position of all environments. Default
+            is None.
         relative : bool, optional
-            Whether to report the position in the user frame, with the entity's morph pose offset and inertial
-            alignment stripped, rather than the world frame used by the solver. Defaults to True.
+            Whether to report the position of the authored link origin rather than of the internal link origin used by
+            the solver. The internal link origin is the authored one moved by the entity's morph 'offset_pos' /
+            'offset_quat' and, on a free root link with 'align=True', by the inertial alignment. Defaults to True.
         """
         return self._solver.get_links_pos(self._idx, envs_idx, relative=relative)[..., 0, :]
 
@@ -124,24 +126,33 @@ class KinematicLink(RBC):
         Parameters
         ----------
         envs_idx : int or array of int, optional
-            The indices of the environments to get the quaternion. If None, get the quaternion of all environments. Default is None.
+            The indices of the environments to get the quaternion. If None, get the quaternion of all environments.
+            Default is None.
         relative : bool, optional
-            Whether to report the orientation in the user frame, with the entity's morph pose offset and inertial
-            alignment stripped, rather than the world frame used by the solver. Defaults to True.
+            Whether to report the orientation of the authored link origin rather than of the internal link origin used
+            by the solver. The internal link origin is the authored one moved by the entity's morph 'offset_pos' /
+            'offset_quat' and, on a free root link with 'align=True', by the inertial alignment. Defaults to True.
         """
         return self._solver.get_links_quat(self._idx, envs_idx, relative=relative)[..., 0, :]
 
     @gs.assert_built
-    def get_vel(self, envs_idx=None) -> torch.Tensor:
+    def get_vel(self, envs_idx=None, *, relative=True) -> torch.Tensor:
         """
         Get the linear velocity of the link in the world frame.
 
         Parameters
         ----------
         envs_idx : int or array of int, optional
-            The indices of the environments to get the linear velocity. If None, get the linear velocity of all environments. Default is None.
+            The indices of the environments to get the linear velocity. If None, get the linear velocity of all
+            environments. Default is None.
+        relative : bool, optional
+            Whether to report the velocity of the authored link origin rather than of the internal link origin used by
+            the solver. The internal link origin is the authored one moved by the world-frame vector 'd'. That
+            displacement composes the entity's morph 'offset_pos' / 'offset_quat' and, on a free root link with
+            'align=True', the inertial alignment. Both readings are expressed in world coordinates and differ by the
+            transport 'omega x d'. Defaults to True.
         """
-        return self._solver.get_links_vel(self._idx, envs_idx)[..., 0, :]
+        return self._solver.get_links_vel(self._idx, envs_idx, relative=relative)[..., 0, :]
 
     @gs.assert_built
     def get_ang(self, envs_idx=None) -> torch.Tensor:
@@ -316,10 +327,9 @@ class KinematicLink(RBC):
     @property
     def aligned(self) -> bool:
         """
-        Whether the link opts into center-of-mass / principal-axis reframing (the 'align' option, set for a free body
-        that opts in or is a primitive). The reframing - and the resulting exactly-diagonal joint-space mass block it
-        enables - is applied only when the body is a single rigid body (a free root with no DOF-bearing descendant);
-        callers relying on the diagonal mass must check that condition too, as the solver does.
+        Whether the build anchored the link frame on the center of mass and principal axes of its body (the 'align'
+        option, on a free body that opts in or is a primitive). Only a single rigid body gets the anchor: a free root
+        with an inertia and no DOF-bearing descendant. Its joint-space mass block is then exactly diagonal.
         """
         return self.desc.is_aligned
 

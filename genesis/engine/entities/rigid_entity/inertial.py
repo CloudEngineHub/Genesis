@@ -155,15 +155,18 @@ def compose_inertial_from_g_infos(g_infos: Sequence[dict], rho: float) -> Inerti
 
 
 class LinkInertial(NamedTuple):
-    """A link's (or variant's) finalized inertial in the solver's representation: mass, center of mass 'com', and the
-    inertia tensor 'inertia' expressed in the principal frame 'quat' (identity when derived from geometry). Distinct
-    from 'InertialProperties', whose 'i' is a single tensor; the solver stores the principal tensor and its orientation
-    separately."""
+    """A link's (or variant's) finalized inertial in the solver's representation. Distinct from 'InertialProperties',
+    whose 'i' is a single tensor, as the solver stores the principal tensor and its orientation separately."""
 
     mass: float
+    """Mass of the link or variant."""
     com: Vec3FType
+    """Center of mass in the link frame, the origin of the public 'link_COM' reference frame."""
     quat: UnitVec4FType
+    """Orientation of the frame 'inertia' is expressed in, identity when derived from geometry. Its axes are those of
+    the public 'link_COM' reference frame."""
     inertia: Matrix3x3Type
+    """Inertia tensor about 'com', expressed in the 'quat' frame."""
 
 
 class LinkInertialInfo(NamedTuple):
@@ -187,24 +190,27 @@ def finalize_inertial(
 ) -> LinkInertial:
     """Resolve a link's local inertial from its parsed explicit values and a geometry-derived estimate (hint).
 
-    Explicit values are used when given; otherwise the geometry estimate is used, and an explicit mass rescales a
-    geometry-derived inertia. An omitted center of mass defaults to the link-frame origin when an explicit inertia
-    matrix is provided. The hint comes from the load-time inertial info, computed from the geometry the link holds
-    and used by both the link description and the align anchor. One resolution path keeps the rigid dynamics inertia
-    and the align anchor in lockstep.
+    Each explicit value is used when given, and the geometry estimate fills in the rest. An explicit mass rescales a
+    geometry-derived inertia to it. An omitted center of mass falls back to the geometry estimate, except when an
+    explicit inertia matrix is given, in which case it is the link-frame origin.
+
+    The geometry estimate is computed once from the geometry the link holds. Both the link description and the align
+    anchor resolve their inertial here, so the rigid dynamics inertia and the align anchor agree.
 
     With ``clamp_min_mass`` the resolved mass is floored at ``gs.EPS`` so a geometry-less moving link stays
-    non-singular in the dynamics; the align stash passes ``False`` so a genuinely massless link keeps its ``0.0``
-    mass and is excluded from the fixed-subtree composite (it must not inflate the composite by ``gs.EPS``).
+    non-singular in the dynamics. The align stash passes ``False``, so a genuinely massless link keeps its ``0.0``
+    mass and does not inflate the fixed-subtree composite by ``gs.EPS``.
     """
     mass, com, quat, inertia = explicit_mass, explicit_com, explicit_quat, explicit_inertia
-    if (mass or hint_mass) > MASS_EPS and hint_mass > gs.EPS and mass is not None:
+    if mass is not None and hint_mass > gs.EPS:
         hint_inertia = hint_inertia * (mass / hint_mass)
         hint_mass = mass
     if mass is None:
         mass = hint_mass
     if inertia is None:
-        com, inertia, quat = hint_com, hint_inertia, gu.identity_quat()
+        if com is None:
+            com = hint_com
+        inertia, quat = hint_inertia, gu.identity_quat()
     elif com is None:
         # Falling back to the geometry estimate here would discard an otherwise complete authored inertia.
         com = gu.zero_pos()
