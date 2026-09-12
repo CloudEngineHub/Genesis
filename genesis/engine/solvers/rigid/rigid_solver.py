@@ -559,19 +559,27 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         # stride-n_envs access. Batched sweeps key their iteration-axis order on the same flag, so that iteration order
         # always follows the physical layout.
         #
-        # The subgroup-cooperative constraint kernels (and the batch-first layout they expect) win when per-env compute
-        # density amortizes the warp-per-env overhead, and lose when envs are sparse and many (the 1-thread-per-env path
-        # is already coalesced under (len_constraints_, _B)). They are also the layout the decomposed solve arm requires.
-        # Empirically the cooperative path wins from ~4096 envs at n_dofs >= ~18 and loses once the env dimension alone
-        # saturates the GPU, so the env bound is get_gpu_core_count() (the threshold envs_undersaturate uses below), not
-        # a fixed literal, combined with n_dofs >= 16. Sparse solve is excluded (the cooperative qfrc kernel and the
+        # The tiled per-island seed of the factor (see enable_tiled_island_seed in array_class.py) runs on GPU at any
+        # env count: the scalar per-island seed it replaces is a per-env thread walking O(n^3) dependent loads, which
+        # above the core count costs more than the whole Newton iteration body. The subgroup-cooperative body kernels
+        # (and the batch-first layout they expect, also the layout the decomposed solve arm requires) win when per-env
+        # compute density amortizes the warp-per-env overhead and lose once the env dimension alone saturates the GPU,
+        # so they add the get_gpu_core_count() env bound (the threshold envs_undersaturate uses below), winning from
+        # ~4096 envs at n_dofs >= ~18. Sparse solve is excluded from both (the cooperative qfrc kernel and the
         # flipped-layout jac readers are dense-only).
-        enable_cooperative_constraint_kernels = (
-            gs.backend != gs.cpu
-            and not self.sim.options.requires_grad
-            and not sparse_solve
-            and self._sim._B <= get_gpu_core_count()
-            and self.n_dofs >= 16
+        enable_tiled_island_seed = (
+            gs.backend != gs.cpu and not self.sim.options.requires_grad and not sparse_solve and self.n_dofs >= 16
+        )
+        enable_cooperative_constraint_kernels = enable_tiled_island_seed and self._sim._B <= get_gpu_core_count()
+        # Dofs per kinematic tree, counted from the links here since _init_tree_fields runs once the fields this config
+        # sizes are allocated. A dof-less tree labels no island (see func_build_islands), so a scene holding one
+        # dof-carrying tree forms at most one island per env, and the per-island passes read the env's plain ranges.
+        trees_n_dofs = np.bincount([link.root_idx for link in self.links], [link.n_dofs for link in self.links])
+        is_single_island = int((trees_n_dofs > 0).sum()) == 1
+        # Above the cooperative bound one thread per env saturates the GPU, where the scalar dense Cholesky of an env's
+        # one block beats the tiled factor, so the seed kernel assembles the block and the monolith factors it.
+        has_scalar_seed_factor = (
+            enable_tiled_island_seed and is_single_island and not enable_cooperative_constraint_kernels
         )
         constraint_layout_batch_first = (
             enable_cooperative_constraint_kernels or self.sim._para_level < gs.PARA_LEVEL.ALL
@@ -603,7 +611,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             parallel_init=(
                 gs.backend != gs.cpu and not self.sim.options.requires_grad and self.n_envs <= get_gpu_core_count()
             ),
+            enable_tiled_island_seed=enable_tiled_island_seed,
             enable_cooperative_constraint_kernels=enable_cooperative_constraint_kernels,
+            is_single_island=is_single_island,
+            has_scalar_seed_factor=has_scalar_seed_factor,
             constraint_layout_batch_first=constraint_layout_batch_first,
         )
 
@@ -664,9 +675,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     island_tile_cap_last, island_tile_cap_last + 1
                 ):
                     island_tile_cap_last -= cholesky_tile_size
-                # The smallest dof-carrying tree is counted from the links here, as _init_tree_fields runs once the
-                # fields this config sizes are allocated.
-                trees_n_dofs = np.bincount([link.root_idx for link in self.links], [link.n_dofs for link in self.links])
                 min_tree_dofs = trees_n_dofs[trees_n_dofs > 0].min() if self.n_dofs else 0
                 island_tile_cap_first = cholesky_tile_size
                 while island_tile_cap_first < min_tree_dofs:
@@ -695,11 +703,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     tiled_n_dofs_per_block=tiled_n_dofs_per_block,
                     island_tile_cap_first=island_tile_cap_first,
                     island_tile_cap_last=island_tile_cap_last,
-                    # Persistent grid of the cooperative per-island factor+solve (see island_factor_n_lanes in
-                    # array_class.py): a block holds one warp, and a streaming multiprocessor keeps several warps
-                    # resident, so the grid holds four lanes per core. The count depends on the GPU alone, so the kernel
-                    # compiles once for any body or env count.
-                    island_factor_n_lanes=4 * max_tiled_envs,
+                    # An island holds at most every dof of the scene, so below this bound the factor paths above the
+                    # last cap (see func_island_assemble_factor_solve_tiled) are dead code and stay uncompiled.
+                    has_island_above_tile_cap=self.n_dofs > island_tile_cap_last,
                 )
 
                 # Manually pin the solve arm only where the winner is determinable in advance AND confirmed across
@@ -715,15 +721,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 # leaves open, every case that description settles in the monolith's favor being pinned above already.
                 if gs.use_deterministic_algorithms and rigid_config.get("prefer_decomposed_solver", -1) == -1:
                     rigid_config["prefer_decomposed_solver"] = 1
-
-            # Add terms for static inner loops, use -1 if not requires_grad to avoid re-compilation
-            if self.sim.options.requires_grad:
-                rigid_config.update(
-                    max_n_geoms_per_entity=max(len(entity.geoms) for entity in self.entities) if self.links else 0,
-                    n_entities=self._n_entities,
-                    n_links=self._n_links,
-                    n_geoms=self._n_geoms,
-                )
 
         # Jacobi equilibration of the Newton system (see nt_jacobi in array_class.py): every factor, incremental
         # update and solve of every arm rides the scaled coordinates; the reference behaviour keeps the raw factor.
@@ -1012,7 +1009,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             entities_mass_block_dof_start[i_e] = blocks_dof_start
             entities_mass_block_dof_end[i_e] = blocks_dof_end
 
+        # Smallest dof structurally coupled to each dof by the mass matrix (itself when none lies below it), read by the
+        # skyline envelope of the per-island solver (see dof_env_start_local in array_class.py).
+        dofs_mass_envelope_start = ((mass_parent_mask + mass_parent_mask.T) > 0.5).argmax(axis=1)
         self.rigid_info.mass_parent_mask.from_numpy(mass_parent_mask)
+        self.rigid_info.dofs_mass_envelope_start.from_numpy(dofs_mass_envelope_start)
         self.rigid_info.dofs_mass_block_start.from_numpy(dofs_mass_block_start)
         self.rigid_info.dofs_mass_block_end.from_numpy(dofs_mass_block_end)
         self.rigid_info.entities_mass_block_dof_start.from_numpy(entities_mass_block_dof_start)

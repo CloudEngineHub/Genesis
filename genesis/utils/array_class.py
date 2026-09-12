@@ -256,6 +256,7 @@ class RigidInfo:
     # entities and kept contiguous by attach(). The assemble/factor/solve restrict to these bounds.
     dofs_mass_block_start: qd.Tensor
     dofs_mass_block_end: qd.Tensor
+    dofs_mass_envelope_start: qd.Tensor
     # DOF range spanned by the mass blocks rooted in each entity: a leading run merged into an earlier-rooted block is
     # excluded, and the last rooted block may extend into a merged child (empty range for a fully-merged child). Lets
     # the per-entity assemble/factor/solve iterate their blocks as one flat, autodiff-compatible loop over DOFs.
@@ -341,6 +342,7 @@ def get_rigid_info(solver, kinematic_only):
             links_tree_idx=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
             dofs_mass_block_start=V(dtype=gs.qd_int, shape=()),
             dofs_mass_block_end=V(dtype=gs.qd_int, shape=()),
+            dofs_mass_envelope_start=V(dtype=gs.qd_int, shape=()),
             entities_mass_block_dof_start=V(dtype=gs.qd_int, shape=()),
             entities_mass_block_dof_end=V(dtype=gs.qd_int, shape=()),
             mass_parent_mask=V(dtype=gs.qd_float, shape=()),
@@ -386,6 +388,7 @@ def get_rigid_info(solver, kinematic_only):
         links_tree_idx=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
         dofs_mass_block_start=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
         dofs_mass_block_end=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
+        dofs_mass_envelope_start=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
         entities_mass_block_dof_start=V(dtype=gs.qd_int, shape=(solver.n_entities_,)),
         entities_mass_block_dof_end=V(dtype=gs.qd_int, shape=(solver.n_entities_,)),
         mass_parent_mask=V(dtype=gs.qd_float, shape=(solver.n_dofs_, solver.n_dofs_)),
@@ -507,10 +510,15 @@ def get_island_state(solver, collider):
     # island_state itself holds only the partition maps and the per-island iteration state.
     rcm_active = solver.rigid_config.sparse_solve
     coop_active = solver.rigid_config.enable_cooperative_constraint_kernels
+    # The (env, island) work-lists of the tiled seed are read where an env can hold several islands (see
+    # func_island_tiled_factor_solve_all in solver.py)
+    worklist_active = solver.rigid_config.enable_tiled_island_seed and not solver.rigid_config.is_single_island
     # Batch-first under the cooperative kernels, whose block serves one env: the lanes then read consecutive items of
     # their env from consecutive addresses (see the constraint-state layouts in get_constraint_state).
     island_layout = (1, 0) if solver.rigid_config.constraint_layout_batch_first else None
-    n_classes = len(island_tile_caps(solver.rigid_config))
+    n_classes = len(
+        island_tile_caps(solver.rigid_config.island_tile_cap_first, solver.rigid_config.island_tile_cap_last)
+    )
     max_candidate_contacts = max(collider.collider_info.max_candidate_contacts[None], 1)
     # Safe upper bound on active constraints, mirroring ConstraintSolver.len_constraints: rows_per_contact per
     # contact + joint-limit/frictionloss (<= n_dofs each) + equality rows (<= 6 each). The equality term must use the
@@ -551,9 +559,9 @@ def get_island_state(solver, collider):
         constraint_island_idx=V(dtype=gs.qd_int, shape=(n_constraints_max, _B), layout=island_layout),
         is_hibernated=V(dtype=gs.qd_int, shape=maybe_shape((n_trees, _B), solver._use_hibernation)),
         hibernated_next_link=V(dtype=gs.qd_int, shape=maybe_shape((n_links, _B), solver._use_hibernation)),
-        factor_worklist_i_b=V(dtype=gs.qd_int, shape=maybe_shape((n_classes * n_trees * _B,), coop_active)),
-        factor_worklist_i_island=V(dtype=gs.qd_int, shape=maybe_shape((n_classes * n_trees * _B,), coop_active)),
-        factor_worklist_size=V(dtype=gs.qd_int, shape=maybe_shape((n_classes,), coop_active)),
+        factor_worklist_i_b=V(dtype=gs.qd_int, shape=maybe_shape((n_classes * n_trees * _B,), worklist_active)),
+        factor_worklist_i_island=V(dtype=gs.qd_int, shape=maybe_shape((n_classes * n_trees * _B,), worklist_active)),
+        factor_worklist_size=V(dtype=gs.qd_int, shape=maybe_shape((n_classes,), worklist_active)),
         rcm_tree_pos=V(
             dtype=gs.qd_int, shape=maybe_shape((n_trees, _B), rcm_active), layout=island_layout if rcm_active else None
         ),
@@ -829,10 +837,10 @@ class ConstraintState:
     # TODO: Optimize storage to only allocate memory half of the Hessian matrix to sparse memory resources.
     nt_H: qd.Tensor
     # Per-DOF Jacobi scale s_i = 1/sqrt(diag(M + J^T D J)_i), at natural DOF id, refreshed ahead of every direct
-    # rebuild (func_jacobi_scale; 1 on an empty diagonal). Assembly writes H already scaled, nt_H holds L of S H S,
-    # update vectors are scaled at construction, and the batch solve wraps grad/Mgrad, so Mgrad = H^-1 grad exactly. A unit diagonal keeps the Hessian's mixed-unit spread within float32's
-    # conditioning capability at any geometry scale and makes the bare-EPS pivot floor scale-relative. Only meaningful
-    # with enable_jacobi_equilibration.
+    # rebuild (func_jacobi_scale, 1 on an empty diagonal). Assembly writes H already scaled, nt_H holds L of S H S,
+    # update vectors are scaled at construction, and the batch solve wraps grad/Mgrad, so Mgrad = H^-1 grad exactly. A
+    # unit diagonal keeps the Hessian's mixed-unit spread within float32's conditioning capability at any geometry
+    # scale and makes the bare-EPS pivot floor scale-relative. Only meaningful with enable_jacobi_equilibration.
     nt_jacobi: qd.Tensor
     # Diagonal of the persisted cone-free Hessian packed in nt_H's mirror slots (see nt_H). Only meaningful with
     # enable_cone_free_hessian_reuse.
@@ -2838,6 +2846,15 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     # single mass block (the common case: one kinematic tree). The tile width is always 32: the path is only taken
     # when the per-entity block exceeds shared memory, which on any real GPU means well over 48 DOFs.
     enable_register_tiled_mass: bool = False
+    # When True, func_solve_init seeds every island's factor with the tiled per-island kernels at any env count. The
+    # monolith self-seeds with the scalar per-island factor otherwise. See the rigid solver's resolution for the gating.
+    enable_tiled_island_seed: bool = False
+    # When True, the scene holds one dof-carrying kinematic tree, so an env forms at most one island and the
+    # per-island passes of the solve read the env's plain dof and row ranges. See the rigid solver's resolution.
+    is_single_island: bool = False
+    # When True, the seed kernel assembles the env's one Hessian block and the monolith factors it with the scalar
+    # dense Cholesky (see _kernel_solve_monolith), a single-island scene above the cooperative bound.
+    has_scalar_seed_factor: bool = False
     # When True, the constraint solver uses the GPU subgroup-cooperative kernel variants (warp-cooperative linesearch
     # refinement, per-friction constraint builder, cooperative mass-matrix assembly), together with the batch-first
     # tensor layouts they expect, eg (_B, len_constraints_) for Jaref / efc_D / ... which unlocks coalesced cross-lane
@@ -2859,14 +2876,8 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     # global memory.
     island_tile_cap_first: int = 0
     island_tile_cap_last: int = 0
-    # Number of lanes of each launch of the cooperative per-island factor+solve, grid-striding over its class's
-    # (env, island) work-list in blocks of the class's tile size: static for CUDA-graph capture, independent of the env
-    # count, and sized to keep several warps resident per streaming multiprocessor.
-    island_factor_n_lanes: int = 32
-    max_n_geoms_per_entity: int = -1
-    n_entities: int = -1
-    n_links: int = -1
-    n_geoms: int = -1
+    # Whether an island can hold more dofs than the last cap, which compiles the factor paths above it.
+    has_island_above_tile_cap: bool = False
 
     @property
     def rows_per_contact(self) -> int:
@@ -2901,15 +2912,15 @@ def cholesky_tile_size_for(n_dofs):
     return 16 if (n_dofs <= 16 or 32 < n_dofs <= 48) else 32
 
 
-def island_tile_caps(rigid_config):
+def island_tile_caps(cap_first, cap_last):
     """Ascending dof caps of the shared tiles of the cooperative per-island factor+solve, see island_tile_cap_first:
     the doublings of the first cap below the last one, then the last one."""
     caps = []
-    cap = rigid_config.island_tile_cap_first
-    while cap < rigid_config.island_tile_cap_last:
+    cap = cap_first
+    while cap < cap_last:
         caps.append(cap)
         cap *= 2
-    caps.append(rigid_config.island_tile_cap_last)
+    caps.append(cap_last)
     return tuple(caps)
 
 
