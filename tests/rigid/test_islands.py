@@ -194,6 +194,56 @@ def test_partition_logics(show_viewer, n_envs, multi_free_body_path):
 
 
 @pytest.mark.required
+def test_partition_maximal_and_invariance(show_viewer, fixed_base_dual_arm):
+    # The dual arm hanging from a fixed torso against its twin whose free torso is welded to the world at runtime:
+    # the twin is one island throughout, the fixed one splits per arm until the arms touch, and both fall alike. The
+    # arms of the first env start lower, so its islands merge first.
+    scene = gs.Scene(
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.5, -4.0, 1.5),
+            camera_lookat=(1.5, 0.0, 0.8),
+        ),
+        show_viewer=show_viewer,
+    )
+    plane = scene.add_entity(gs.morphs.Plane())
+    dual_arm = scene.add_entity(
+        gs.morphs.URDF(
+            file=fixed_base_dual_arm,
+            pos=(0.0, 0.0, 1.0),
+            fixed=True,
+        )
+    )
+    dual_arm_welded = scene.add_entity(
+        gs.morphs.URDF(
+            file=fixed_base_dual_arm,
+            pos=(3.0, 0.0, 1.0),
+        )
+    )
+    scene.build(n_envs=2)
+    scene.rigid_solver.add_weld_constraint(dual_arm_welded.base_link_idx, plane.base_link_idx)
+    dual_arm.set_dofs_position([[0.9, -0.9], [0.0, 0.0]])
+    dual_arm_welded.set_dofs_position([[0.9, -0.9], [0.0, 0.0]], dofs_idx_local=[6, 7])
+    n_islands = scene.rigid_solver.constraint_solver.constraint_state.island.n_islands
+
+    # The welded dual arm is one island, the two arms of the fixed dual arm are two islands until they touch, one from
+    # then on. Until the arms touch the twins fall alike, at rest they settle alike up to the compliance of the weld.
+    has_envs_differed = False
+    for i_step in range(80):
+        scene.step()
+        is_arms_touching = tensor_to_array(dual_arm.get_contacts(with_entity=dual_arm)["valid_mask"].any(dim=-1))
+        assert_equal(qd_to_numpy(n_islands), 3 - is_arms_touching)
+        has_envs_differed |= is_arms_touching[0] != is_arms_touching[1]
+        if i_step == 0:
+            assert not is_arms_touching.any()
+        if i_step == 39:
+            arms_qpos_diff = dual_arm_welded.get_dofs_position()[..., 6:] - dual_arm.get_dofs_position()
+            assert_allclose(arms_qpos_diff[~is_arms_touching], 0.0, tol=1e-3)
+            assert_allclose(arms_qpos_diff[is_arms_touching], 0.0, tol=5e-3)
+    assert has_envs_differed
+    assert_allclose(dual_arm_welded.get_dofs_position()[..., 6:], dual_arm.get_dofs_position(), tol=5e-3)
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_partition_track_changes(show_viewer, n_envs):
     # The partition is rebuilt every step, so it must track contacts forming (merge) and breaking (split).
@@ -225,17 +275,14 @@ def test_partition_track_changes(show_viewer, n_envs):
     # The step rebuilds the partition; read the island count the solver actually used this step.
     island_state = scene.rigid_solver.constraint_solver.constraint_state.island
 
-    def n_islands_now():
-        return qd_to_numpy(island_state.n_islands)
-
     scene.step()
-    assert_equal(n_islands_now(), 2)
+    assert_equal(qd_to_numpy(island_state.n_islands), 2)
     for _ in range(45):
         scene.step()
-    assert_equal(n_islands_now(), 1)
+    assert_equal(qd_to_numpy(island_state.n_islands), 1)
     box_upper.set_pos([0.0, 0.0, 0.40])
     scene.step()
-    assert_equal(n_islands_now(), 2)
+    assert_equal(qd_to_numpy(island_state.n_islands), 2)
 
 
 @pytest.mark.required

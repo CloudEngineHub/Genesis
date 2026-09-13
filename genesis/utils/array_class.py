@@ -238,13 +238,15 @@ class RigidInfo:
     mass_mat_D_inv: qd.Tensor = of_kind(DataKind.DERIVED)
     mass_mat_tiled_scratch: qd.Tensor = of_kind(DataKind.SCRATCH)
     mass_mat_mask: qd.Tensor = of_kind(DataKind.STATE)
-    # The kinematic trees, the links sharing a root link (links.root_idx). Tree i_t is rooted at trees_root_idx[i_t],
-    # holds the trees_n_links[i_t] links of the span [trees_root_idx[i_t], trees_link_end[i_t]) whose root it is (the
-    # span may interleave links of 0-dof entities created between attached ones, so consumers gate each link on the
-    # root) and the contiguous dofs [trees_dof_start[i_t], trees_dof_start[i_t] + trees_n_dofs[i_t]). The trees
-    # carrying a dof come first, in ascending dof order, so the island partition (see island.py) lists the dofs of the
-    # trees it groups in ascending order; the dof-less trees (fixed bodies) follow in root order and join no island.
-    # links_tree_idx maps every link to its tree.
+    # Kinematic roots: the links sharing a root link (links.root_idx), static ones included. A root spans the links
+    # [root, links_root_end[root]) whose root it is (a span may interleave links of other roots, so the walks gate each
+    # link on its root). The composite inertia and the center of mass are per root.
+    roots_link_idx: qd.Tensor
+    links_root_end: qd.Tensor
+    # Kinematic trees: the links a chain of moving joints connects, so a static link belongs to none (links_tree_idx
+    # -1) and each branch of a fixed base is a tree. Tree i_t is rooted at trees_root_idx[i_t], spans the links
+    # [trees_root_idx[i_t], trees_link_end[i_t]) mapped to it and the contiguous dofs [trees_dof_start[i_t],
+    # trees_dof_start[i_t] + trees_n_dofs[i_t]), in ascending dof order. The islands are built on the trees.
     trees_root_idx: qd.Tensor
     trees_link_end: qd.Tensor
     trees_n_links: qd.Tensor
@@ -334,6 +336,8 @@ def get_rigid_info(solver, kinematic_only):
             mass_mat_D_inv=V(dtype=gs.qd_float, shape=()),
             mass_mat_tiled_scratch=V(dtype=gs.qd_float, shape=()),
             mass_mat_mask=V(dtype=gs.qd_bool, shape=()),
+            roots_link_idx=V(dtype=gs.qd_int, shape=(solver.n_roots_,)),
+            links_root_end=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
             trees_root_idx=V(dtype=gs.qd_int, shape=(solver.n_trees_,)),
             trees_link_end=V(dtype=gs.qd_int, shape=(solver.n_trees_,)),
             trees_n_links=V(dtype=gs.qd_int, shape=(solver.n_trees_,)),
@@ -380,6 +384,8 @@ def get_rigid_info(solver, kinematic_only):
         mass_mat_D_inv=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), needs_grad=requires_grad),
         mass_mat_tiled_scratch=V(dtype=gs.qd_float, shape=mass_mat_tiled_scratch_shape),
         mass_mat_mask=V(dtype=gs.qd_bool, shape=(solver.n_entities_, _B)),
+        roots_link_idx=V(dtype=gs.qd_int, shape=(solver.n_roots_,)),
+        links_root_end=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
         trees_root_idx=V(dtype=gs.qd_int, shape=(solver.n_trees_,)),
         trees_link_end=V(dtype=gs.qd_int, shape=(solver.n_trees_,)),
         trees_n_links=V(dtype=gs.qd_int, shape=(solver.n_trees_,)),
@@ -872,6 +878,14 @@ class ConstraintState:
     # Always ndarray (not field): graph.do_while requires the same physical ndarray on every call.
     graph_counter: qd.types.ndarray()
     early_exit_flag: qd.Tensor
+    # Scratch of the noslip sweep (empty when noslip is off): M^{-1} J^T of the row being updated, in the column of the
+    # env, or of the lane of the cooperative sweep at [i_d, i_b * 32 + tid] (see kernel_noslip in noslip.py).
+    noslip_MinvJT: qd.Tensor
+    # Row coloring of the cooperative noslip sweep (empty otherwise, see func_color_rows_batch in noslip.py): the color
+    # of each row, the color count of each island and the next free color of the mass block starting at each dof.
+    noslip_rows_color: qd.Tensor
+    noslip_islands_n_colors: qd.Tensor
+    noslip_blocks_n_colors: qd.Tensor
 
 
 def get_constraint_state(constraint_solver, solver, collider):
@@ -911,6 +925,11 @@ def get_constraint_state(constraint_solver, solver, collider):
     # slot per fused update on the CPU per-island path (func_rank_batch_update_island), a single slot elsewhere
     # (indexing then reduces to [i_d]). Flat 2D so the buffer keeps the DOF-vec rank and layout on every backend.
     nt_vec_n_slots = solver.rigid_config.hessian_rank_update_batch if constraint_solver.sparse_solve else 1
+    # The noslip scratch holds one M^{-1} J^T column per env, or per lane of the 32-lane blocks of the cooperative sweep
+    # (see kernel_noslip in noslip.py).
+    is_noslip_active = solver._options.noslip_iterations > 0
+    is_noslip_cooperative = solver.rigid_config.enable_cooperative_noslip
+    noslip_n_lanes = 32 if is_noslip_cooperative else 1
 
     jac_shape = (len_constraints_, solver.n_dofs_, _B)
     # The sparse-Jacobian representation is always active, so its index buffers are always allocated. The skyline DOF
@@ -1002,6 +1021,26 @@ def get_constraint_state(constraint_solver, solver, collider):
         nt_H_cone_free_diag=V(
             dtype=gs.qd_float,
             shape=maybe_shape((_B, solver.n_dofs_), solver.rigid_config.enable_cone_free_hessian_reuse),
+        ),
+        noslip_MinvJT=V(
+            dtype=gs.qd_float,
+            shape=maybe_shape((solver.n_dofs_, noslip_n_lanes * _B), is_noslip_active),
+            layout=dof_vec_layout if is_noslip_active else None,
+        ),
+        noslip_rows_color=V(
+            dtype=gs.qd_int,
+            shape=maybe_shape((len_constraints_, _B), is_noslip_cooperative),
+            layout=con_layout if is_noslip_cooperative else None,
+        ),
+        noslip_islands_n_colors=V(
+            dtype=gs.qd_int,
+            shape=maybe_shape((solver.n_trees_, _B), is_noslip_cooperative),
+            layout=con_layout if is_noslip_cooperative else None,
+        ),
+        noslip_blocks_n_colors=V(
+            dtype=gs.qd_int,
+            shape=maybe_shape((solver.n_dofs_, _B), is_noslip_cooperative),
+            layout=dof_vec_layout if is_noslip_cooperative else None,
         ),
         # Allocated last to preserve the allocation order of the tensors above (see the warning at the top).
         island=get_island_state(solver, collider),
@@ -2860,6 +2899,11 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     # tensor layouts they expect, eg (_B, len_constraints_) for Jaref / efc_D / ... which unlocks coalesced cross-lane
     # reads.
     enable_cooperative_constraint_kernels: bool = False
+    # When True, the noslip sweep of an island runs on a block of 32 lanes: the island's rows are colored so that the
+    # rows of a color touch disjoint mass blocks, the lanes update the rows of a color in parallel and the colors are
+    # swept in order (see kernel_noslip in noslip.py). The rows are visited in another order than by the one-thread
+    # sweep, so the two sweeps give different iterates. See the rigid solver's resolution for the gating.
+    enable_cooperative_noslip: bool = False
     # Purely descriptive layout flag: True whenever the layout-flippable constraint-state tensors are physically
     # batch-first, i.e. enable_cooperative_constraint_kernels or serialized execution (env loop outermost, so per-env
     # rows must be contiguous). Consumers that only need iteration order to follow the physical layout (ndrange axes,
