@@ -79,14 +79,12 @@ from .abd.misc import (
     kernel_wakeup_coupled_links,
 )
 from .abd.forward_kinematics import (
-    func_aggregate_awake_entities,
     func_COM_links,
     func_forward_kinematics_batch,
     func_forward_kinematics_entity,
     func_forward_velocity,
     func_forward_velocity_batch,
     func_forward_velocity_entity,
-    func_hibernate__for_all_awake_islands_either_hiberanate_or_update_aabb_sort_buffer,
     func_update_all_verts,
     func_update_cartesian_space,
     func_update_cartesian_space_batch,
@@ -175,7 +173,6 @@ from .abd.accessor import (
     kernel_wake_up_entities_by_dofs,
     kernel_wake_up_entities_by_links,
     kernel_wake_up_entities_by_qs,
-    kernel_wake_up_entities_on_new_contact,
 )
 from .abd.diff import (
     func_copy_cartesian_space,
@@ -487,8 +484,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def _resolve_broadphase_traversal(self):
         if self._options.broadphase_traversal is not None:
             return self._options.broadphase_traversal
-        # For hibernation, the main missing piece is skipping hibernated-vs-hibernated pairs. This means reading two
-        # additional values from global memory, and the associated pipeline stall etc associated with this.
         # For heterogeneous, the valid_collision_pairs array is built once at init from the global geom pair
         # matrix, but with heterogeneous entities different batch elements have different geoms (different geom_start/
         # geom_end per link per batch), so a pair (ga, gb) might be valid in batch 0 but not exist in batch 3. To
@@ -496,7 +491,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         # in the current batch element. Per-batch lists multiply the memory footprint by the batch size, increasing
         # memory usage, and increasing L1/L2 cache contention. Runtime filtering keeps the single list, but it will
         # no longer be compact, and we will have thread divergence.
-        if gs.backend == gs.cpu or self._use_hibernation or self._enable_heterogeneous:
+        if gs.backend == gs.cpu or self._enable_heterogeneous:
             return gs.broadphase_traversal.SAP
         return gs.broadphase_traversal.ALL_VS_ALL
 
@@ -773,11 +768,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.kinematics_scratch = self.data_manager.kinematics_scratch
         if self._use_hibernation:
             self.n_awake_dofs = self.rigid_info.n_awake_dofs
-            self.awake_dofs = self.rigid_info.awake_dofs
-            self.n_awake_links = self.rigid_info.n_awake_links
-            self.awake_links = self.rigid_info.awake_links
-            self.n_awake_entities = self.rigid_info.n_awake_entities
-            self.awake_entities = self.rigid_info.awake_entities
         if self._requires_grad:
             self.dyn_state_adjoint_cache = self.data_manager.dyn_state_adjoint_cache
 
@@ -1017,7 +1007,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         # Smallest dof structurally coupled to each dof by the mass matrix (itself when none lies below it), read by the
         # skyline envelope of the per-island solver (see dof_env_start_local in array_class.py).
-        dofs_mass_envelope_start = ((mass_parent_mask + mass_parent_mask.T) > 0.5).argmax(axis=1)
+        dofs_mass_envelope_start = ((mass_parent_mask + mass_parent_mask.T) > 0.5).argmax(axis=1).astype(gs.np_int)
         self.rigid_info.mass_parent_mask.from_numpy(mass_parent_mask)
         self.rigid_info.dofs_mass_envelope_start.from_numpy(dofs_mass_envelope_start)
         self.rigid_info.dofs_mass_block_start.from_numpy(dofs_mass_block_start)
@@ -1309,7 +1299,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._func_constraint_force()
             kernel_step_2(
                 self.dyn_state,
-                self.collider.collider_state,
                 self.constraint_solver.constraint_state,
                 self.dyn_info,
                 self.rigid_info,
@@ -1362,8 +1351,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             gs.raise_exception("Invalid constraint forces causing 'nan'. Please decrease Rigid simulation timestep.")
         if errno & array_class.ErrorCode.INVALID_ACC_NAN:
             gs.raise_exception("Invalid accelerations causing 'nan'. Please decrease Rigid simulation timestep.")
-        if errno & array_class.ErrorCode.OVERFLOW_HIBERNATION_ISLANDS:
-            gs.raise_exception("Contact island buffer overflow. Please increase RigidOptions 'max_collision_pairs'.")
 
     def _kernel_detect_collision(self):
         self.collider.clear()
@@ -1386,17 +1373,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         if self._enable_collision:
             self.collider.detection()
-            # A collision against a sleeping body must wake it before the solve, so it joins the island partition
-            # and responds dynamically this step instead of letting the awake body pass through.
-            if self._use_hibernation:
-                kernel_wake_up_entities_on_new_contact(
-                    self.dyn_state,
-                    self.collider.collider_state,
-                    self.constraint_solver.constraint_state,
-                    self.dyn_info,
-                    self.rigid_info,
-                    self.rigid_config,
-                )
 
         if not self._disable_constraint:
             self.constraint_solver.add_inequality_constraints()
@@ -1670,7 +1646,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
         kernel_step_2.grad(
             self.dyn_state,
-            self.collider.collider_state,
             self.constraint_solver.constraint_state,
             self.dyn_info,
             self.rigid_info,
@@ -1716,7 +1691,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             update_qacc_from_qvel_delta(self.dyn_state, self.rigid_info, self.rigid_config)
             kernel_step_2(
                 self.dyn_state,
-                self.collider.collider_state,
                 self.constraint_solver.constraint_state,
                 self.dyn_info,
                 self.rigid_info,
@@ -1793,7 +1767,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             cfrc_ang_dst = qd_to_torch(self.dyn_state.links.cfrc_applied_ang, transpose=True, copy=False)
             fric_dst = qd_to_torch(self.dyn_state.geoms.friction_ratio, transpose=True, copy=False)
             # Setting the state is a discontinuity: wake every body in the affected envs (a body left hibernated would
-            # stay frozen), restoring the flags and the compact awake lists alongside the other state buffers.
+            # stay frozen), restoring the flags and the awake-dof count alongside the other state buffers.
             if self._use_hibernation:
                 links_hibernated_dst = qd_to_torch(self.dyn_state.links.is_hibernated, transpose=True, copy=False)
                 awake_steps_dst = qd_to_torch(self.dyn_state.links.awake_steps, transpose=True, copy=False)
@@ -1806,17 +1780,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 islands_next_link_dst = qd_to_torch(
                     self.constraint_solver.constraint_state.island.hibernated_next_link, transpose=True, copy=False
                 )
-                awake_links_dst = qd_to_torch(self.rigid_info.awake_links, transpose=True, copy=False)
-                awake_dofs_dst = qd_to_torch(self.rigid_info.awake_dofs, transpose=True, copy=False)
-                awake_entities_dst = qd_to_torch(self.rigid_info.awake_entities, transpose=True, copy=False)
-                n_awake_links_dst = qd_to_torch(self.rigid_info.n_awake_links, copy=False)
                 n_awake_dofs_dst = qd_to_torch(self.rigid_info.n_awake_dofs, copy=False)
-                n_awake_entities_dst = qd_to_torch(self.rigid_info.n_awake_entities, copy=False)
-                # Fill to the padded buffer capacity but keep n_awake at the real count below, so a scene with no
-                # DOFs writes its padded slot yet reports zero awake DOFs.
-                awake_links_src = torch.arange(self.n_links_, device=gs.device, dtype=gs.tc_int)
-                awake_dofs_src = torch.arange(self.n_dofs_, device=gs.device, dtype=gs.tc_int)
-                awake_entities_src = torch.arange(self.n_entities_, device=gs.device, dtype=gs.tc_int)
 
             if envs_idx is not None and not isinstance(envs_idx, torch.Tensor):
                 (envs_idx,) = indices_to_mask(envs_idx)
@@ -1848,12 +1812,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     entities_hibernated_dst.masked_fill_(envs_mask[:, None], 0)
                     islands_hibernated_dst.masked_fill_(envs_mask[:, None], 0)
                     islands_next_link_dst.masked_fill_(envs_mask[:, None], -1)
-                    torch.where(envs_mask[:, None], awake_links_src, awake_links_dst, out=awake_links_dst)
-                    torch.where(envs_mask[:, None], awake_dofs_src, awake_dofs_dst, out=awake_dofs_dst)
-                    torch.where(envs_mask[:, None], awake_entities_src, awake_entities_dst, out=awake_entities_dst)
-                    n_awake_links_dst.masked_fill_(envs_mask, self.n_links)
                     n_awake_dofs_dst.masked_fill_(envs_mask, self.n_dofs)
-                    n_awake_entities_dst.masked_fill_(envs_mask, self.n_entities)
             else:
                 if self.n_qs:
                     errno[envs_idx] = 0
@@ -1876,12 +1835,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     entities_hibernated_dst[envs_idx] = 0
                     islands_hibernated_dst[envs_idx] = 0
                     islands_next_link_dst[envs_idx] = -1
-                    awake_links_dst[envs_idx] = awake_links_src
-                    awake_dofs_dst[envs_idx] = awake_dofs_src
-                    awake_entities_dst[envs_idx] = awake_entities_src
-                    n_awake_links_dst[envs_idx] = self.n_links
                     n_awake_dofs_dst[envs_idx] = self.n_dofs
-                    n_awake_entities_dst[envs_idx] = self.n_entities
             if gs.backend == gs.metal:
                 torch.mps.synchronize()
         else:
@@ -2723,9 +2677,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._is_forward_vel_updated = True
 
     def _wake_dofs(self, dofs_idx, envs_idx):
-        # Revive any hibernated entity owning these (already sanitized) dofs before an input is written to or
-        # targeted at them; forward dynamics and integration act only on awake dofs, so an input applied to a
-        # sleeping body would otherwise be silently dropped until it is woken by some other means.
+        # Revive any hibernated entity owning these (already sanitized) dofs before a state is written to them;
+        # forward dynamics and integration act only on awake dofs, so a state written to a sleeping body would
+        # otherwise be silently dropped until it is woken by some other means.
         if self._use_hibernation:
             kernel_wake_up_entities_by_dofs(
                 dofs_idx,
@@ -2747,7 +2701,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         super().set_dofs_velocity(velocity, dofs_idx, envs_idx, skip_forward=skip_forward)
 
     def control_dofs_force(self, force, dofs_idx=None, envs_idx=None):
-        if gs.use_zerocopy and not self._use_hibernation:
+        # A control target is consumed by the actuation pass of the next step, which wakes a sleeping link it actuates
+        # (see func_torque_and_passive_force), so the target is written without waking anything here.
+        if gs.use_zerocopy:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
             ctrl_mode = qd_to_torch(self.dyn_state.dofs.ctrl_mode, transpose=True, copy=False)
             ctrl_mode[mask] = gs.CTRL_MODE.FORCE
@@ -2763,11 +2719,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.n_envs == 0:
             force = force[None]
 
-        self._wake_dofs(dofs_idx, envs_idx)
         kernel_control_dofs_force(dofs_idx, envs_idx, force, self.dyn_state, self.rigid_config)
 
     def control_dofs_velocity(self, velocity, dofs_idx=None, envs_idx=None):
-        if gs.use_zerocopy and not self._use_hibernation:
+        if gs.use_zerocopy:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
             ctrl_mode = qd_to_torch(self.dyn_state.dofs.ctrl_mode, transpose=True, copy=False)
             ctrl_mode[mask] = gs.CTRL_MODE.VELOCITY
@@ -2785,11 +2740,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.n_envs == 0:
             velocity = velocity[None]
 
-        self._wake_dofs(dofs_idx, envs_idx)
         kernel_control_dofs_velocity(dofs_idx, envs_idx, velocity, self.dyn_state, self.rigid_config)
 
     def control_dofs_position(self, position, dofs_idx=None, envs_idx=None):
-        if gs.use_zerocopy and not self._use_hibernation:
+        if gs.use_zerocopy:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
             ctrl_mode = qd_to_torch(self.dyn_state.dofs.ctrl_mode, transpose=True, copy=False)
             ctrl_mode[mask] = gs.CTRL_MODE.POSITION
@@ -2807,11 +2761,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.n_envs == 0:
             position = position[None]
 
-        self._wake_dofs(dofs_idx, envs_idx)
         kernel_control_dofs_position(dofs_idx, envs_idx, position, self.dyn_state, self.rigid_config)
 
     def control_dofs_position_velocity(self, position, velocity, dofs_idx=None, envs_idx=None):
-        if gs.use_zerocopy and not self._use_hibernation:
+        if gs.use_zerocopy:
             mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
             ctrl_mode = qd_to_torch(self.dyn_state.dofs.ctrl_mode, transpose=True, copy=False)
             ctrl_mode[mask] = gs.CTRL_MODE.POSITION
@@ -2833,7 +2786,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             position = position[None]
             velocity = velocity[None]
 
-        self._wake_dofs(dofs_idx, envs_idx)
         kernel_control_dofs_position_velocity(dofs_idx, envs_idx, position, velocity, self.dyn_state, self.rigid_config)
 
     def get_sol_params(self, geoms_idx=None, envs_idx=None, *, joints_idx=None, eqs_idx=None):
@@ -3490,7 +3442,6 @@ def kernel_step_1(
 @qd.kernel(fastcache=True)
 def kernel_step_2(
     dyn_state: array_class.DynState,
-    collider_state: array_class.ColliderState,
     constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -3518,12 +3469,3 @@ def kernel_step_2(
                 dyn_state, dyn_info, rigid_info, rigid_config, force_update_fixed_geoms=False, is_backward=is_backward
             )
             func_forward_velocity(dyn_state, dyn_info, rigid_info, rigid_config, is_backward)
-
-    # Hibernating comes last, after the post-integrate refresh above: both only visit awake entities, so deciding to
-    # sleep first would drop the newly-hibernated island from that refresh and freeze its Cartesian pose one
-    # integration behind the qpos this step just advanced, for as long as it sleeps.
-    if qd.static(rigid_config.use_hibernation):
-        func_hibernate__for_all_awake_islands_either_hiberanate_or_update_aabb_sort_buffer(
-            dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config, errno
-        )
-        func_aggregate_awake_entities(dyn_state, dyn_info, rigid_info, rigid_config)

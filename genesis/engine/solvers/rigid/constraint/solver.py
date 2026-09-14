@@ -11,7 +11,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd import func_solve_mass_batch
-from genesis.engine.solvers.rigid.abd.misc import linear_to_lower_tri
+from genesis.engine.solvers.rigid.abd.misc import func_hibernate_island_if_settled, linear_to_lower_tri
 from genesis.utils.misc import qd_to_torch, indices_to_mask, assign_indexed_tensor
 
 from .island import (
@@ -182,8 +182,10 @@ class ConstraintSolver:
 
         self.reset()
 
-        # The hibernated-island daisy chain must start empty (-1 = no successor); it persists across steps, written
-        # when an island hibernates and cleared on wakeup.
+        # A static link belongs to no tree, so the partition build labels it with no island (see func_build_islands):
+        # its slot of links_island_idx holds -1 for the life of the scene. The hibernated-island daisy chain must start
+        # empty (-1 = no successor); it persists across steps, written when an island hibernates and cleared on wakeup.
+        self.constraint_state.island.links_island_idx.fill(-1)
         if self._solver._use_hibernation:
             self.constraint_state.island.hibernated_next_link.fill(-1)
 
@@ -298,6 +300,7 @@ class ConstraintSolver:
             self._collider.collider_state,
             self.constraint_state,
             self._solver.dyn_info,
+            self._solver.rigid_info,
             self._solver.rigid_config,
         )
 
@@ -654,20 +657,25 @@ def _is_contact_inert(
     i_b,
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ) -> bool:
     """Whether a contact carries no constraint because neither endpoint is an awake dynamic body.
 
-    A sleeper struck by an awake body is revived before the constraints are assembled
-    (kernel_wake_up_entities_on_new_contact), so only hibernated-fixed pairs reach this state.
+    A sleeper struck by an awake body is revived as the island partition is built, before the constraints are
+    assembled (see func_build_islands), so only hibernated-fixed pairs reach this state.
     """
-    link_a_maybe_batch = [link_a, i_b] if qd.static(rigid_config.batch_links_info) else link_a
-    link_b_maybe_batch = [link_b, i_b] if qd.static(rigid_config.batch_links_info) else link_b
-    is_a_awake = not (dyn_info.links.is_fixed[link_a_maybe_batch] or dyn_state.links.is_hibernated[link_a, i_b])
-    is_b_awake = link_b >= 0 and not (
-        dyn_info.links.is_fixed[link_b_maybe_batch] or dyn_state.links.is_hibernated[link_b, i_b]
-    )
-    return not is_a_awake and not is_b_awake
+    is_inert = False
+    # A pair of fixed links is dropped at build time, so an env with no sleeper holds no inert contact
+    if rigid_info.n_awake_dofs[i_b] < dyn_state.dofs.is_hibernated.shape[0]:
+        link_a_maybe_batch = [link_a, i_b] if qd.static(rigid_config.batch_links_info) else link_a
+        link_b_maybe_batch = [link_b, i_b] if qd.static(rigid_config.batch_links_info) else link_b
+        is_a_awake = not (dyn_info.links.is_fixed[link_a_maybe_batch] or dyn_state.links.is_hibernated[link_a, i_b])
+        is_b_awake = link_b >= 0 and not (
+            dyn_info.links.is_fixed[link_b_maybe_batch] or dyn_state.links.is_hibernated[link_b, i_b]
+        )
+        is_inert = not is_a_awake and not is_b_awake
+    return is_inert
 
 
 @qd.func
@@ -907,7 +915,7 @@ def _add_collision_constraints_per_friction(
                 i_col = collider_state.contact_sort_idx[i_col_, i_b]
                 link_a = collider_state.contact_data.link_a[i_col, i_b]
                 link_b = collider_state.contact_data.link_b[i_col, i_b]
-                is_inert = _is_contact_inert(link_a, link_b, i_b, dyn_state, dyn_info, rigid_config)
+                is_inert = _is_contact_inert(link_a, link_b, i_b, dyn_state, dyn_info, rigid_info, rigid_config)
             if is_inert:
                 n_con = constraint_state.n_constraints[i_b] + i_col_ * rows_per_contact + i_friction
                 _clear_inert_collision_row(n_con, i_b, constraint_state, rigid_config)
@@ -966,7 +974,7 @@ def _add_collision_constraints_per_contact(
             link_b_maybe_batch = [link_b, i_b] if qd.static(rigid_config.batch_links_info) else link_b
 
             if qd.static(rigid_config.use_hibernation):
-                if _is_contact_inert(link_a, link_b, i_b, dyn_state, dyn_info, rigid_config):
+                if _is_contact_inert(link_a, link_b, i_b, dyn_state, dyn_info, rigid_info, rigid_config):
                     for i_friction in range(rows_per_contact):
                         n_con = collision_con_start + i_col_ * rows_per_contact + i_friction
                         _clear_inert_collision_row(n_con, i_b, constraint_state, rigid_config)
@@ -1436,19 +1444,16 @@ def _sort_contacts_and_build_islands(
     rigid_config: qd.template(),
     collider_static_config: qd.template(),
 ):
-    """Order the contacts of every env (see add_inequality_constraints) and build its island partition, the two per-env
-    steps sharing one launch.
+    """Order the contacts of every env (see add_inequality_constraints) and build its island partition in one launch.
 
     Where the cooperative kernels run, a block serves each env: the lanes sort together (func_sort_contacts_coop), then
-    build the partition together (func_build_islands_coop); elsewhere one thread per env does both. The order and the
-    partition are the same whichever way they are built, so the constraint order the caller assembles is too. A
-    single-island scene writes its partition outright (func_build_single_island), off the CPU skyline path and
-    hibernation, which alone read the tree and link labels the full build resolves.
+    build the partition together (func_build_islands_coop); elsewhere one thread per env does both. Both ways give the
+    same order and partition. A single-island scene writes its partition outright (func_build_single_island), off the
+    CPU skyline path and in every env where nothing sleeps.
     """
     _B = constraint_state.jac.shape[2]
-    has_trivial_partition = qd.static(
-        rigid_config.is_single_island and not rigid_config.sparse_solve and not rigid_config.use_hibernation
-    )
+    # Under hibernation the trivial partition serves the envs where nothing sleeps, the full build the others
+    has_trivial_partition = qd.static(rigid_config.is_single_island and not rigid_config.sparse_solve)
     if qd.static(rigid_config.enable_tiled_island_seed and not rigid_config.is_single_island):
         # Reset the per-class (env, island) work-list counters before the per-env builds append to them
         N_CLASSES = qd.static(
@@ -1466,7 +1471,16 @@ def _sort_contacts_and_build_islands(
                 func_sort_contacts_coop(i_b, tid, dyn_state, collider_state, constraint_state)
                 qd.simt.block.sync()
             if qd.static(has_trivial_partition):
-                func_build_single_island_coop(i_b, tid, constraint_state, rigid_info)
+                is_partition_trivial = True
+                if qd.static(rigid_config.use_hibernation):
+                    is_partition_trivial = rigid_info.n_awake_dofs[i_b] >= dyn_state.dofs.is_hibernated.shape[0]
+                if is_partition_trivial:
+                    func_build_single_island_coop(i_b, tid, constraint_state, rigid_info, rigid_config)
+                else:
+                    if qd.static(rigid_config.use_hibernation):
+                        func_build_islands_coop(
+                            i_b, tid, dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config
+                        )
             else:
                 func_build_islands_coop(
                     i_b, tid, dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config
@@ -1493,7 +1507,16 @@ def _sort_contacts_and_build_islands(
                     dyn_state.geoms.quat,
                 )
             if qd.static(has_trivial_partition):
-                func_build_single_island(i_b, constraint_state, rigid_info)
+                is_partition_trivial = True
+                if qd.static(rigid_config.use_hibernation):
+                    is_partition_trivial = rigid_info.n_awake_dofs[i_b] >= dyn_state.dofs.is_hibernated.shape[0]
+                if is_partition_trivial:
+                    func_build_single_island(i_b, constraint_state, rigid_info, rigid_config)
+                else:
+                    if qd.static(rigid_config.use_hibernation):
+                        func_build_islands(
+                            i_b, dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config
+                        )
             else:
                 func_build_islands(i_b, dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config)
             if qd.static(rigid_config.enable_tiled_island_seed and not rigid_config.is_single_island):
@@ -1506,20 +1529,28 @@ def func_append_factor_worklist(
     i_b, i_island, constraint_state: array_class.ConstraintState, rigid_config: qd.template()
 ):
     """Append island i_island of env i_b to the factor work-list of its size class, the smallest tile cap holding the
-    island's dofs and the last class for the islands above every cap (see island_tile_caps)."""
-    CAPS = qd.static(
-        array_class.island_tile_caps(rigid_config.island_tile_cap_first, rigid_config.island_tile_cap_last)
-    )
-    N_CLASSES = qd.static(len(CAPS))
-    region = constraint_state.island.factor_worklist_i_b.shape[0] // N_CLASSES
-    n_island_dofs = constraint_state.island.dof_slices.n[i_island, i_b]
-    i_class = N_CLASSES - 1
-    for k in qd.static(range(N_CLASSES - 2, -1, -1)):
-        if n_island_dofs <= CAPS[k]:
-            i_class = k
-    i_slot = i_class * region + qd.atomic_add(constraint_state.island.factor_worklist_size[i_class], 1)
-    constraint_state.island.factor_worklist_i_b[i_slot] = i_b
-    constraint_state.island.factor_worklist_i_island[i_slot] = i_island
+    island's dofs and the last class for the islands above every cap (see island_tile_caps).
+
+    A hibernated island is left off the lists: its factor and solve are skipped for the whole step, every pass reading
+    its gradient or direction being gated on improved (see IslandState).
+    """
+    is_listed = True
+    if qd.static(rigid_config.use_hibernation):
+        is_listed = constraint_state.island.is_hibernated[i_island, i_b] == 0
+    if is_listed:
+        CAPS = qd.static(
+            array_class.island_tile_caps(rigid_config.island_tile_cap_first, rigid_config.island_tile_cap_last)
+        )
+        N_CLASSES = qd.static(len(CAPS))
+        region = constraint_state.island.factor_worklist_i_b.shape[0] // N_CLASSES
+        n_island_dofs = constraint_state.island.dof_slices.n[i_island, i_b]
+        i_class = N_CLASSES - 1
+        for k in qd.static(range(N_CLASSES - 2, -1, -1)):
+            if n_island_dofs <= CAPS[k]:
+                i_class = k
+        i_slot = i_class * region + qd.atomic_add(constraint_state.island.factor_worklist_size[i_class], 1)
+        constraint_state.island.factor_worklist_i_b[i_slot] = i_b
+        constraint_state.island.factor_worklist_i_island[i_slot] = i_island
 
 
 @qd.kernel(fastcache=True)
@@ -3111,7 +3142,8 @@ def func_island_tiled_factor_solve_all(
                         i_b = constraint_state.island.factor_worklist_i_b[i_class * region + i_work]
                         i_island = constraint_state.island.factor_worklist_i_island[i_class * region + i_work]
                     if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
-                        # An island standing still (asleep, or converged in the iterations) keeps its factor and solve
+                        # An island converged in the iterations keeps its factor and solve; a hibernated one is off the
+                        # lists (see func_append_factor_worklist)
                         if constraint_state.island.improved[i_island, i_b]:
                             func_island_assemble_factor_solve_tiled(
                                 i_b,
@@ -3129,18 +3161,6 @@ def func_island_tiled_factor_solve_all(
                                 IS_LAST_CLASS,
                                 write_L,
                             )
-                        elif qd.static(rigid_config.use_hibernation):
-                            if constraint_state.island.is_hibernated[i_island, i_b]:
-                                # A hibernated island, whose factor and solve are skipped for the whole step, carries a
-                                # zero gradient and search direction so that no stale direction steps its dofs. The
-                                # gradient is zeroed where it is computed (func_update_gradient_no_solve,
-                                # func_update_gradient_batch).
-                                dof_start = constraint_state.island.dof_slices.start[i_island, i_b]
-                                i_d_ = tid
-                                while i_d_ < constraint_state.island.dof_slices.n[i_island, i_b]:
-                                    i_d = constraint_state.island.dof_id[dof_start + i_d_, i_b]
-                                    constraint_state.Mgrad[i_d, i_b] = gs.qd_float(0.0)
-                                    i_d_ = i_d_ + T
 
 
 @qd.func
@@ -3276,7 +3296,7 @@ def func_apply_rank1_dense_block(
     i_b, i_d_start, n, sign, constraint_state: array_class.ConstraintState, rigid_info: array_class.RigidInfo
 ) -> bool:
     """Apply one rank-1 update (sign +1) or downdate (sign -1) to the dense factor L of the dof block
-    [i_d_start, i_d_start + n) in nt_H: the whole env, or one island whose dofs are one ascending run.
+    [i_d_start, i_d_start + n) in nt_H, every dof of an env holding one island.
 
     The working vector is pre-staged over the block's dofs in nt_vec at their global rows. Returns True on a
     non-positive downdate pivot. Shared by the active-set flip update (working vector jac * sqrt(D)) and the coupled
@@ -3338,34 +3358,6 @@ def func_rank1_flip_dense_block(
             v = v * constraint_state.nt_jacobi[i_d, i_b]
         constraint_state.nt_vec[i_d, i_b] = v
     return func_apply_rank1_dense_block(i_b, i_d_start, n, sign, constraint_state, rigid_info)
-
-
-@qd.func
-def func_factor_island_incremental_dense(
-    i_b,
-    i_island,
-    i_d_start,
-    n,
-    constraint_state: array_class.ConstraintState,
-    rigid_info: array_class.RigidInfo,
-    rigid_config: qd.template(),
-) -> bool:
-    """Maintain the dense factor of island i_island, whose dofs are the ascending run [i_d_start, i_d_start + n),
-    through one rank-1 update or downdate per row of the island that flipped active since the previous iteration (see
-    prev_active).
-
-    Returns True on a non-positive downdate pivot, the caller then refactoring the island directly.
-    """
-    con_lo = constraint_state.island.constraint_slices.start[i_island, i_b]
-    con_hi = con_lo + constraint_state.island.constraint_slices.n[i_island, i_b]
-    con_base = linesearch.func_list_range_start(constraint_state.island.constraint_id, con_lo, con_hi, i_b)
-    is_degenerated = False
-    for i_pos in range(con_lo, con_hi):
-        i_c = linesearch.func_list_item(constraint_state.island.constraint_id, i_pos, con_lo, con_base, i_b)
-        if constraint_state.active[i_c, i_b] ^ constraint_state.prev_active[i_c, i_b]:
-            if func_rank1_flip_dense_block(i_b, i_c, i_d_start, n, constraint_state, rigid_info, rigid_config):
-                is_degenerated = True
-    return is_degenerated
 
 
 @qd.func
@@ -3448,7 +3440,10 @@ def func_apply_staged_rank_updates_island(
         if qd.static(rigid_config.sparse_solve):
             j_d_local_end = constraint_state.island.dof_env_col_end[dof_base + i_d_local, i_b] + 1
         for j_d_local in range(i_d_local + 1, j_d_local_end):
-            if constraint_state.island.dof_env_start_local[dof_base + j_d_local, i_b] <= i_d_local:
+            is_coupled = True
+            if qd.static(rigid_config.sparse_solve):
+                is_coupled = constraint_state.island.dof_env_start_local[dof_base + j_d_local, i_b] <= i_d_local
+            if is_coupled:
                 j_dg = constraint_state.island.dof_id[dof_base + j_d_local, i_b]
                 j_slot_base = j_dg * rigid_config.hessian_rank_update_batch
                 Lj = constraint_state.nt_H[i_b, j_dg, i_dg]
@@ -3506,6 +3501,52 @@ def func_rank_batch_update_island(
     return func_apply_staged_rank_updates_island(
         i_b, i_island, i_d_local_start, n_u, signs, constraint_state, rigid_info, rigid_config
     )
+
+
+@qd.func
+def func_factor_island_incremental_batch(
+    i_b,
+    i_island,
+    constraint_state: array_class.ConstraintState,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+) -> bool:
+    """Fold the active-set flips of island i_island into its Cholesky factor by fused rank-1 updates.
+
+    The flipped rows are gathered into batches of hessian_rank_update_batch, each applied as one column sweep over the
+    island's dof list (see func_rank_batch_update_island), whatever global dofs the island holds. Returns True on a
+    degenerate downdate, the caller then refactoring the island directly.
+    """
+    c_start = constraint_state.island.constraint_slices.start[i_island, i_b]
+    c_n = constraint_state.island.constraint_slices.n[i_island, i_b]
+    dof_base = constraint_state.island.dof_slices.start[i_island, i_b]
+    n_isl_dofs = constraint_state.island.dof_slices.n[i_island, i_b]
+    if qd.static(rigid_config.is_single_island):
+        # The env's one island holds every dof, a count the compiler knows and fixes the trip counts below with.
+        n_isl_dofs = constraint_state.nt_H.shape[1]
+    for i_d_local in range(n_isl_dofs):
+        slot_base = constraint_state.island.dof_id[dof_base + i_d_local, i_b] * rigid_config.hessian_rank_update_batch
+        for i_u in qd.static(range(rigid_config.hessian_rank_update_batch)):
+            constraint_state.nt_vec[slot_base + i_u, i_b] = gs.qd_float(0.0)
+    is_degenerated = False
+    batch_ic = qd.Vector.zero(gs.qd_int, rigid_config.hessian_rank_update_batch)
+    n_u = 0
+    for i_lcon in range(c_n):
+        i_c = constraint_state.island.constraint_id[c_start + i_lcon, i_b]
+        if constraint_state.active[i_c, i_b] ^ constraint_state.prev_active[i_c, i_b]:
+            batch_ic[n_u] = i_c
+            n_u = n_u + 1
+            if n_u == rigid_config.hessian_rank_update_batch:
+                if func_rank_batch_update_island(
+                    i_b, i_island, batch_ic, n_u, constraint_state, rigid_info, rigid_config
+                ):
+                    is_degenerated = True
+                    break
+                n_u = 0
+    if not is_degenerated and n_u > 0:
+        if func_rank_batch_update_island(i_b, i_island, batch_ic, n_u, constraint_state, rigid_info, rigid_config):
+            is_degenerated = True
+    return is_degenerated
 
 
 @qd.func
@@ -3747,32 +3788,9 @@ def func_factor_island_incremental_or_direct(
             > 2.0 * sum_span_sq
         )
         if not need_rebuild:
-            for i_d_local in range(n_isl_dofs):
-                slot_base = (
-                    constraint_state.island.dof_id[dof_base + i_d_local, i_b] * rigid_config.hessian_rank_update_batch
-                )
-                for i_u in qd.static(range(rigid_config.hessian_rank_update_batch)):
-                    constraint_state.nt_vec[slot_base + i_u, i_b] = gs.qd_float(0.0)
-            # Gather the flipped constraints into fixed-size batches; apply each batch as one fused column sweep.
-            batch_ic = qd.Vector.zero(gs.qd_int, rigid_config.hessian_rank_update_batch)
-            n_u = 0
-            for i_lcon in range(c_n):
-                i_c = constraint_state.island.constraint_id[c_start + i_lcon, i_b]
-                if constraint_state.active[i_c, i_b] ^ constraint_state.prev_active[i_c, i_b]:
-                    batch_ic[n_u] = i_c
-                    n_u = n_u + 1
-                    if n_u == rigid_config.hessian_rank_update_batch:
-                        if func_rank_batch_update_island(
-                            i_b, i_island, batch_ic, n_u, constraint_state, rigid_info, rigid_config
-                        ):
-                            need_rebuild = True
-                            break
-                        n_u = 0
-            if not need_rebuild and n_u > 0:
-                if func_rank_batch_update_island(
-                    i_b, i_island, batch_ic, n_u, constraint_state, rigid_info, rigid_config
-                ):
-                    need_rebuild = True
+            need_rebuild = func_factor_island_incremental_batch(
+                i_b, i_island, constraint_state, rigid_info, rigid_config
+            )
             # The active-set batch above maintains the per-row J^T D J of active rows; the coupled middle-zone cone
             # block (its rows inactive) is disjoint from that and is maintained here by its downdate/update.
             if qd.static(rigid_config.enable_elliptic_friction):
@@ -3835,20 +3853,14 @@ def func_hessian_and_cholesky_factor_incremental_batch(
             if constraint_state.island.improved[i_island, i_b]:
                 func_hessian_direct_batch(i_b, i_island, constraint_state, dyn_info, rigid_info, rigid_config)
                 func_cholesky_factor_direct_batch(i_b, i_island, constraint_state, rigid_info, rigid_config)
-    else:
-        # Each island still iterating maintains its own factor: by rank-1 updates on its dense block where its dofs
-        # are one ascending run (see dof_range_start in IslandState), refactored directly where they are not or where a
-        # downdate went indefinite. An island standing still keeps its factor (see improved in IslandState).
+    elif qd.static(not rigid_config.is_single_island):
+        # Each island still iterating maintains its own factor by the fused rank-1 updates of its flipped rows over its
+        # dof list, refactored directly where a downdate went indefinite. An island standing still keeps its factor (see
+        # improved in IslandState). A scene holding one island per env always takes the whole-env branch above, so
+        # this one stays out of its kernels.
         for i_island in range(constraint_state.island.n_islands[i_b]):
             if constraint_state.island.improved[i_island, i_b]:
-                i_d_start = constraint_state.island.dof_range_start[i_island, i_b]
-                n_island_dofs = constraint_state.island.dof_slices.n[i_island, i_b]
-                is_island_degenerated = True
-                if i_d_start >= 0:
-                    is_island_degenerated = func_factor_island_incremental_dense(
-                        i_b, i_island, i_d_start, n_island_dofs, constraint_state, rigid_info, rigid_config
-                    )
-                if is_island_degenerated:
+                if func_factor_island_incremental_batch(i_b, i_island, constraint_state, rigid_info, rigid_config):
                     func_hessian_direct_batch(i_b, i_island, constraint_state, dyn_info, rigid_info, rigid_config)
                     func_cholesky_factor_direct_batch(i_b, i_island, constraint_state, rigid_info, rigid_config)
     return is_degenerated
@@ -4661,7 +4673,7 @@ def func_update_constraint_batch(
         if is_moving:
             for i_pos in range(dof_lo, dof_hi):
                 i_d = linesearch.func_list_item(constraint_state.island.dof_id, i_pos, dof_lo, dof_base, i_b)
-                cost_i = cost_i + 0.5 * (Ma[i_d, i_b] - dyn_state.dofs.force[i_d, i_b]) * (
+                cost_i = cost_i + 0.5 * (Ma[i_d, i_b] - dyn_state.dofs.qf_smooth[i_d, i_b]) * (
                     qacc[i_d, i_b] - dyn_state.dofs.acc_smooth[i_d, i_b]
                 )
             for i_pos in range(row_lo, row_hi):
@@ -4821,7 +4833,7 @@ def _func_update_cost_coop(
         while i_d < n_dofs:
             v = (
                 0.5
-                * (Ma[i_d, i_b] - dyn_state.dofs.force[i_d, i_b])
+                * (Ma[i_d, i_b] - dyn_state.dofs.qf_smooth[i_d, i_b])
                 * (qacc[i_d, i_b] - dyn_state.dofs.acc_smooth[i_d, i_b])
             )
             cost_i = cost_i + v
@@ -4892,8 +4904,8 @@ def func_update_gradient_batch(
     rigid_config: qd.template(),
 ):
     """Gradient of every island of one env that still iterates and its Newton direction Mgrad through the island's
-    factor, a hibernated island carrying zeros. The dofs are walked through the island list by offset where it holds
-    consecutive indices, and over the env's plain range in a scene holding one island per env (see is_single_island).
+    factor. The dofs are walked through the island list by offset where it holds consecutive indices, and over the
+    env's plain range in a scene holding one island per env (see is_single_island).
     """
     n_dofs = constraint_state.grad.shape[0]
     for i_island in range(constraint_state.island.n_islands[i_b]):
@@ -4907,17 +4919,13 @@ def func_update_gradient_batch(
         if constraint_state.island.improved[i_island, i_b]:
             for i_pos in range(dof_lo, dof_hi):
                 i_d = linesearch.func_list_item(constraint_state.island.dof_id, i_pos, dof_lo, dof_base, i_b)
+                # dofs.force holds the smooth force only where the forward dynamics ran this step: a body woken at the
+                # island build (see func_build_islands) still carries the total force of its last solve there.
                 constraint_state.grad[i_d, i_b] = (
                     constraint_state.Ma[i_d, i_b]
-                    - dyn_state.dofs.force[i_d, i_b]
+                    - dyn_state.dofs.qf_smooth[i_d, i_b]
                     - constraint_state.qfrc_constraint[i_d, i_b]
                 )
-        elif qd.static(rigid_config.use_hibernation):
-            if constraint_state.island.is_hibernated[i_island, i_b]:
-                for i_pos in range(dof_lo, dof_hi):
-                    i_d = linesearch.func_list_item(constraint_state.island.dof_id, i_pos, dof_lo, dof_base, i_b)
-                    constraint_state.grad[i_d, i_b] = gs.qd_float(0.0)
-                    constraint_state.Mgrad[i_d, i_b] = gs.qd_float(0.0)
     if qd.static(rigid_config.solver_type == gs.constraint_solver.CG):
         func_solve_mass_batch(
             i_b, constraint_state.grad, constraint_state.Mgrad, dyn_state, dyn_info, rigid_info, rigid_config
@@ -4955,18 +4963,14 @@ def func_update_gradient_no_solve(
         n_dofs, _B, axes=qd.static((1, 0) if rigid_config.enable_cooperative_constraint_kernels else None)
     ):
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
-            # The gradient of an island standing still is kept (see improved in IslandState), and a hibernated island
-            # carries a zero gradient, see func_island_tiled_factor_solve_all.
+            # The gradient of an island standing still is kept (see improved in IslandState)
             i_island = constraint_state.island.dofs_island_idx[i_d, i_b]
             if constraint_state.island.improved[i_island, i_b]:
                 constraint_state.grad[i_d, i_b] = (
                     constraint_state.Ma[i_d, i_b]
-                    - dyn_state.dofs.force[i_d, i_b]
+                    - dyn_state.dofs.qf_smooth[i_d, i_b]
                     - constraint_state.qfrc_constraint[i_d, i_b]
                 )
-            elif qd.static(rigid_config.use_hibernation):
-                if constraint_state.island.is_hibernated[i_island, i_b]:
-                    constraint_state.grad[i_d, i_b] = gs.qd_float(0.0)
 
 
 @qd.func
@@ -5423,6 +5427,7 @@ def func_update_contact_force(
     collider_state: array_class.ColliderState,
     constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
     n_links = dyn_state.links.contact_force.shape[0]
@@ -5473,7 +5478,9 @@ def func_update_contact_force(
             # An inert contact keeps the force of the last solve it took part in, so a resting sleeper keeps reporting
             # the support force it is at rest under.
             if qd.static(rigid_config.use_hibernation):
-                if _is_contact_inert(contact_data_link_a, contact_data_link_b, i_b, dyn_state, dyn_info, rigid_config):
+                if _is_contact_inert(
+                    contact_data_link_a, contact_data_link_b, i_b, dyn_state, dyn_info, rigid_info, rigid_config
+                ):
                     force = collider_state.contact_data.force[i_col, i_b]
             collider_state.contact_data.force[i_col, i_b] = force
 
@@ -5483,6 +5490,14 @@ def func_update_contact_force(
             dyn_state.links.contact_force[contact_data_link_b, i_b] = (
                 dyn_state.links.contact_force[contact_data_link_b, i_b] + force
             )
+
+        # The settled islands fall asleep here, once the solve has written the forces their contacts and dofs keep
+        # reporting for as long as they sleep, and before the integration skips their dofs.
+        if qd.static(rigid_config.use_hibernation):
+            for i_island in range(constraint_state.island.n_islands[i_b]):
+                func_hibernate_island_if_settled(
+                    i_island, i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config
+                )
 
 
 @qd.kernel(fastcache=True)

@@ -207,7 +207,6 @@ class ErrorCode(IntEnum):
     OVERFLOW_COLLISION_PAIRS = 0b00000000000000000000000000000001
     OVERFLOW_CANDIDATE_CONTACTS = 0b00000000000000000000000000000010
     OVERFLOW_CONTACTS = 0b00000000000000000000000000000100
-    OVERFLOW_HIBERNATION_ISLANDS = 0b00000000000000000000000000001000
     INVALID_CONTACT_NAN = 0b00000000000000000000000000010000
     INVALID_FORCE_NAN = 0b00000000000000000000000000100000
     INVALID_ACC_NAN = 0b00000000000000000000000001000000
@@ -221,12 +220,13 @@ class RigidInfo:
     kind: ClassVar[DataKind] = DataKind.CONSTANT
 
     # *_bw: Cache for backward pass
+    # Awake dofs per env under hibernation, counted down where an island sleeps and up where one wakes. An env whose
+    # count is zero has every body asleep and skips the passes that gate on it whole. An env whose count is the dof
+    # count has no sleeper and skips the passes that look for one (the chain edges and the wake pass of the island
+    # build, the pair filter of the broad phase, the contact advection, the inert rows), so hibernation costs it one
+    # read per pass until something sleeps in it. A dof-less scene pads its dof buffers to one slot and takes the slow
+    # path.
     n_awake_dofs: qd.Tensor = of_kind(DataKind.STATE)
-    awake_dofs: qd.Tensor = of_kind(DataKind.STATE)
-    n_awake_entities: qd.Tensor = of_kind(DataKind.STATE)
-    awake_entities: qd.Tensor = of_kind(DataKind.STATE)
-    n_awake_links: qd.Tensor = of_kind(DataKind.STATE)
-    awake_links: qd.Tensor = of_kind(DataKind.STATE)
     qpos0: qd.Tensor = of_kind(DataKind.INFO)
     qpos: qd.Tensor = of_kind(DataKind.STATE)
     qpos_next: qd.Tensor = of_kind(DataKind.SCRATCH)
@@ -321,11 +321,6 @@ def get_rigid_info(solver, kinematic_only):
             gravity=V_VEC(3, dtype=gs.qd_float, shape=()),
             meaninertia=V(dtype=gs.qd_float, shape=()),
             n_awake_dofs=V(dtype=gs.qd_int, shape=(_B,)),
-            n_awake_entities=V(dtype=gs.qd_int, shape=(_B,)),
-            n_awake_links=V(dtype=gs.qd_int, shape=(_B,)),
-            awake_dofs=V(dtype=gs.qd_int, shape=(solver.n_dofs_, _B)),
-            awake_entities=V(dtype=gs.qd_int, shape=(solver.n_entities_, _B)),
-            awake_links=V(dtype=gs.qd_int, shape=(solver.n_links_, _B)),
             qpos0=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B)),
             qpos=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B)),
             qpos_next=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B)),
@@ -369,11 +364,6 @@ def get_rigid_info(solver, kinematic_only):
         gravity=V_VEC(3, dtype=gs.qd_float, shape=(_B,)),
         meaninertia=V(dtype=gs.qd_float, shape=(_B,)),
         n_awake_dofs=V(dtype=gs.qd_int, shape=(_B,)),
-        n_awake_entities=V(dtype=gs.qd_int, shape=(_B,)),
-        n_awake_links=V(dtype=gs.qd_int, shape=(_B,)),
-        awake_dofs=V(dtype=gs.qd_int, shape=(solver.n_dofs_, _B)),
-        awake_entities=V(dtype=gs.qd_int, shape=(solver.n_entities_, _B)),
-        awake_links=V(dtype=gs.qd_int, shape=(solver.n_links_, _B)),
         qpos0=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B)),
         qpos=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B), needs_grad=requires_grad),
         qpos_next=V(dtype=gs.qd_float, shape=(solver.n_qs_, _B), needs_grad=requires_grad),
@@ -446,9 +436,9 @@ class IslandState:
     # Partition of the dof-carrying kinematic trees (see trees_root_idx in RigidInfo) into islands, the connected
     # components of the trees under the contact, equality and hibernation couplings, rebuilt every step by island.py.
     # trees_parent_idx is the union-find forest over the trees, trees_island_idx the island of each tree and
-    # links_island_idx that of each link, -1 for a dof-less tree and its links. link_slices maps an island to its slice
-    # of link_id, dof_slices to its slice of dof_id (island-local dof -> global dof, ascending unless the CPU skyline
-    # path reorders it by contact adjacency).
+    # links_island_idx that of each link, -1 for a static link and for a dof-less tree and its links. link_slices maps
+    # an island to its slice of link_id, dof_slices to its slice of dof_id (island-local dof -> global dof, ascending
+    # unless the CPU skyline path reorders it by contact adjacency).
     trees_parent_idx: qd.Tensor
     trees_island_idx: qd.Tensor
     links_island_idx: qd.Tensor
@@ -486,8 +476,8 @@ class IslandState:
     is_hibernated: qd.Tensor = of_kind(DataKind.STATE)
     hibernated_next_link: qd.Tensor = of_kind(DataKind.STATE)
     # (env, island) work-lists of the cooperative per-island factor+solve, one per island size class (see
-    # island_tile_caps): class c holds factor_worklist_size[c] items in its own region of the two index lists, of
-    # n_trees * _B slots each, in the order of the atomic reservation of the partition pass.
+    # island_tile_caps): class c holds its factor_worklist_size[c] awake islands in its own region of the two index
+    # lists, of n_trees * _B slots each, in the order of the atomic reservation of the partition pass.
     factor_worklist_i_b: qd.Tensor
     factor_worklist_i_island: qd.Tensor
     factor_worklist_size: qd.Tensor
@@ -921,10 +911,14 @@ def get_constraint_state(constraint_solver, solver, collider):
     # striding i_d in cooperative kernels become stride-1; the regression on 1T-per-(i_d, i_b) writers is patched on
     # a per-consumer basis under the same enable_cooperative_constraint_kernels flag.
     dof_vec_layout = (1, 0) if batch_first else None
-    # Rank-1 working vectors of the incremental Cholesky update, flattened slot-minor as [i_d * n_slots + i_u]: one
-    # slot per fused update on the CPU per-island path (func_rank_batch_update_island), a single slot elsewhere
-    # (indexing then reduces to [i_d]). Flat 2D so the buffer keeps the DOF-vec rank and layout on every backend.
-    nt_vec_n_slots = solver.rigid_config.hessian_rank_update_batch if constraint_solver.sparse_solve else 1
+    # Rank-1 working vectors of the incremental Cholesky update, flattened slot-minor as [i_d * n_slots + i_u]: one slot
+    # per fused update of the per-island factor (func_rank_batch_update_island), a single slot for the whole-env factor
+    # of a single-island scene (indexing then reduces to [i_d]). Flat 2D to keep the DOF-vec rank and layout everywhere.
+    nt_vec_n_slots = (
+        solver.rigid_config.hessian_rank_update_batch
+        if constraint_solver.sparse_solve or not solver.rigid_config.is_single_island
+        else 1
+    )
     # The noslip scratch holds one M^{-1} J^T column per env, or per lane of the 32-lane blocks of the cooperative sweep
     # (see kernel_noslip in noslip.py).
     is_noslip_active = solver._options.noslip_iterations > 0
@@ -2197,6 +2191,9 @@ class LinksState:
     cfrc_coupling_ang: qd.Tensor
     cfrc_coupling_vel: qd.Tensor
     contact_force: qd.Tensor
+    # Hibernation: is_hibernated flags a sleeping link, awake_steps counts the consecutive substeps an awake link has
+    # spent below the hibernation speed tolerance, up to hibernation_min_steps (see func_count_settled_step), zero
+    # again the step it exceeds the tolerance or wakes.
     is_hibernated: qd.Tensor = of_kind(DataKind.STATE)
     awake_steps: qd.Tensor = of_kind(DataKind.STATE)
 
@@ -2938,7 +2935,7 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
 
     @property
     def hessian_rank_update_batch(self) -> int:
-        """Number of rank-1 Cholesky updates fused into one column sweep by the CPU incremental factor.
+        """Number of rank-1 Cholesky updates fused into one column sweep by the per-island incremental factor.
 
         Sizes the nt_vec slots and the static per-column unroll of func_rank_batch_update_island: 8 amortizes the
         active-set flip batching, widened when the coupled elliptic-cone update must stage 2 slots per cone row
