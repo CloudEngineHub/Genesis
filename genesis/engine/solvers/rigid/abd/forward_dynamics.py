@@ -2271,18 +2271,23 @@ def func_count_settled_step(
 ):
     """Count this substep in the settled-step counter of awake link i_l of env i_b.
 
-    The counter (see awake_steps in array_class.py) grows, up to hibernation_min_steps, while the link's maximum dof
-    speed stays below the hibernation tolerance, and drops to zero the step it exceeds it. Each dof velocity is
-    weighted by dof_length (1 for translation, the swept radius for rotation), so the tolerance is
-    a single linear speed across mixed dofs: the rotational jitter of a small body produces a tiny surface speed and
-    counts as rest. The next velocity is read, the one the copy that follows makes current.
+    The counter (see awake_steps in array_class.py) grows, up to hibernation_min_steps, while the largest dof speed of
+    the link stays below the hibernation tolerance, and drops to zero the step it exceeds it. The speed of a dof is its
+    next velocity scaled by dof_length (1 for translation, the swept radius for rotation), so the tolerance is one
+    linear speed for every kind of dof: the rotational jitter of a small body is a tiny surface speed and counts as
+    rest. An actuated link stays awake, since the actuation pass wakes any sleeping link it actuates (see
+    func_torque_and_passive_force).
     """
     link_I = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
+    EPS = rigid_info.EPS[None]
     max_vel = gs.qd_float(0.0)
+    is_driven = False
     for i_d in range(dyn_info.links.dof_start[link_I], dyn_info.links.dof_end[link_I]):
         I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
         max_vel = qd.max(max_vel, dyn_info.dofs.dof_length[I_d] * qd.abs(dyn_state.dofs.vel_next[i_d, i_b]))
-    if max_vel < rigid_info.hibernation_thresh_vel[None]:
+        if qd.abs(dyn_state.dofs.qf_applied[i_d, i_b]) > EPS:
+            is_driven = True
+    if max_vel < rigid_info.hibernation_thresh_vel[None] and not is_driven:
         if dyn_state.links.awake_steps[i_l, i_b] < rigid_config.hibernation_min_steps:
             dyn_state.links.awake_steps[i_l, i_b] = dyn_state.links.awake_steps[i_l, i_b] + 1
     else:

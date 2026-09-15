@@ -5,7 +5,7 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 
 from ..abd.misc import func_wakeup_link
-from ..collider.contact import func_contact_order_key
+from ..collider.contact import func_contact_order_key, func_promote_woken_contacts
 
 
 # Partition the dof-carrying kinematic trees (see trees_root_idx in array_class.py) into islands: the connected
@@ -76,6 +76,7 @@ def func_equality_links(i_eq, i_b, n_links, dyn_info: array_class.DynInfo, rigid
 def func_edge_trees(
     i_e,
     i_b,
+    i_first_contact,
     n_contacts,
     n_equalities,
     collider_state: array_class.ColliderState,
@@ -84,8 +85,8 @@ def func_edge_trees(
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
-    """Trees coupled by edge i_e of one env: the contacts first, in contact_sort_idx order, then the equality
-    constraints, then (under hibernation) the chain successor of every link.
+    """Trees coupled by edge i_e of one env: the live contacts first, in contact_sort_idx order from i_first_contact,
+    then the equality constraints, then (under hibernation) the chain successor of every link.
 
     Either tree is -1 when the edge couples no two dof-carrying trees: a contact against a fixed body, a link with no
     chain successor.
@@ -94,7 +95,7 @@ def func_edge_trees(
     link_a = -1
     link_b = -1
     if i_e < n_contacts:
-        i_col = collider_state.contact_sort_idx[i_e, i_b]
+        i_col = collider_state.contact_sort_idx[i_first_contact + i_e, i_b]
         link_a = collider_state.contact_data.link_a[i_col, i_b]
         link_b = collider_state.contact_data.link_b[i_col, i_b]
     elif i_e < n_contacts + n_equalities:
@@ -303,13 +304,15 @@ def func_build_islands(
     tree. Each island then lists its dofs (the trees in ascending order, the dofs of each in ascending order, so an
     island's dofs ascend) and, under hibernation, which alone reads them, its links, and holds its inertia (the trace
     of the mass matrix over its dofs, the scale of its convergence tests) and, under hibernation, its sleeping flag.
-    The sleepers of an island an awake body reaches wake here, and a settled island falls asleep after the solve
-    (func_hibernate_island_if_settled). The CPU skyline path then reorders each island's dofs by contact adjacency,
-    see func_reorder_island_dofs.
+    The sleepers of an island an awake body reaches wake here, with their kept contacts (func_promote_woken_contacts).
+    A settled island falls asleep after the solve (func_hibernate_island_if_settled). The caller sorts the live contacts
+    and, on the CPU skyline path, reorders each island's dofs by contact adjacency (func_reorder_island_dofs).
     """
     n_trees = rigid_info.trees_root_idx.shape[0]
     n_links = rigid_info.links_tree_idx.shape[0]
-    n_contacts = collider_state.n_contacts[i_b]
+    # The live contacts follow the kept ones of the sleepers (see n_contacts_hibernated in array_class.py)
+    n_first_contact = collider_state.n_contacts_hibernated[i_b]
+    n_contacts = collider_state.n_contacts[i_b] - n_first_contact
     n_equalities = constraint_state.qd_n_equalities[i_b]
     n_edges = n_contacts + n_equalities
     # An env with no sleeper (see n_awake_dofs in array_class.py) has no chain edge to union, no island flag to derive
@@ -324,7 +327,16 @@ def func_build_islands(
         constraint_state.island.trees_parent_idx[i_t, i_b] = i_t
     for i_e in range(n_edges):
         i_ta, i_tb = func_edge_trees(
-            i_e, i_b, n_contacts, n_equalities, collider_state, constraint_state, dyn_info, rigid_info, rigid_config
+            i_e,
+            i_b,
+            n_first_contact,
+            n_contacts,
+            n_equalities,
+            collider_state,
+            constraint_state,
+            dyn_info,
+            rigid_info,
+            rigid_config,
         )
         if i_ta >= 0 and i_tb >= 0:
             func_union_trees(i_ta, i_tb, i_b, constraint_state)
@@ -410,16 +422,16 @@ def func_build_islands(
                 i_island = constraint_state.island.links_island_idx[i_l, i_b]
                 if i_island >= 0 and not dyn_state.links.is_hibernated[i_l, i_b]:
                     constraint_state.island.is_hibernated[i_island, i_b] = 0
+            n_awake_dofs_before = rigid_info.n_awake_dofs[i_b]
             for i_l in range(n_links):
                 i_island = constraint_state.island.links_island_idx[i_l, i_b]
                 if i_island >= 0 and constraint_state.island.is_hibernated[i_island, i_b] == 0:
                     func_wakeup_link(i_l, i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
+            if rigid_info.n_awake_dofs[i_b] != n_awake_dofs_before:
+                func_promote_woken_contacts(i_b, dyn_state, collider_state)
         else:
             for i_island in range(n_islands):
                 constraint_state.island.is_hibernated[i_island, i_b] = 0
-
-    if qd.static(rigid_config.sparse_solve):
-        func_reorder_island_dofs(i_b, collider_state, constraint_state, rigid_info)
 
 
 @qd.func
@@ -430,8 +442,8 @@ def func_build_single_island(
 
     The lists are the identity and the island's inertia the trace of the mass matrix. Reserved for scenes off the CPU
     skyline path, which alone reads the tree labels the full build resolves (see _sort_contacts_and_build_islands in
-    solver.py). Under hibernation the island is awake and lists the links of the one tree, which the sleep decision
-    and the wake paths read (see func_hibernate_island_if_settled). An env holding a sleeper takes the full build.
+    solver.py). Under hibernation the island is awake and its link list, written once at build (see
+    ConstraintSolver.__init__), stands. An env holding a sleeper takes the full build.
     """
     n_dofs = constraint_state.island.dof_id.shape[0]
     constraint_state.island.n_islands[i_b] = 1
@@ -447,26 +459,7 @@ def func_build_single_island(
         inertia = inertia + rigid_info.mass_mat[i_d, i_d, i_b]
     constraint_state.island.inertia[0, i_b] = inertia
     if qd.static(rigid_config.use_hibernation):
-        func_list_single_island_links(i_b, constraint_state, rigid_info)
-
-
-@qd.func
-def func_list_single_island_links(
-    i_b, constraint_state: array_class.ConstraintState, rigid_info: array_class.RigidInfo
-):
-    """List the links of the one tree of a single-island scene as the awake island's links, in index order (see
-    func_build_single_island)."""
-    n_links = rigid_info.links_tree_idx.shape[0]
-    n_island_links = 0
-    for i_l in range(n_links):
-        if rigid_info.links_tree_idx[i_l] == 0:
-            constraint_state.island.links_island_idx[i_l, i_b] = 0
-            constraint_state.island.link_id[n_island_links, i_b] = i_l
-            n_island_links = n_island_links + 1
-    constraint_state.island.link_slices.start[0, i_b] = 0
-    constraint_state.island.link_slices.n[0, i_b] = n_island_links
-    constraint_state.island.link_slices.curr[0, i_b] = n_island_links
-    constraint_state.island.is_hibernated[0, i_b] = 0
+        constraint_state.island.is_hibernated[0, i_b] = 0
 
 
 @qd.func
@@ -488,7 +481,7 @@ def func_build_single_island_coop(
         constraint_state.island.dof_slices.curr[0, i_b] = n_dofs
         constraint_state.island.dof_range_start[0, i_b] = 0
         if qd.static(rigid_config.use_hibernation):
-            func_list_single_island_links(i_b, constraint_state, rigid_info)
+            constraint_state.island.is_hibernated[0, i_b] = 0
     inertia = gs.qd_float(0.0)
     i_d = tid
     while i_d < n_dofs:
@@ -538,7 +531,9 @@ def func_build_islands_coop(
     n_trees = rigid_info.trees_root_idx.shape[0]
     n_links = rigid_info.links_tree_idx.shape[0]
     n_dofs = constraint_state.island.dof_id.shape[0]
-    n_contacts = collider_state.n_contacts[i_b]
+    # The live contacts follow the kept ones of the sleepers (see n_contacts_hibernated in array_class.py)
+    n_first_contact = collider_state.n_contacts_hibernated[i_b]
+    n_contacts = collider_state.n_contacts[i_b] - n_first_contact
     n_equalities = constraint_state.qd_n_equalities[i_b]
     n_edges = n_contacts + n_equalities
     # Every lane reads the env's sleeper gate, see func_build_islands
@@ -566,7 +561,16 @@ def func_build_islands_coop(
         i_e = tid
         while i_e < n_edges:
             i_ta, i_tb = func_edge_trees(
-                i_e, i_b, n_contacts, n_equalities, collider_state, constraint_state, dyn_info, rigid_info, rigid_config
+                i_e,
+                i_b,
+                n_first_contact,
+                n_contacts,
+                n_equalities,
+                collider_state,
+                constraint_state,
+                dyn_info,
+                rigid_info,
+                rigid_config,
             )
             if i_ta >= 0 and i_tb >= 0:
                 root_a = func_tree_component(i_ta, i_b, constraint_state)
@@ -711,12 +715,16 @@ def func_build_islands_coop(
                     constraint_state.island.is_hibernated[i_island, i_b] = 0
                 i_l = i_l + _K
             qd.simt.block.sync()
+            n_awake_dofs_before = rigid_info.n_awake_dofs[i_b]
             i_l = tid
             while i_l < n_links:
                 i_island = constraint_state.island.links_island_idx[i_l, i_b]
                 if i_island >= 0 and constraint_state.island.is_hibernated[i_island, i_b] == 0:
                     func_wakeup_link(i_l, i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
                 i_l = i_l + _K
+            qd.simt.block.sync()
+            if tid == 0 and rigid_info.n_awake_dofs[i_b] != n_awake_dofs_before:
+                func_promote_woken_contacts(i_b, dyn_state, collider_state)
         else:
             i_island = tid
             while i_island < n_islands:
@@ -801,12 +809,14 @@ def func_reorder_island_dofs(
     """
     n_trees = rigid_info.trees_root_idx.shape[0]
     n_islands = constraint_state.island.n_islands[i_b]
+    n_first_contact = collider_state.n_contacts_hibernated[i_b]
     n_contacts = collider_state.n_contacts[i_b]
 
-    # Per-island contact lists (island -> contact ranges in contact_id), in contact_sort_idx order
+    # Per-island contact lists (island -> contact ranges in contact_id) over the live contacts, in contact_sort_idx
+    # order
     for i_island in range(n_islands):
         constraint_state.island.contact_slices.n[i_island, i_b] = 0
-    for i_c in range(n_contacts):
+    for i_c in range(n_first_contact, n_contacts):
         i_island = func_contact_island(collider_state.contact_sort_idx[i_c, i_b], i_b, collider_state, constraint_state)
         if i_island >= 0:
             constraint_state.island.contact_slices.n[i_island, i_b] = (
@@ -817,7 +827,7 @@ def func_reorder_island_dofs(
         constraint_state.island.contact_slices.start[i_island, i_b] = contact_list_start
         constraint_state.island.contact_slices.curr[i_island, i_b] = contact_list_start
         contact_list_start = contact_list_start + constraint_state.island.contact_slices.n[i_island, i_b]
-    for i_c in range(n_contacts):
+    for i_c in range(n_first_contact, n_contacts):
         i_col = collider_state.contact_sort_idx[i_c, i_b]
         i_island = func_contact_island(i_col, i_b, collider_state, constraint_state)
         if i_island >= 0:
@@ -948,7 +958,8 @@ def func_sort_contacts_coop(
     """
     _K = qd.static(32)
     n = collider_state.n_contacts[i_b]
-    i_c = tid
+    n_first = collider_state.n_contacts_hibernated[i_b]
+    i_c = n_first + tid
     while i_c < n:
         i_col = collider_state.contact_sort_idx[i_c, i_b]
         geom_b = collider_state.contact_data.geom_b[i_col, i_b]
@@ -960,14 +971,14 @@ def func_sort_contacts_coop(
         collider_state.contact_sort_key[i_c, i_b] = func_contact_order_key(pos)
         i_c = i_c + _K
     qd.simt.block.sync()
-    i_c = tid
+    i_c = n_first + tid
     while i_c < n:
         i_col = constraint_state.island.contact_id[i_c, i_b]
         geom_a = collider_state.contact_data.geom_a[i_col, i_b]
         geom_b = collider_state.contact_data.geom_b[i_col, i_b]
         key = collider_state.contact_sort_key[i_c, i_b]
-        rank = 0
-        for j_c in range(n):
+        rank = n_first
+        for j_c in range(n_first, n):
             j_col = constraint_state.island.contact_id[j_c, i_b]
             geom_a_j = collider_state.contact_data.geom_a[j_col, i_b]
             precedes = geom_a_j < geom_a
@@ -988,6 +999,7 @@ def func_sort_contacts_coop(
 def func_sort_contacts(
     i_b,
     contact_idx: qd.Tensor,
+    i_first,
     n,
     contacts_pos: qd.Tensor,
     contacts_geom_a: qd.Tensor,
@@ -995,7 +1007,7 @@ def func_sort_contacts(
     geoms_pos: qd.Tensor,
     geoms_quat: qd.Tensor,
 ):
-    """Insertion-sort the contact indices contact_idx[0 : n] of one env by a deterministic total order.
+    """Insertion-sort the contact indices contact_idx[i_first : n] of one env by a deterministic total order.
 
     The order is (geom_a, geom_b, then the contact position along one direction in geom_b's own frame), a pure function
     of contact data, so it is independent of the racy atomic_add narrowphase layout. The position is taken in that frame
@@ -1008,7 +1020,7 @@ def func_sort_contacts(
     contact_idx is collider_state.contact_sort_idx; the contact-data tensors are passed as leaves rather than the whole
     collider_state struct so that it can be sorted in place without the struct-expansion aliasing its own field.
     """
-    for i_s in range(1, n):
+    for i_s in range(i_first + 1, n):
         i_p = contact_idx[i_s, i_b]
         geom_a_p = contacts_geom_a[i_p, i_b]
         geom_b_p = contacts_geom_b[i_p, i_b]
@@ -1016,7 +1028,7 @@ def func_sort_contacts(
             contacts_pos[i_p, i_b] - geoms_pos[geom_b_p, i_b], geoms_quat[geom_b_p, i_b]
         )
         j_s = i_s - 1
-        while j_s >= 0:
+        while j_s >= i_first:
             i_q = contact_idx[j_s, i_b]
             geom_a_q = contacts_geom_a[i_q, i_b]
             geom_b_q = contacts_geom_b[i_q, i_b]
