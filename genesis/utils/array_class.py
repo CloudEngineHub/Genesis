@@ -231,13 +231,11 @@ class RigidInfo:
     qpos: qd.Tensor = of_kind(DataKind.STATE)
     qpos_next: qd.Tensor = of_kind(DataKind.SCRATCH)
     links_T: qd.Tensor = of_kind(DataKind.DERIVED)
-    envs_offset: qd.Tensor
     geoms_init_AABB: qd.Tensor
     mass_mat: qd.Tensor = of_kind(DataKind.DERIVED)
     mass_mat_L: qd.Tensor = of_kind(DataKind.DERIVED)
     mass_mat_D_inv: qd.Tensor = of_kind(DataKind.DERIVED)
     mass_mat_tiled_scratch: qd.Tensor = of_kind(DataKind.SCRATCH)
-    mass_mat_mask: qd.Tensor = of_kind(DataKind.STATE)
     # Kinematic roots: the links sharing a root link (links.root_idx), static ones included. A root spans the links
     # [root, links_root_end[root]) whose root it is (a span may interleave links of other roots, so the walks gate each
     # link on its root). The composite inertia and the center of mass are per root.
@@ -246,24 +244,22 @@ class RigidInfo:
     # Kinematic trees: the links a chain of moving joints connects, so a static link belongs to none (links_tree_idx
     # -1) and each branch of a fixed base is a tree. Tree i_t is rooted at trees_root_idx[i_t], spans the links
     # [trees_root_idx[i_t], trees_link_end[i_t]) mapped to it and the contiguous dofs [trees_dof_start[i_t],
-    # trees_dof_start[i_t] + trees_n_dofs[i_t]), in ascending dof order. The islands are built on the trees.
+    # trees_dof_start[i_t] + trees_n_dofs[i_t]), in ascending dof order. The islands are built on the trees. A scene
+    # without any tree keeps one padded slot at root 0 and link end 0, so every tree walk is empty.
     trees_root_idx: qd.Tensor
     trees_link_end: qd.Tensor
     trees_n_links: qd.Tensor
     trees_dof_start: qd.Tensor
     trees_n_dofs: qd.Tensor
     links_tree_idx: qd.Tensor
-    # Per-DOF bounds of the mass block the DOF belongs to: the DOFs of its branch rooted where the fixed structure
-    # ends (deeper branches stay mass-coupled to their chain and belong to the enclosing block), merged across
-    # entities and kept contiguous by attach(). The assemble/factor/solve restrict to these bounds.
+    # Per-DOF bounds of the mass block the DOF belongs to: the DOFs of its branch rooted where the fixed structure ends
+    # (deeper branches stay mass-coupled to their chain and belong to the enclosing block), merged across entities and
+    # kept contiguous by attach(). A block lies within one kinematic tree, whose dof range the blocks partition (an
+    # aligned free body splits into one block per dof), so the assemble/factor/solve walk the blocks of a tree and
+    # restrict to these bounds.
     dofs_mass_block_start: qd.Tensor
     dofs_mass_block_end: qd.Tensor
     dofs_mass_envelope_start: qd.Tensor
-    # DOF range spanned by the mass blocks rooted in each entity: a leading run merged into an earlier-rooted block is
-    # excluded, and the last rooted block may extend into a merged child (empty range for a fully-merged child). Lets
-    # the per-entity assemble/factor/solve iterate their blocks as one flat, autodiff-compatible loop over DOFs.
-    entities_mass_block_dof_start: qd.Tensor
-    entities_mass_block_dof_end: qd.Tensor
     # Mask of the (dof, dof) pairs the mass matrix couples: a dof with its ancestors along the kinematic chain and
     # the dofs of its own link, within its mass block.
     mass_parent_mask: qd.Tensor
@@ -317,7 +313,6 @@ def get_rigid_info(solver, kinematic_only):
     # FIXME: Add a better split between kinematic and Genesis
     if kinematic_only:
         return RigidInfo(
-            envs_offset=V_VEC(3, dtype=gs.qd_float, shape=(_B,)),
             gravity=V_VEC(3, dtype=gs.qd_float, shape=()),
             meaninertia=V(dtype=gs.qd_float, shape=()),
             n_awake_dofs=V(dtype=gs.qd_int, shape=(_B,)),
@@ -330,7 +325,6 @@ def get_rigid_info(solver, kinematic_only):
             mass_mat_L=V(dtype=gs.qd_float, shape=()),
             mass_mat_D_inv=V(dtype=gs.qd_float, shape=()),
             mass_mat_tiled_scratch=V(dtype=gs.qd_float, shape=()),
-            mass_mat_mask=V(dtype=gs.qd_bool, shape=()),
             roots_link_idx=V(dtype=gs.qd_int, shape=(solver.n_roots_,)),
             links_root_end=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
             trees_root_idx=V(dtype=gs.qd_int, shape=(solver.n_trees_,)),
@@ -342,8 +336,6 @@ def get_rigid_info(solver, kinematic_only):
             dofs_mass_block_start=V(dtype=gs.qd_int, shape=()),
             dofs_mass_block_end=V(dtype=gs.qd_int, shape=()),
             dofs_mass_envelope_start=V(dtype=gs.qd_int, shape=()),
-            entities_mass_block_dof_start=V(dtype=gs.qd_int, shape=()),
-            entities_mass_block_dof_end=V(dtype=gs.qd_int, shape=()),
             mass_parent_mask=V(dtype=gs.qd_float, shape=()),
             substep_dt=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0),
             iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=0),
@@ -360,7 +352,6 @@ def get_rigid_info(solver, kinematic_only):
         )
 
     return RigidInfo(
-        envs_offset=V_VEC(3, dtype=gs.qd_float, shape=(_B,)),
         gravity=V_VEC(3, dtype=gs.qd_float, shape=(_B,)),
         meaninertia=V(dtype=gs.qd_float, shape=(_B,)),
         n_awake_dofs=V(dtype=gs.qd_int, shape=(_B,)),
@@ -373,7 +364,6 @@ def get_rigid_info(solver, kinematic_only):
         mass_mat_L=V(dtype=gs.qd_float, shape=mass_mat_shape, needs_grad=requires_grad),
         mass_mat_D_inv=V(dtype=gs.qd_float, shape=(solver.n_dofs_, _B), needs_grad=requires_grad),
         mass_mat_tiled_scratch=V(dtype=gs.qd_float, shape=mass_mat_tiled_scratch_shape),
-        mass_mat_mask=V(dtype=gs.qd_bool, shape=(solver.n_entities_, _B)),
         roots_link_idx=V(dtype=gs.qd_int, shape=(solver.n_roots_,)),
         links_root_end=V(dtype=gs.qd_int, shape=(solver.n_links_,)),
         trees_root_idx=V(dtype=gs.qd_int, shape=(solver.n_trees_,)),
@@ -385,8 +375,6 @@ def get_rigid_info(solver, kinematic_only):
         dofs_mass_block_start=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
         dofs_mass_block_end=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
         dofs_mass_envelope_start=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
-        entities_mass_block_dof_start=V(dtype=gs.qd_int, shape=(solver.n_entities_,)),
-        entities_mass_block_dof_end=V(dtype=gs.qd_int, shape=(solver.n_entities_,)),
         mass_parent_mask=V(dtype=gs.qd_float, shape=(solver.n_dofs_, solver.n_dofs_)),
         substep_dt=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._substep_dt),
         iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=solver._options.iterations),
@@ -2092,6 +2080,11 @@ class DofsState:
     acc_smooth_bw: qd.Tensor
     qf_smooth: qd.Tensor
     qf_constraint: qd.Tensor
+    # Implicit damping correction (see func_implicit_damping in forward_dynamics.py): qf_damping_implicit holds the
+    # implicit share of the damping force, h D qacc for the diagonal D the damped mass factor adds, and
+    # qacc_damping_implicit the correction (M + hD)^-1 h D qacc subtracted from the acceleration.
+    qf_damping_implicit: qd.Tensor = of_kind(DataKind.SCRATCH)
+    qacc_damping_implicit: qd.Tensor = of_kind(DataKind.SCRATCH)
     cdof_ang: qd.Tensor
     cdof_vel: qd.Tensor
     cdofvel_ang: qd.Tensor
@@ -2128,6 +2121,8 @@ def get_dofs_state(solver):
         acc_smooth_bw=V(dtype=gs.qd_float, shape=shape_bw, needs_grad=requires_grad),
         qf_smooth=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
         qf_constraint=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
+        qf_damping_implicit=V(dtype=gs.qd_float, shape=shape),
+        qacc_damping_implicit=V(dtype=gs.qd_float, shape=shape),
         cdof_ang=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         cdof_vel=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         cdofvel_ang=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
