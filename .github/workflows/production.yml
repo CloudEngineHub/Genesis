@@ -156,13 +156,16 @@ jobs:
             }
             const workflowPath = `${process.env.WORKFLOW_REPOSITORY}/${process.env.WORKFLOW_FILE_PATH}`;
 
-            const groups = await github.paginate(github.rest.actions.listSelfHostedRunnerGroupsForOrg, { org });
+            // The endpoints of the runner groups have no method in the client, so they are requested by route.
+            const groups = await github.paginate('GET /orgs/{org}/actions/runner-groups', { org });
             const group = groups.find((group) => group.name === process.env.RUNNER_GROUP);
             if (!group) {
-              throw new Error(`Runner group '${process.env.RUNNER_GROUP}' is missing from organization '${org}'.`);
+              const groupNames = groups.map((group) => `'${group.name}'`).join(', ') || 'none';
+              throw new Error(`Runner group '${process.env.RUNNER_GROUP}' is missing from organization '${org}'. `
+                + `Runner groups visible to the token: ${groupNames}.`);
             }
             const repos = group.visibility === 'selected'
-              ? await github.paginate(github.rest.actions.listRepoAccessToSelfHostedRunnerGroupInOrg, {
+              ? await github.paginate('GET /orgs/{org}/actions/runner-groups/{runner_group_id}/repositories', {
                   org, runner_group_id: group.id,
                 })
               : await github.paginate(github.rest.repos.listForOrg, { org, type: 'all' });
