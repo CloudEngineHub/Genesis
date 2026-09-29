@@ -2,12 +2,15 @@ import dataclasses
 import math
 from collections.abc import Iterable, Iterator, Mapping
 from enum import IntEnum
-from typing import ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
-import quadrants as qd
-from typing_extensions import dataclass_transform  # Made it into standard lib from Python 3.12
 import numpy as np
 import torch
+
+from typing_extensions import dataclass_transform  # Made it into standard lib from Python 3.12
+
+import quadrants as qd
+from quadrants.lang import impl
 
 import genesis as gs
 from genesis.utils.misc import qd_to_torch
@@ -73,9 +76,44 @@ class AutoInitMeta(type):
         return super().__new__(cls, name, bases, namespace)
 
 
+# FIXME: quadrants#941 - a Python-scope fill of a field still being declared closes its SNode tree, one tree per filled
+# constant. 'V_SCALAR_FROM' defers it to the next materialization instead, at the cost of one synchronization there.
+_pending_fields_fill: list[tuple[qd.Tensor, Any]] = []
+_materialize = impl.PyQuadrants.materialize
+_clear = impl.PyQuadrants.clear
+
+
+def _materialize_then_fill(self):
+    _materialize(self)
+    # The list is emptied before replaying it, since each fill launches a kernel that materializes again. The replay
+    # ends with a synchronization because a DLPack export materializes right before handing out its buffer, which
+    # leaves its caller no chance to synchronize between the fill and the first read.
+    fields_fill = _pending_fields_fill.copy()
+    _pending_fields_fill.clear()
+    for tensor, value in fields_fill:
+        tensor.fill(value)
+    if fields_fill:
+        self.prog.synchronize()
+
+
+def _clear_then_drop_fills(self):
+    _clear(self)
+    _pending_fields_fill.clear()
+
+
+impl.PyQuadrants.materialize = _materialize_then_fill
+impl.PyQuadrants.clear = _clear_then_drop_fills
+
+
 def V_SCALAR_FROM(dtype, value):
     data = V(dtype=dtype, shape=())
-    data.fill(value)
+    # Filling a field now would close the SNode tree still collecting fields, so the fill waits for the next
+    # materialization (see quadrants#941 above). An ndarray is filled right away: its zero-copy export runs no
+    # materialization on CPU and CUDA, so a deferred value could be read before its fill.
+    if _tensor_backend() == qd.Backend.FIELD:
+        _pending_fields_fill.append((data, value))
+    else:
+        data.fill(value)
     return data
 
 
@@ -853,7 +891,7 @@ class ConstraintState:
     graph_counter: qd.types.ndarray()
     early_exit_flag: qd.Tensor
     # Scratch of the noslip sweep (empty when noslip is off): M^{-1} J^T of the row being updated, in the column of the
-    # env, or of the lane of the cooperative sweep at [i_d, i_b * 32 + tid] (see kernel_noslip in noslip.py).
+    # env, or of the lane of the cooperative sweep at [i_d, i_b * 32 + tid] (see func_noslip in noslip.py).
     noslip_MinvJT: qd.Tensor
     # Row coloring of the cooperative noslip sweep (empty otherwise, see func_color_rows_batch in noslip.py): the color
     # of each row, the color count of each island and the next free color of the mass block starting at each dof.
@@ -910,7 +948,7 @@ def get_constraint_state(constraint_solver, solver, collider):
     newton_dof_vec_layout = dof_vec_layout if is_newton else None
     newton_serial_layout = serial_layout if is_newton else None
     # The noslip scratch holds one M^{-1} J^T column per env, or per lane of the 32-lane blocks of the cooperative sweep
-    # (see kernel_noslip in noslip.py).
+    # (see func_noslip in noslip.py).
     is_noslip_active = solver._options.noslip_iterations > 0
     is_noslip_cooperative = solver.rigid_config.enable_cooperative_noslip
     noslip_n_lanes = 32 if is_noslip_cooperative else 1
@@ -1434,6 +1472,7 @@ class MPRInfo:
     CCD_EPS: qd.Tensor
     CCD_TOLERANCE: qd.Tensor
     CCD_ITERATIONS: qd.Tensor
+    CCD_EXTRAPOLATION_TOL: qd.Tensor
 
 
 def get_mpr_info(**kwargs):
@@ -1441,6 +1480,7 @@ def get_mpr_info(**kwargs):
         CCD_EPS=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["CCD_EPS"]),
         CCD_TOLERANCE=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["CCD_TOLERANCE"]),
         CCD_ITERATIONS=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["CCD_ITERATIONS"]),
+        CCD_EXTRAPOLATION_TOL=V_SCALAR_FROM(dtype=gs.qd_float, value=kwargs["CCD_EXTRAPOLATION_TOL"]),
     )
 
 
@@ -2916,7 +2956,7 @@ class RigidSimStaticConfig(metaclass=AutoInitMeta):
     enable_cooperative_constraint_kernels: bool = False
     # When True, the noslip sweep of an island runs on a block of 32 lanes: the island's rows are colored so that the
     # rows of a color touch disjoint mass blocks, the lanes update the rows of a color in parallel and the colors are
-    # swept in order (see kernel_noslip in noslip.py). The rows are visited in another order than by the one-thread
+    # swept in order (see func_noslip in noslip.py). The rows are visited in another order than by the one-thread
     # sweep, so the two sweeps give different iterates. See the rigid solver's resolution for the gating.
     enable_cooperative_noslip: bool = False
     # Purely descriptive layout flag: True whenever the layout-flippable constraint-state tensors are physically

@@ -71,7 +71,14 @@ class SupportField:
             init_pos = self.solver.dyn_info.verts.init_pos.to_numpy()
             geoms_vert_start = self.solver.dyn_info.geoms.vert_start.to_numpy()
             geoms_vert_end = self.solver.dyn_info.geoms.vert_end.to_numpy()
-            for i_g in range(self.solver.n_geoms):
+            for i_g, geom in enumerate(self.solver.geoms):
+                support_cell_start.append(n_support_cells)
+
+                # The support of a terrain is read off the prism built from its height field, so its table would never
+                # be read. Its vertex count (one per height field sample) would make it the costliest table to build.
+                if geom.type == gs.GEOM_TYPE.TERRAIN:
+                    continue
+
                 this_pos = init_pos[geoms_vert_start[i_g] : geoms_vert_end[i_g]]
 
                 window_size = int(5e8 // this_pos.shape[0])
@@ -84,18 +91,18 @@ class SupportField:
 
                 support = this_pos[max_indices]
 
-                support_cell_start.append(n_support_cells)
                 support_v.append(support)
                 support_vid.append(max_indices)
                 n_support_cells += support.shape[0]
 
+        if n_support_cells > 0:
             support_v = np.concatenate(support_v)
             support_vid = np.concatenate(support_vid, dtype=gs.np_int)
             support_cell_start = np.array(support_cell_start, dtype=gs.np_int)
         else:
             support_v = np.zeros((1, 3), dtype=gs.np_float)
             support_vid = np.zeros((1,), dtype=gs.np_int)
-            support_cell_start = np.zeros((1,), dtype=gs.np_int)
+            support_cell_start = np.zeros((max(self.solver.n_geoms, 1),), dtype=gs.np_int)
 
         self._support_field_info = array_class.get_support_field_info(
             self.solver.n_geoms, n_support_cells, self._support_res
