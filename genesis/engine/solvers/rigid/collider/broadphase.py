@@ -259,6 +259,9 @@ def _func_broad_phase_sap(
                                     collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
                                 continue
 
+                            if n_broad == collider_info.max_collision_pairs_broad[None]:
+                                errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
+                                break
                             collider_state.broad_collision_pairs[n_broad, i_b][0] = i_ga
                             collider_state.broad_collision_pairs[n_broad, i_b][1] = i_gb
                             n_broad = n_broad + 1
@@ -294,6 +297,9 @@ def _func_broad_phase_sap(
                                         collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
                                     continue
 
+                                if n_broad == collider_info.max_collision_pairs_broad[None]:
+                                    errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
+                                    break
                                 collider_state.broad_collision_pairs[n_broad, i_b][0] = i_ga
                                 collider_state.broad_collision_pairs[n_broad, i_b][1] = i_gb
                                 n_broad = n_broad + 1
@@ -358,7 +364,7 @@ def _func_broad_phase_all_vs_all(
         collider_state.n_broad_pairs[i_b] = 0
 
     n_valid_pairs = collider_info.n_valid_pairs[None]
-    qd.loop_config(name="traverse_valid")
+    qd.loop_config(name="traverse_valid", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for i_vp, i_b in qd.ndrange(n_valid_pairs, _B):
         pair = collider_info.valid_collision_pairs[i_vp]
         i_ga = pair[0]
