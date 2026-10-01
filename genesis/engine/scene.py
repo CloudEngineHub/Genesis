@@ -9,6 +9,7 @@ import sys
 import weakref
 import zipfile
 from collections import Counter
+from functools import cached_property
 from typing import BinaryIO, Callable, Iterable, Literal, NamedTuple, TYPE_CHECKING, overload
 
 import numpy as np
@@ -111,8 +112,8 @@ def description_digest(desc: SceneDescription) -> str:
     'Scene.load' replaces. Two scenes sharing the digest allocate the same state, so a record of one restores into the
     other. The Genesis version and sources are left out, so a record survives the code moving on.
 
-    The digest exports the description in memory, meshes included, so it is taken once per built scene and once per
-    trajectory opened, never per restore.
+    The digest exports the description in memory, meshes included, so a scene takes it on its first save or restore
+    and keeps it, and a trajectory takes it once when opened.
     """
     defaults = SceneOptions()
     visual = {
@@ -264,7 +265,6 @@ class Scene(RBC):
 
         self._uid = gs.UID()
         self._is_built = False
-        self._desc_digest: str | None = None
         self._pre_step_callbacks: list = []
 
         gs.logger.info(f"Scene ~~~<{self._uid}>~~~ created.")
@@ -872,8 +872,6 @@ class Scene(RBC):
             # reset state
             self._reset()
 
-            # The description is fixed once built, so its digest is taken once (see 'description_digest')
-            self._desc_digest = description_digest(self._desc)
             self._is_built = True
 
         with gs.logger.timer("Compiling simulation kernels..."):
@@ -1956,6 +1954,11 @@ class Scene(RBC):
         scene rather than the state it has simulated to.
         """
         return self._desc
+
+    @cached_property
+    def _desc_digest(self) -> str:
+        """The digest of this scene's description (see 'description_digest'), which a saved state must share."""
+        return description_digest(self._desc)
 
     def get_entity(self, name: str | None = None, *, uid: str | None = None) -> "Entity":
         """
