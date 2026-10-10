@@ -25,7 +25,7 @@ from .contact import (
     func_rotate_frame,
     func_set_contact,
 )
-from .utils import func_point_in_geom_aabb
+from .utils import func_closest_points_on_segments, func_is_discrete_geoms, func_point_in_geom_aabb
 
 
 @qd.func
@@ -522,12 +522,12 @@ def func_add_polytope_vertex_contacts_sdf(
                 # the actual overlap rather than just the radial gap.
                 if is_closing_regime and pen_v > 0.0 and approach_depth_pair > pen_emit:
                     pen_emit = approach_depth_pair
-                repeated = False
+                is_repeated = False
                 for j in range(n_added):
                     idx_prev = collider_state.n_contacts[i_b] - 1 - j
                     if (contact_pos_v - collider_state.contact_data.pos[idx_prev, i_b]).norm() < tolerance:
-                        repeated = True
-                if not repeated and pen_emit > 0.0:
+                        is_repeated = True
+                if not is_repeated and pen_emit > 0.0:
                     # Snap the contact position onto A's smooth surface when A is a smooth primitive
                     # (SPHERE/ELLIPSOID/CAPSULE). The tessellation vertex sits an O(tessellation chord error) inboard
                     # of the true surface; on a settled static contact that offset becomes a torque arm and drives a
@@ -1548,6 +1548,7 @@ def func_recompute_perturbed_contact(
     contact_pos: qd.types.vector(3),
     normal_0: qd.types.vector(3),
     contact_pos_0: qd.types.vector(3),
+    penetration_0: float,
     qrot: qd.types.vector(4),
     ga_pos_original: qd.types.vector(3),
     ga_quat_original: qd.types.vector(4),
@@ -1559,126 +1560,215 @@ def func_recompute_perturbed_contact(
     rigid_info: array_class.RigidInfo,
     collider_info: array_class.ColliderInfo,
     rigid_config: qd.template(),
+    geom_pair_scale: float,
     used_gjk: bool,
+    used_gjk_0: bool,
 ):
     """
-    Recompute a perturbed multi-contact point exactly, by un-rotating the portal the perturbed detection found.
+    Project a contact found on the perturbed geoms onto the contact patch of contact 0.
 
-    Multi-contact spreads contact points by detecting collisions on slightly rotated copies of the two geometries.
-    The contact normal and penetration must be recovered for the unperturbed configuration. The contact normal is a
-    property of the Minkowski difference (both geometries), so neither geom's surface normal alone captures it.
-    Instead the MPR portal - the triangle of support-point pairs bounding the contact - is un-rotated back to the
-    unperturbed pose (each support point by the inverse of its own geom's perturbation), and the face normal of the
-    resulting Minkowski triangle gives the exact contact normal, with the penetration as the portal's distance to the
-    Minkowski origin. The position comes last, from the recovered normal and penetration, since only those say how far
-    apart the two surfaces are.
+    Every contact of the convex pair takes the normal 'normal_0' of contact 0. The witnesses of the perturbed
+    detection, un-rotated by the perturbation 'qrot' of their own geom (geom A by 'qrot', geom B by its inverse), are
+    exact material points of the unperturbed geoms. The depth is measured along 'normal_0' at the witness standing on
+    the feature of the contact: exact where two edges cross, at the end that the tilt deepens for an edge lying on a
+    face, bounded from below by the support triangle of the other geom (or the plane) where it covers the witness, and
+    otherwise read off the tangent plane of the other geom.
+
+    A contact of negative depth, past the edge of the patch, moves towards contact 0 'contact_pos_0' of depth
+    'penetration_0' to where the depth interpolated between both vanishes, and is returned at zero depth. The depth
+    across the contact plane being concave, this point lies on the patch. 'used_gjk_0' says whether
+    Gilbert-Johnson-Keerthi (GJK) rather than Minkowski portal refinement (MPR) detected contact 0, which sets the
+    accuracy of its depth.
+
+    Returns the normal, the non-negative depth and the position.
     """
-    # qrot is applied to geom A and its inverse to geom B; precompute the rotation matrix once (R for qrot, its
-    # transpose for the inverse) and reuse it for every un-rotation below instead of re-deriving it per call.
-    R = gu.qd_quat_to_R(qrot, rigid_info.EPS[None])
+    EPS = rigid_info.EPS[None]
+
+    # qrot is applied to geom A and its inverse to geom B
+    R = gu.qd_quat_to_R(qrot, EPS)
     R_inv = R.transpose()
-    contact_point_a = R_inv @ ((contact_pos - 0.5 * penetration * normal) - contact_pos_0) + contact_pos_0
-    contact_point_b = R @ ((contact_pos + 0.5 * penetration * normal) - contact_pos_0) + contact_pos_0
+    witness_a = R_inv @ ((contact_pos - 0.5 * penetration * normal) - contact_pos_0) + contact_pos_0
+    witness_b = R @ ((contact_pos + 0.5 * penetration * normal) - contact_pos_0) + contact_pos_0
 
-    # The unperturbed contact normal is recovered per detection method, using only the data that method exposes. The
-    # multi-contact perturbation is symmetric (geom A by +qrot, geom B by -qrot, over +/- axis pairs), so methods that
-    # keep the perturbed normal still yield an unbiased contact set: the per-contact tilts cancel in aggregate (no
-    # drift), and the pruning kernel's mean normal averages them back to the true normal (the patch stays coplanar).
-    #  - PLANE: the normal is rigid to the plane geom (geom A, rotated by qrot), so un-rotating it by qrot is exact.
-    #  - CAPSULE-CAPSULE: an analytic closest-segment contact, with no portal or witness pair; the only available
-    #    correction is the first-order twist of the perturbed normal back towards the unperturbed one.
-    #  - MPR: it exposes no witness pair, only a portal; the un-rotated portal support simplex gives the exact normal
-    #    as the Minkowski-triangle face normal (vertex-face / edge-edge contacts included).
-    #  - GJK: same construction from the EPA polytope face nearest to the origin (its three support pairs).
-    # is_exact reports whether the recovered penetration is exact (a true contact depth) rather than an approximate
-    # first-order value. The caller uses it to pick the contact-acceptance threshold: an exact penetration can be
-    # discarded as soon as it is non-positive (fictitious contact), while an approximate one keeps a negative tolerance.
-    is_exact = False
-    needs_twist = False
+    # Geom A lies on the positive side of the normal, so that the depth at the witness of geom A is the height of the
+    # surface of geom B above it, and the depth at the witness of geom B its height above the surface of geom A
+    depth = normal_0.dot(witness_b - witness_a)
+    # The point steps back from the witness of geom B by half the depth: averaging both witnesses would slide it off the
+    # feature by an amount quadratic in the perturbation angle
+    contact_pos = witness_b - 0.5 * depth * normal_0
+    is_depth_lower_bound = False
+    # Whether the witness of geom B rather than geom A stands on the feature of the contact, where the depth is measured
+    is_witness_b_anchor = False
     if dyn_info.geoms.type[i_ga] == gs.GEOM_TYPE.PLANE:
-        normal = R_inv @ normal
-        penetration = normal.dot(contact_point_b - contact_point_a)
-        is_exact = True
-    elif dyn_info.geoms.type[i_ga] == gs.GEOM_TYPE.CAPSULE and dyn_info.geoms.type[i_gb] == gs.GEOM_TYPE.CAPSULE:
-        # Analytic closest-segment contact: no portal or witness pair (and its portal_status / nearest_face are stale,
-        # since it runs neither MPR nor GJK), so the only correction available is the first-order twist.
-        needs_twist = True
-    elif used_gjk and gjk_state.nearest_face[i_scratch] < 0:
-        # Shallow GJK contact (no EPA polytope was built): no support face, but the perturbed witness delta is the
-        # perturbed normal by construction, so keep it; the +/- symmetry keeps the contact set unbiased in aggregate.
-        pass
-    elif not used_gjk and mpr_state.portal_status[i_scratch] < PORTAL_STATUS.LOWER_BOUND:
-        # MPR left no trustworthy refined contact-face portal (degenerate touch/segment path, or the origin projects
-        # far outside the portal); reconstructing from it would yield a spurious edge/corner normal. A LOWER_BOUND
-        # portal keeps the reconstruction: its support triangle still spans the contact face, only its depth is
-        # inexact.
-        needs_twist = True
-    else:
-        # Support pairs of the contact face: the MPR portal (indices 1-3), or the GJK EPA face nearest to the origin.
-        a1 = mpr_state.simplex_support.v1[1, i_scratch]
-        b1 = mpr_state.simplex_support.v2[1, i_scratch]
-        a2 = mpr_state.simplex_support.v1[2, i_scratch]
-        b2 = mpr_state.simplex_support.v2[2, i_scratch]
-        a3 = mpr_state.simplex_support.v1[3, i_scratch]
-        b3 = mpr_state.simplex_support.v2[3, i_scratch]
-        if used_gjk:
-            i_f = gjk_state.nearest_face[i_scratch]
-            iv1 = gjk_state.polytope_faces.verts_idx[i_scratch, i_f][0]
-            iv2 = gjk_state.polytope_faces.verts_idx[i_scratch, i_f][1]
-            iv3 = gjk_state.polytope_faces.verts_idx[i_scratch, i_f][2]
-            a1 = gjk_state.polytope_verts.obj1[i_scratch, iv1]
-            b1 = gjk_state.polytope_verts.obj2[i_scratch, iv1]
-            a2 = gjk_state.polytope_verts.obj1[i_scratch, iv2]
-            b2 = gjk_state.polytope_verts.obj2[i_scratch, iv2]
-            a3 = gjk_state.polytope_verts.obj1[i_scratch, iv3]
-            b3 = gjk_state.polytope_verts.obj2[i_scratch, iv3]
-        # contact_pos_0 cancels in the edge differences, so the face normal needs only support-point deltas.
-        edge1 = R_inv @ (a2 - a1) - R @ (b2 - b1)
-        edge2 = R_inv @ (a3 - a1) - R @ (b3 - b1)
-        portal_normal = edge1.cross(edge2)
-        portal_norm_sqr = portal_normal.norm_sqr()
-        # The face normal is reliable only when the support triangle is well-conditioned. For a nearly coplanar
-        # contact (e.g. flat box-on-box) the support points can be almost collinear, making the face normal
-        # numerically unstable; fall back to the twist there. Compared squared to avoid the edge-length square roots.
-        if portal_norm_sqr > 0.01 * edge1.norm_sqr() * edge2.norm_sqr():
-            normal = portal_normal / qd.sqrt(portal_norm_sqr)
-            if normal.dot(normal_0) < 0.0:
-                normal = -normal
-            # The depth read off the portal is exact only when the origin projects inside it (Theorem 4.2); a
-            # LOWER_BOUND portal keeps the reconstructed normal but leaves the depth to the first-order witness
-            # separation below, and its candidate to the lenient acceptance.
-            is_exact = used_gjk or mpr_state.portal_status[i_scratch] == PORTAL_STATUS.EXACT
-            if is_exact:
-                # m1 (one un-rotated Minkowski support point on the face) is only needed for the exact penetration.
-                m1 = R_inv @ (a1 - contact_pos_0) - R @ (b1 - contact_pos_0)
-                penetration = -normal.dot(m1)
+        # The plane of geom A passes through its witness of contact 0, with the normal of contact 0
+        depth = normal_0.dot(witness_b - contact_pos_0) + 0.5 * penetration_0
+        contact_pos = witness_b - 0.5 * depth * normal_0
+        is_depth_lower_bound = True
+    elif not (
+        (dyn_info.geoms.type[i_ga] == gs.GEOM_TYPE.CAPSULE and dyn_info.geoms.type[i_gb] == gs.GEOM_TYPE.CAPSULE)
+        or (used_gjk and gjk_state.nearest_face[i_scratch] < 0)
+        or (not used_gjk and mpr_state.portal_status[i_scratch] == PORTAL_STATUS.NONE)
+    ):
+        # Support points of the detection: the Minkowski portal refinement (MPR) portal (indices 1-3), or the face of
+        # the expanding polytope algorithm (EPA) of Gilbert-Johnson-Keerthi (GJK) nearest to the origin. The analytic
+        # capsule-capsule detection runs neither, a shallow GJK contact builds no polytope, and the degenerate paths of
+        # MPR leave the portal unwritten.
+        supports = qd.Matrix.zero(gs.qd_float, 6, 3)
+        for i_v in qd.static(range(3)):
+            support_a = mpr_state.simplex_support.v1[i_v + 1, i_scratch]
+            support_b = mpr_state.simplex_support.v2[i_v + 1, i_scratch]
+            if used_gjk:
+                i_f = gjk_state.nearest_face[i_scratch]
+                i_pv = gjk_state.polytope_faces.verts_idx[i_scratch, i_f][i_v]
+                support_a = gjk_state.polytope_verts.obj1[i_scratch, i_pv]
+                support_b = gjk_state.polytope_verts.obj2[i_scratch, i_pv]
+            support_a = R_inv @ (support_a - contact_pos_0) + contact_pos_0
+            support_b = R @ (support_b - contact_pos_0) + contact_pos_0
+            for i_3 in qd.static(range(3)):
+                supports[i_v, i_3] = support_a[i_3]
+                supports[3 + i_v, i_3] = support_b[i_3]
+
+        # The support points of a geom that line up along the normal of contact 0 span a vertex or an edge of it, rows
+        # 3 * i_g of the triangle of support points of geom i_g, whose two farthest points are the ends of the edge
+        is_supports_degenerate = qd.Vector([0, 0], dt=gs.qd_int)
+        is_supports_edge = qd.Vector([0, 0], dt=gs.qd_int)
+        ends = qd.Matrix.zero(gs.qd_float, 4, 3)
+        for i_g in qd.static(range(2)):
+            v_1 = qd.Vector([supports[3 * i_g, 0], supports[3 * i_g, 1], supports[3 * i_g, 2]], dt=gs.qd_float)
+            v_2 = qd.Vector(
+                [supports[3 * i_g + 1, 0], supports[3 * i_g + 1, 1], supports[3 * i_g + 1, 2]], dt=gs.qd_float
+            )
+            v_3 = qd.Vector(
+                [supports[3 * i_g + 2, 0], supports[3 * i_g + 2, 1], supports[3 * i_g + 2, 2]], dt=gs.qd_float
+            )
+            edge_1, edge_2 = v_2 - v_1, v_3 - v_1
+            if qd.abs(edge_1.cross(edge_2).dot(normal_0)) <= EPS * edge_1.norm() * edge_2.norm():
+                is_supports_degenerate[i_g] = 1
+                # The ends of the edge are the two points farthest apart along the contact plane, where it lies
+                span_12 = edge_1 - edge_1.dot(normal_0) * normal_0
+                span_13 = edge_2 - edge_2.dot(normal_0) * normal_0
+                span_23 = (v_3 - v_2) - (v_3 - v_2).dot(normal_0) * normal_0
+                end_0, end_1, span = v_1, v_2, span_12
+                if span_13.norm_sqr() > span.norm_sqr():
+                    end_1, span = v_3, span_13
+                if span_23.norm_sqr() > span.norm_sqr():
+                    end_0, end_1, span = v_2, v_3, span_23
+                if span.norm_sqr() > EPS * geom_pair_scale**2:
+                    is_supports_edge[i_g] = 1
+                    for i_3 in qd.static(range(3)):
+                        ends[2 * i_g, i_3] = end_0[i_3]
+                        ends[2 * i_g + 1, i_3] = end_1[i_3]
+        is_witness_b_anchor = is_supports_degenerate[1] == 1 and is_supports_degenerate[0] == 0
+
+        if is_supports_edge[0] == 1 and is_supports_edge[1] == 1:
+            # Two edges touch where they cross seen along the normal of contact 0, both closest points being material
+            # points on one line along it, which makes the depth exact
+            edge_a_0 = qd.Vector([ends[0, 0], ends[0, 1], ends[0, 2]], dt=gs.qd_float)
+            edge_a_1 = qd.Vector([ends[1, 0], ends[1, 1], ends[1, 2]], dt=gs.qd_float)
+            edge_b_0 = qd.Vector([ends[2, 0], ends[2, 1], ends[2, 2]], dt=gs.qd_float)
+            edge_b_1 = qd.Vector([ends[3, 0], ends[3, 1], ends[3, 2]], dt=gs.qd_float)
+            proj_a_0 = edge_a_0 - edge_a_0.dot(normal_0) * normal_0
+            proj_a_1 = edge_a_1 - edge_a_1.dot(normal_0) * normal_0
+            proj_b_0 = edge_b_0 - edge_b_0.dot(normal_0) * normal_0
+            proj_b_1 = edge_b_1 - edge_b_1.dot(normal_0) * normal_0
+            len_sqr_a = (proj_a_1 - proj_a_0).norm_sqr()
+            len_sqr_b = (proj_b_1 - proj_b_0).norm_sqr()
+            if len_sqr_a > EPS * geom_pair_scale**2 and len_sqr_b > EPS * geom_pair_scale**2:
+                # The parallel test of the helper compares the squared sine of the angle between both edges, times the
+                # product of their squared lengths, to its tolerance
+                closest_a, closest_b = func_closest_points_on_segments(
+                    proj_a_0, proj_a_1, proj_b_0, proj_b_1, EPS * len_sqr_a * len_sqr_b
+                )
+                if (closest_b - closest_a).norm_sqr() <= EPS * geom_pair_scale**2:
+                    ratio_a = (closest_a - proj_a_0).dot(proj_a_1 - proj_a_0) / len_sqr_a
+                    ratio_b = (closest_b - proj_b_0).dot(proj_b_1 - proj_b_0) / len_sqr_b
+                    witness_a = edge_a_0 + ratio_a * (edge_a_1 - edge_a_0)
+                    witness_b = edge_b_0 + ratio_b * (edge_b_1 - edge_b_0)
+                    depth = normal_0.dot(witness_b - witness_a)
+                    contact_pos = 0.5 * (witness_a + witness_b)
+                    is_depth_lower_bound = True
         else:
-            needs_twist = True
+            # Along an edge lying on the face of the other geom, the depth varies linearly, so that the point the
+            # detection lands on along it is arbitrary up to rounding when the tilt hardly deepens one end more than
+            # the other. The perturbation looks for the end of the patch that its tilt deepens, which is one end of the
+            # edge, an exact material point. Each geom turns about contact 0, geom A by 'qrot' towards the negative
+            # side of the normal and geom B by its inverse towards the positive one.
+            for i_g in qd.static(range(2)):
+                if is_supports_edge[i_g] == 1:
+                    end_0 = qd.Vector([ends[2 * i_g, 0], ends[2 * i_g, 1], ends[2 * i_g, 2]], dt=gs.qd_float)
+                    end_1 = qd.Vector(
+                        [ends[2 * i_g + 1, 0], ends[2 * i_g + 1, 1], ends[2 * i_g + 1, 2]], dt=gs.qd_float
+                    )
+                    R_g = R if qd.static(i_g == 0) else R_inv
+                    lift_0 = normal_0.dot(R_g @ (end_0 - contact_pos_0) - (end_0 - contact_pos_0))
+                    lift_1 = normal_0.dot(R_g @ (end_1 - contact_pos_0) - (end_1 - contact_pos_0))
+                    if qd.static(i_g == 0):
+                        lift_0, lift_1 = -lift_0, -lift_1
+                    if qd.abs(lift_1 - lift_0) > EPS * (qd.abs(lift_0) + qd.abs(lift_1)):
+                        end = end_1 if lift_1 > lift_0 else end_0
+                        if qd.static(i_g == 0):
+                            witness_a = end
+                        else:
+                            witness_b = end
 
-    # Single first-order fallback for every case that could not recover an exact normal (analytic capsule-capsule,
-    # degenerate MPR, near-collinear portal). Computed once, and only when actually needed.
-    if needs_twist:
-        mc_perturbation = collider_info.mc_perturbation[None]
-        twist_rotvec = qd.math.clamp(normal.cross(normal_0), -mc_perturbation, mc_perturbation)
-        normal = normal + twist_rotvec.cross(normal)
-    if not is_exact:
-        penetration = normal.dot(contact_point_b - contact_point_a)
+            # The support triangle of each geom bounds its surface at the witness of the other geom, when it covers it
+            # along the normal of contact 0: geom B from above at the witness of geom A, geom A from below at that of
+            # geom B. A triangle that a vertex or an edge reduces to a point or a segment covers nothing. Both bounds
+            # being lower bounds of the depth at their own witness, the deeper one is kept.
+            for i_g in qd.static(range(2)):
+                i_r = 3 * (1 - i_g)
+                v_1 = qd.Vector([supports[i_r, 0], supports[i_r, 1], supports[i_r, 2]], dt=gs.qd_float)
+                v_2 = qd.Vector([supports[i_r + 1, 0], supports[i_r + 1, 1], supports[i_r + 1, 2]], dt=gs.qd_float)
+                v_3 = qd.Vector([supports[i_r + 2, 0], supports[i_r + 2, 1], supports[i_r + 2, 2]], dt=gs.qd_float)
+                witness = witness_a if qd.static(i_g == 0) else witness_b
+                edge_1, edge_2, offset = v_2 - v_1, v_3 - v_1, witness - v_1
+                area = edge_1.cross(edge_2).dot(normal_0)
+                if qd.abs(area) > EPS * edge_1.norm() * edge_2.norm():
+                    lambda_2 = offset.cross(edge_2).dot(normal_0) / area
+                    lambda_3 = edge_1.cross(offset).dot(normal_0) / area
+                    if lambda_2 >= 0.0 and lambda_3 >= 0.0 and lambda_2 + lambda_3 <= 1.0:
+                        height = normal_0.dot(v_1 + lambda_2 * edge_1 + lambda_3 * edge_2)
+                        bound = height - normal_0.dot(witness_a)
+                        if qd.static(i_g == 1):
+                            bound = normal_0.dot(witness_b) - height
+                        if not is_depth_lower_bound or bound > depth:
+                            depth = bound
+                            contact_pos = witness + (0.5 if qd.static(i_g == 0) else -0.5) * bound * normal_0
+                            is_depth_lower_bound = True
 
-    # Each un-rotated witness point is an exact material point of its own geom, but the two un-rotations turn in
-    # opposite directions and so slide the pair tangentially past each other, by twice the perturbation angle times
-    # their distance from contact 0. Only their separation along the recovered normal carries contact information, so
-    # the position steps back from geom B's witness by half of it, landing on the feature the perturbation found.
-    # Averaging the two witnesses instead subtracts the whole separation, sliding the contact off that feature by an
-    # amount that grows with the square of the perturbation angle, which no precision reaches.
-    contact_pos = contact_point_b - 0.5 * penetration * normal
+    if not is_depth_lower_bound:
+        # The un-rotated perturbed normal is the normal of the tangent plane of the other geom at its witness, against
+        # which the anchor witness measures its depth. A plane tilted beyond the relative rotation of both geoms belongs
+        # to another face, along which this depth is ill-conditioned, so that the separation of both witnesses stays.
+        tangent_normal = R @ normal
+        if is_witness_b_anchor:
+            tangent_normal = R_inv @ normal
+        tangent_slope = tangent_normal.dot(normal_0)
+        if tangent_slope >= qd.cos(2.0 * collider_info.mc_perturbation[None]):
+            depth = tangent_normal.dot(witness_b - witness_a) / tangent_slope
+            contact_pos = witness_a + 0.5 * depth * normal_0
+            if is_witness_b_anchor:
+                contact_pos = witness_b - 0.5 * depth * normal_0
 
-    # Apply the smooth-primitive position reconstruction here, after the perturbation has been reverted, so it uses the
-    # final (corrected) normal and the unperturbed pose - the canonical state the solver stores.
+    # A contact of negative depth lies past the edge of the patch, and moves towards contact 0 to where the depth
+    # interpolated between both vanishes. The interpolation divides by their difference of depth, which must exceed its
+    # own error: the rounding of both depths and the stopping tolerance of the detection of contact 0.
+    depth_noise = EPS * geom_pair_scale
+    if used_gjk_0:
+        if not func_is_discrete_geoms(i_ga, i_gb, dyn_info):
+            depth_noise = qd.max(depth_noise, collider_info.gjk.tolerance[None])
+    else:
+        depth_noise = qd.max(depth_noise, collider_info.mpr.CCD_TOLERANCE[None] * geom_pair_scale)
+    if depth < 0.0 and penetration_0 - depth > depth_noise:
+        contact_pos += depth / (depth - penetration_0) * (contact_pos_0 - contact_pos)
+    depth = qd.max(depth, 0.0)
+
+    # The smooth-primitive position reconstruction runs on the unperturbed pose, the canonical state the solver stores
     contact_pos = func_apply_smooth_refinement(
         i_ga,
         i_gb,
-        normal,
-        penetration,
+        normal_0,
+        depth,
         contact_pos,
         ga_pos_original,
         ga_quat_original,
@@ -1687,7 +1777,7 @@ def func_recompute_perturbed_contact(
         dyn_info,
         rigid_config,
     )
-    return normal, penetration, contact_pos, is_exact
+    return normal_0, depth, contact_pos
 
 
 @qd.func
@@ -1795,6 +1885,7 @@ def func_convex_convex_contact(
         penetration_0 = gs.qd_float(0.0)
         normal_0 = qd.Vector.zero(gs.qd_float, 3)
         contact_pos_0 = qd.Vector.zero(gs.qd_float, 3)
+        is_gjk_used_0 = False
 
         # Whether narrowphase detected a contact.
         is_col = False
@@ -1813,6 +1904,8 @@ def func_convex_convex_contact(
                 collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.GJK
                 or collider_static_config.ccd_algorithm == CCD_ALGORITHM_CODE.MJ_GJK
             )
+            # Whether GJK ran, which the analytic detections and the plane bypass whatever the algorithm prefers
+            is_gjk_used = False
 
             # Apply perturbations to thread-local state
             if multi_contact and is_col_0:
@@ -2012,6 +2105,7 @@ def func_convex_convex_contact(
                                     gjk_static_config,
                                 )
 
+                            is_gjk_used = True
                             is_col = gjk_state.is_col[i_b] == 1
                             penetration = gjk_state.penetration[i_b]
                             n_contacts = gjk_state.n_contacts[i_b]
@@ -2102,6 +2196,7 @@ def func_convex_convex_contact(
 
             if i_detection == 0:
                 is_col_0, normal_0, penetration_0, contact_pos_0 = is_col, normal, penetration, contact_pos
+                is_gjk_used_0 = is_gjk_used
                 if is_col_0:
                     func_add_contact(
                         i_ga,
@@ -2139,14 +2234,11 @@ def func_convex_convex_contact(
             elif multi_contact and is_col:
                 # For perturbed iterations (i_detection > 0), recompute the contact from the deepest contact points
                 # discovered by the perturbed detection, evaluated on the unperturbed geometries. This applies to all
-                # collision methods when multi-contact is enabled, except mujoco compatible. When the correction is
-                # skipped (mujoco compatible), is_exact stays False so the lenient acceptance threshold is used.
-                is_exact = False
+                # collision methods when multi-contact is enabled, except mujoco compatible.
                 if qd.static(
                     collider_static_config.ccd_algorithm not in (CCD_ALGORITHM_CODE.MJ_MPR, CCD_ALGORITHM_CODE.MJ_GJK)
                 ):
-                    _used_gjk = prefer_gjk
-                    normal, penetration, contact_pos, is_exact = func_recompute_perturbed_contact(
+                    normal, penetration, contact_pos = func_recompute_perturbed_contact(
                         i_ga,
                         i_gb,
                         i_b,
@@ -2155,6 +2247,7 @@ def func_convex_convex_contact(
                         contact_pos,
                         normal_0,
                         contact_pos_0,
+                        penetration_0,
                         qrot,
                         ga_pos_original,
                         ga_quat_original,
@@ -2166,7 +2259,9 @@ def func_convex_convex_contact(
                         rigid_info,
                         collider_info,
                         rigid_config,
-                        _used_gjk,
+                        geom_pair_scale,
+                        is_gjk_used,
+                        is_gjk_used_0,
                     )
 
                 # For MuJoCo-compatible GJK, set penetration of perturbed contacts to equal the initial contact's
@@ -2177,38 +2272,32 @@ def func_convex_convex_contact(
                     penetration = penetration_0
 
                 # Discard repeated contact points
-                repeated = False
+                is_repeated = False
                 for i_c in range(n_con):
-                    if not repeated:
+                    if not is_repeated:
                         idx_prev = collider_state.n_contacts[i_b] - 1 - i_c
                         prev_contact = collider_state.contact_data.pos[idx_prev, i_b]
                         if (contact_pos - prev_contact).norm() < tolerance:
-                            repeated = True
+                            is_repeated = True
 
-                if not repeated:
-                    # When the correction is exact, a fictitious candidate (one that only touches because of the
-                    # perturbation) reverts to a non-positive penetration and is discarded, within a guard of rounding
-                    # width so a grazing candidate is accepted consistently across rotated copies. When the correction
-                    # is only approximate, keep the negative tolerance so first-order error drops no genuine contact.
-                    if penetration > (-EPS * geom_pair_scale if is_exact else -tolerance):
-                        penetration = qd.max(penetration, 0.0)
-                        func_add_contact(
-                            i_ga,
-                            i_gb,
-                            i_b,
-                            i_pair,
-                            normal,
-                            contact_pos,
-                            penetration,
-                            dyn_state,
-                            collider_state,
-                            dyn_info,
-                            rigid_info,
-                            collider_info,
-                            use_atomic=False,
-                            errno=errno,
-                        )
-                        n_con = n_con + 1
+                if not is_repeated:
+                    func_add_contact(
+                        i_ga,
+                        i_gb,
+                        i_b,
+                        i_pair,
+                        normal,
+                        contact_pos,
+                        penetration,
+                        dyn_state,
+                        collider_state,
+                        dyn_info,
+                        rigid_info,
+                        collider_info,
+                        use_atomic=False,
+                        errno=errno,
+                    )
+                    n_con = n_con + 1
 
 
 @qd.func
@@ -2248,7 +2337,6 @@ def _func_multicontact_run_detection(
     contact_pos = qd.Vector.zero(gs.qd_float, 3)
     used_gjk = False
     geom_pair_scale = func_compute_geom_pair_scale(i_ga, i_gb, geoms_init_AABB, dyn_info)
-    tolerance = func_compute_mc_tolerance(i_ga, i_gb, geoms_init_AABB, dyn_info, collider_info, rigid_config)
 
     if dyn_info.geoms.type[i_ga] == gs.GEOM_TYPE.CAPSULE and dyn_info.geoms.type[i_gb] == gs.GEOM_TYPE.CAPSULE:
         is_col, normal, contact_pos, penetration = capsule_contact.func_capsule_capsule_contact(
@@ -2423,6 +2511,7 @@ def _func_multicontact_detect(
 
     contact0_normal = collider_state.narrowphase_work_queues.mpr_normal[i_work, 0]
     contact0_pos = collider_state.narrowphase_work_queues.mpr_contact_pos[i_work, 0]
+    contact0_penetration = collider_state.narrowphase_work_queues.mpr_penetration[i_work, 0]
     has_contact0 = not is_gjk_preferred_0
     is_gjk_multi_done = False
     n_con = gs.qd_int(0)
@@ -2434,6 +2523,8 @@ def _func_multicontact_detect(
     axis_0 = qd.Vector.zero(gs.qd_float, 3)
     axis_1 = qd.Vector.zero(gs.qd_float, 3)
     is_axes_computed = False
+    # Whether GJK detected contact 0, which the MPR seed, the analytic detections and the plane do not
+    is_gjk_used_0 = False
     for i_det in range(i_det_start, i_det_end):
         is_initial_detection = i_det == 0
         is_active = is_gjk_preferred_0
@@ -2590,6 +2681,8 @@ def _func_multicontact_detect(
                         )
                         contact0_normal = normal
                         contact0_pos = contact_pos
+                        contact0_penetration = penetration
+                        is_gjk_used_0 = is_gjk_used
                         slot_status = MULTICONTACT_SLOT.BASE
                         slot_normal = normal
                         slot_pos = contact_pos
@@ -2601,11 +2694,10 @@ def _func_multicontact_detect(
             elif is_col:
                 # The perturbed contact is refined inside func_recompute_perturbed_contact (after the perturbation is
                 # reverted, on the canonical pose); no pre-reversal refinement is needed here.
-                is_exact = False
                 if qd.static(
                     collider_static_config.ccd_algorithm not in (CCD_ALGORITHM_CODE.MJ_MPR, CCD_ALGORITHM_CODE.MJ_GJK)
                 ):
-                    normal, penetration, contact_pos, is_exact = func_recompute_perturbed_contact(
+                    normal, penetration, contact_pos = func_recompute_perturbed_contact(
                         i_ga,
                         i_gb,
                         i_scratch,
@@ -2614,6 +2706,7 @@ def _func_multicontact_detect(
                         contact_pos,
                         contact0_normal,
                         contact0_pos,
+                        contact0_penetration,
                         qrot,
                         ga_pos_original,
                         ga_quat_original,
@@ -2625,9 +2718,11 @@ def _func_multicontact_detect(
                         rigid_info,
                         collider_info,
                         rigid_config,
+                        geom_pair_scale,
                         is_gjk_used,
+                        is_gjk_used_0,
                     )
-                slot_status = MULTICONTACT_SLOT.EXACT if is_exact else MULTICONTACT_SLOT.APPROX
+                slot_status = MULTICONTACT_SLOT.PERTURBED
                 slot_normal = normal
                 slot_pos = contact_pos
                 slot_penetration = penetration
@@ -2639,11 +2734,9 @@ def _func_multicontact_detect(
                     slot_status,
                     slot_pos,
                     slot_penetration,
-                    geom_pair_scale,
                     tolerance,
                     local_contact_pos,
                     local_penetration,
-                    rigid_info,
                     collider_static_config,
                 )
                 if is_accepted:
@@ -2685,21 +2778,17 @@ def _func_multicontact_accept(
     status: int,
     contact_pos: qd.types.vector(3),
     penetration: float,
-    geom_pair_scale: float,
     tolerance: float,
     local_contact_pos,
     local_penetration,
-    rigid_info: array_class.RigidInfo,
     collider_static_config: qd.template(),
 ):
     """Decide whether a candidate contact of a pair is kept, given the contacts of the pair kept so far.
 
     The first n_con rows of local_contact_pos and local_penetration hold the contacts kept so far. A contact of status
     BASE (see MULTICONTACT_SLOT in constants.py) is kept as it is. A perturbed contact is kept unless it lies within the
-    tolerance of a contact already kept or its penetration falls below its acceptance threshold, and it is then clamped
-    to non-negative. Returns whether the contact is kept and its penetration.
+    tolerance of a contact already kept. Returns whether the contact is kept and its penetration.
     """
-    EPS = rigid_info.EPS[None]
     is_accepted = status == MULTICONTACT_SLOT.BASE
     if not is_accepted:
         # Perturbed contacts carry the initial contact's penetration under compatibility: see the twin acceptance in
@@ -2716,12 +2805,7 @@ def _func_multicontact_accept(
                 if (contact_pos - prev).norm() < tolerance:
                     is_repeated = True
 
-        if not is_repeated:
-            # Rounding-scale guard for exact candidates: see the twin acceptance in func_convex_convex_contact
-            is_exact = status == MULTICONTACT_SLOT.EXACT
-            if penetration > (-EPS * geom_pair_scale if is_exact else -tolerance):
-                penetration = qd.max(penetration, 0.0)
-                is_accepted = True
+        is_accepted = not is_repeated
     return is_accepted, penetration
 
 
@@ -2805,7 +2889,6 @@ def _func_multicontact_gather(
     i_gb = collider_state.narrowphase_work_queues.mpr_i_gb[i_work]
     i_pair = collider_state.narrowphase_work_queues.mpr_i_pair[i_work]
 
-    geom_pair_scale = func_compute_geom_pair_scale(i_ga, i_gb, geoms_init_AABB, dyn_info)
     tolerance = func_compute_mc_tolerance(i_ga, i_gb, geoms_init_AABB, dyn_info, collider_info, rigid_config)
 
     n_con = gs.qd_int(0)
@@ -2821,11 +2904,9 @@ def _func_multicontact_gather(
                 status,
                 contact_pos,
                 collider_state.narrowphase_work_queues.mpr_penetration[i_work, i_s],
-                geom_pair_scale,
                 tolerance,
                 local_contact_pos,
                 local_penetration,
-                rigid_info,
                 collider_static_config,
             )
             if is_accepted:
@@ -2991,7 +3072,7 @@ def func_narrowphase_contact0(
     for flat_idx in range(_grid_size):
         i_b = flat_idx // n_chunks
         chunk = flat_idx % n_chunks
-        n_pairs = collider_state.n_broad_pairs[i_b]
+        n_pairs = qd.min(collider_state.n_broad_pairs[i_b], max_broad_pairs)
         pair_start = chunk * n_pairs // n_chunks
         pair_end = (chunk + 1) * n_pairs // n_chunks
 
@@ -3240,7 +3321,7 @@ def func_narrow_phase_convex_vs_convex(
 
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
-        for i_pair in range(collider_state.n_broad_pairs[i_b]):
+        for i_pair in range(qd.min(collider_state.n_broad_pairs[i_b], collider_state.broad_collision_pairs.shape[0])):
             i_ga = collider_state.broad_collision_pairs[i_pair, i_b][0]
             i_gb = collider_state.broad_collision_pairs[i_pair, i_b][1]
 
@@ -3437,7 +3518,7 @@ def func_narrow_phase_convex_specializations(
     _B = collider_state.active_buffer.shape[1]
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
-        for i_pair in range(collider_state.n_broad_pairs[i_b]):
+        for i_pair in range(qd.min(collider_state.n_broad_pairs[i_b], collider_state.broad_collision_pairs.shape[0])):
             i_ga = collider_state.broad_collision_pairs[i_pair, i_b][0]
             i_gb = collider_state.broad_collision_pairs[i_pair, i_b][1]
 
@@ -3500,7 +3581,7 @@ def func_narrow_phase_any_vs_terrain(
     _B = collider_state.active_buffer.shape[1]
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
-        for i_pair in range(collider_state.n_broad_pairs[i_b]):
+        for i_pair in range(qd.min(collider_state.n_broad_pairs[i_b], collider_state.broad_collision_pairs.shape[0])):
             i_ga = collider_state.broad_collision_pairs[i_pair, i_b][0]
             i_gb = collider_state.broad_collision_pairs[i_pair, i_b][1]
 
@@ -3543,7 +3624,7 @@ def func_narrow_phase_nonconvex_vs_nonterrain(
     _B = collider_state.active_buffer.shape[1]
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
-        for i_pair in range(collider_state.n_broad_pairs[i_b]):
+        for i_pair in range(qd.min(collider_state.n_broad_pairs[i_b], collider_state.broad_collision_pairs.shape[0])):
             i_ga = collider_state.broad_collision_pairs[i_pair, i_b][0]
             i_gb = collider_state.broad_collision_pairs[i_pair, i_b][1]
 
