@@ -309,7 +309,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
 
     def build(self):
         self._n_geoms = self.n_geoms
-        self._n_cells = self.n_cells
         self._n_verts = self.n_verts
         self._n_free_verts = self.n_free_verts
         self._n_fixed_verts = self.n_fixed_verts
@@ -321,7 +320,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self._equalities = self.equalities
 
         self.n_geoms_ = max(1, self.n_geoms)
-        self.n_cells_ = max(1, self.n_cells)
         self.n_verts_ = max(1, self.n_verts)
         self.n_faces_ = max(1, self.n_faces)
         self.n_edges_ = max(1, self.n_edges)
@@ -1137,12 +1135,12 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             # estimate the exact contact information.
             geoms_center = []
             for geom in geoms:
-                tmesh = geom.mesh.trimesh
-                if tmesh.is_watertight:
-                    geoms_center.append(tmesh.center_mass)
+                # A geom enclosing no volume has no center of mass, and its inertial reports no mass
+                if geom.mesh.is_watertight and geom.mesh.inertial.mass > 0.0:
+                    geoms_center.append(geom.mesh.inertial.com)
                 else:
                     # Still fallback to mean vertex position if no better option...
-                    geoms_center.append(np.mean(tmesh.vertices, axis=0))
+                    geoms_center.append(np.mean(geom.mesh.verts, axis=0))
 
             # A geom is hollow when its own center lies in a cavity rather than inside its material (bowl, mug,
             # nut), i.e. its own SDF is positive at its center. This is a static property of the collision
@@ -1156,10 +1154,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     geom.type not in (gs.GEOM_TYPE.SPHERE, gs.GEOM_TYPE.PLANE, gs.GEOM_TYPE.TERRAIN)
                     and not geom.is_convex
                 ):
-                    grid_pos = geom.T_mesh_to_sdf[:3, :3] @ center + geom.T_mesh_to_sdf[:3, 3]
-                    cell = np.minimum(np.maximum(np.floor(grid_pos).astype(gs.np_int), 0), geom.sdf_res - 2)
+                    sdf_grid = geom.desc.mesh.get_sdf_grid(geom.desc.sdf)
+                    grid_pos = sdf_grid.T_mesh_to_sdf[:3, :3] @ center + sdf_grid.T_mesh_to_sdf[:3, 3]
+                    cell = np.minimum(
+                        np.maximum(np.floor(grid_pos).astype(gs.np_int), 0), np.subtract(geom.desc.sdf.n_nodes, 2)
+                    )
                     frac = grid_pos - cell
-                    corners = geom.sdf_val[cell[0] : cell[0] + 2, cell[1] : cell[1] + 2, cell[2] : cell[2] + 2]
+                    corners = sdf_grid.value[cell[0] : cell[0] + 2, cell[1] : cell[1] + 2, cell[2] : cell[2] + 2]
                     weights_x, weights_y, weights_z = ([1.0 - frac[i], frac[i]] for i in range(3))
                     sd_center = np.einsum("i,j,k,ijk->", weights_x, weights_y, weights_z, corners)
                     is_hollow = sd_center > gs.EPS
@@ -3421,12 +3422,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.is_built:
             return self._n_geoms
         return len(self.geoms)
-
-    @property
-    def n_cells(self):
-        if self.is_built:
-            return self._n_cells
-        return sum(entity.n_cells for entity in self._entities)
 
     @property
     def n_verts(self):

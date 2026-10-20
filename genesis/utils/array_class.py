@@ -38,7 +38,12 @@ def maybe_shape(shape, is_on):
 
 @dataclass_transform(eq_default=True, kw_only_default=False, frozen_default=True)
 class AutoInitMeta(type):
-    """Metaclass that generates __init__ from annotations, like a mutable dataclass."""
+    """Metaclass generating __init__, __eq__ and __hash__ from annotations, like a frozen dataclass.
+
+    Kernels key their compiled instances on the static configs they take, by equality, so configs holding the same
+    values let a rebuilt scene reuse the kernels compiled for the previous one. A config is immutable, since a write
+    would change the key under which its kernels are stored.
+    """
 
     def __new__(cls, name, bases, namespace):
         names = tuple(namespace["__annotations__"].keys())
@@ -69,9 +74,21 @@ class AutoInitMeta(type):
 
             # Set attributes
             for key, value in assigned.items():
-                setattr(self, key, value)
+                object.__setattr__(self, key, value)
+
+        def __setattr__(self, key, value):
+            raise AttributeError(f"{name} is immutable")
+
+        def __eq__(self, other):
+            return type(other) is type(self) and vars(other) == vars(self)
+
+        def __hash__(self):
+            return hash((type(self), *(vars(self)[key] for key in names)))
 
         namespace["__init__"] = __init__
+        namespace["__setattr__"] = __setattr__
+        namespace["__eq__"] = __eq__
+        namespace["__hash__"] = __hash__
 
         return super().__new__(cls, name, bases, namespace)
 
@@ -2037,12 +2054,13 @@ class GJKStaticConfig(metaclass=AutoInitMeta):
 class SupportFieldInfo:
     kind: ClassVar[DataKind] = DataKind.CONSTANT
 
-    # First cell of the table of each geom
+    # First cell of the table of each geom, the geoms of one trimesh sharing one table
     support_cell_start: qd.Tensor
     # First extra candidate of each cell, past those of its record, its extras ending where those of the next start
     support_list_start: qd.Tensor
-    # Mesh-frame position and index of each candidate vertex: the record of every cell at twice the index of the cell,
-    # holding the first two candidates of the cell (a single candidate twice), then the extra candidates of all cells
+    # Mesh-frame position and index of each candidate vertex, among the vertices of its geom: the record of every cell
+    # at twice the index of the cell, holding the first two candidates of the cell (a single candidate twice), then the
+    # extra candidates of all cells
     support_v: qd.Tensor
     support_vid: qd.Tensor
     support_res: qd.Tensor
@@ -2092,7 +2110,6 @@ class SDFInfo:
     kind: ClassVar[DataKind] = DataKind.CONSTANT
 
     geoms_info: SDFGeomInfo
-    geoms_sdf_start: qd.Tensor
     geoms_sdf_val: qd.Tensor
     geoms_sdf_grad: qd.Tensor
     geoms_sdf_closest_vert: qd.Tensor
@@ -2102,13 +2119,12 @@ class SDFInfo:
 def get_sdf_info(n_geoms, n_cells, n_coarse_cells):
     if not _is_tensor_addressable((n_cells, 3), gs.np_float):
         gs.raise_exception(
-            f"SDF Gradient shape (n_cells={n_cells}, 3) is too large. Consider manually setting larger "
-            "'sdf_cell_size' in 'gs.materials.Rigid' options."
+            f"SDF Gradient shape (n_cells={n_cells}, 3) is too large. Consider setting a larger 'sdf_cell_size', or a "
+            "smaller 'sdf_max_res', in 'gs.materials.Rigid' options."
         )
 
     return SDFInfo(
         geoms_info=get_sdf_geom_info(max(n_geoms, 1)),
-        geoms_sdf_start=V(dtype=gs.qd_int, shape=(max(n_geoms, 1),)),
         geoms_sdf_val=V(dtype=gs.qd_float, shape=(max(n_cells, 1),)),
         geoms_sdf_grad=V_VEC(3, dtype=gs.qd_float, shape=(max(n_cells, 1),)),
         geoms_sdf_closest_vert=V(dtype=gs.qd_int, shape=(max(n_cells, 1),)),
@@ -2124,9 +2140,8 @@ class ColliderInfo:
     kind: ClassVar[DataKind] = DataKind.CONSTANT
 
     # Narrowphase sub-component descriptions, owned by their respective builders (MPR, GJK, SupportField, SDF) and
-    # embedded here so kernels receive the whole collider description as one argument. Each has a single instance,
-    # activated (which may reallocate it at its final size) before this struct is built; a reassignment after the
-    # embedding would leave the reference here stale.
+    # embedded here so kernels receive the whole collider description as one argument. They are built at their final
+    # size before this struct is.
     mpr: MPRInfo
     gjk: GJKInfo
     support_field: SupportFieldInfo

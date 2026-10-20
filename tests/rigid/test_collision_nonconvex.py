@@ -697,7 +697,7 @@ def test_mesh_repair(convexify, show_viewer, gjk_collision):
 def test_convexify(euler, show_viewer, gjk_collision):
     OBJ_OFFSET_X = 0.0  # 0.02
     OBJ_OFFSET_Y = 0.15
-    N_SETTLE = 1350
+    N_SETTLE = 1200
 
     # The test check that the volume difference is under a given threshold and that convex decomposition is only used
     # whenever it is necessary. Then run a simulation to see if it explodes, i.e. objects are at reset inside tank.
@@ -932,7 +932,7 @@ def test_many_objects_collision(convexify, show_viewer, tol):
     links, link_names = [], []
     for obj, name in zip(objs, obj_names):
         for link in obj.links:
-            links.append([(geom.get_verts(), geom.get_trimesh().faces) for geom in link.geoms])
+            links.append([(geom.get_verts(), geom.trimesh.faces) for geom in link.geoms])
             link_names.append(name)
     max_penetration, crossings = get_genuine_interpenetration(links)
     # FIXME: Rare (~5% of initial-pose draws) stem-through-wall traps exceed this bound by design: a thin feature

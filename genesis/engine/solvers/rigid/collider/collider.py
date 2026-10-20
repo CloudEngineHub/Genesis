@@ -80,10 +80,10 @@ class Collider:
         self._prune_max_contacts_floor = 512
 
         # The narrowphase sub-components are built AND activated before the collision fields, whose collider info embeds
-        # their description structs: the activation of the SDF and of the support field reallocates theirs at their
-        # final size, so it has to run before the embedding (see ColliderInfo). Their constructors also resolve the
-        # options the static configuration reads, so they run first.
-        self._sdf = SDF(rigid_solver)
+        # their description structs: the activation of the support field reallocates its own at its final size, so it
+        # has to run before the embedding (see ColliderInfo). Their constructors also resolve the options the static
+        # configuration reads, so they run first.
+        self.sdf = SDF(rigid_solver)
         self.mpr = mpr.MPR(rigid_solver)
         self.gjk = gjk.GJK(rigid_solver)
         self._support_field = support_field.SupportField(rigid_solver)
@@ -95,8 +95,6 @@ class Collider:
             and not self._solver._requires_grad
         )
 
-        if self.collider_config.has_nonconvex_nonterrain:
-            self._sdf.activate()
         # The split narrowphase launches one thread per core, its contact0 pass rounding up to whole environments. An
         # upper-bound estimate of the core count sizes these launches (Genesis-Embodied-AI/Genesis#2616).
         if self._use_split_narrowphase:
@@ -260,8 +258,8 @@ class Collider:
             self.collider_config,
             self.mpr._mpr_info,
             self.gjk._gjk_info,
-            self._support_field._support_field_info,
-            self._sdf._sdf_info,
+            self._support_field.support_field_info,
+            self.sdf.sdf_info,
             mc_perturbation=self._mc_perturbation,
             mc_tolerance=self._mc_tolerance,
             diff_pos_tolerance=self._diff_pos_tolerance,
@@ -431,6 +429,10 @@ class Collider:
 
         # Lazily compute geom vertices only for geoms that need neutral overlap checks
         geoms_verts: dict[int, np.ndarray] = {}
+        # Voxel grid and filled-voxel centers of a geom, built the first time it enters a pair with overlapping bounds
+        # and shared by every other pair it enters, since voxelization dominates this check and a link usually overlaps
+        # several others in the neutral configuration
+        geoms_voxels: dict[int, tuple[trimesh.voxel.VoxelGrid, np.ndarray]] = {}
         if needs_neutral_check:
             self_root_indices = np.where(valid & same_root)[0]
             self_root_geom_idxs = np.unique(np.concatenate([row[self_root_indices], col[self_root_indices]]))
@@ -481,14 +483,14 @@ class Collider:
                     mesh_b = trimesh.Trimesh(vertices=verts_b, faces=geoms[i_gb].init_faces, process=False)
                     bounds_a, bounds_b = mesh_a.bounds, mesh_b.bounds
                     if not ((bounds_a[1] < bounds_b[0]).any() or (bounds_b[1] < bounds_a[0]).any()):
-                        voxels_a = mesh_a.voxelized(
-                            pitch=min(NEUTRAL_COLLISION_RES_ABS, NEUTRAL_COLLISION_RES_REL * max(mesh_a.extents))
-                        )
-                        voxels_b = mesh_b.voxelized(
-                            pitch=min(NEUTRAL_COLLISION_RES_ABS, NEUTRAL_COLLISION_RES_REL * max(mesh_b.extents))
-                        )
-                        coords_a = voxels_a.indices_to_points(np.argwhere(voxels_a.matrix))
-                        coords_b = voxels_b.indices_to_points(np.argwhere(voxels_b.matrix))
+                        for i_g, mesh in ((i_ga, mesh_a), (i_gb, mesh_b)):
+                            if i_g not in geoms_voxels:
+                                voxels = mesh.voxelized(
+                                    pitch=min(NEUTRAL_COLLISION_RES_ABS, NEUTRAL_COLLISION_RES_REL * max(mesh.extents))
+                                )
+                                geoms_voxels[i_g] = (voxels, voxels.indices_to_points(np.argwhere(voxels.matrix)))
+                        voxels_a, coords_a = geoms_voxels[i_ga]
+                        voxels_b, coords_b = geoms_voxels[i_gb]
                         if voxels_a.is_filled(coords_b).any() or voxels_b.is_filled(coords_a).any():
                             self_colliding_pairs.append((i_ga, i_gb))
                             valid[idx] = False
@@ -753,10 +755,6 @@ class Collider:
             self.collider_info.terrain_rc.from_numpy(rc)
             self.collider_info.terrain_scale.from_numpy(entity.terrain_scale)
             self.collider_info.terrain_xyz_maxmin.from_numpy(xyz_maxmin)
-
-    def activate_sdf(self) -> None:
-        """Enable SDF queries against this collider's geometry. Idempotent."""
-        self._sdf.activate()
 
     def reset(self, envs_idx=None, *, cache_only: bool = True) -> None:
         self._contact_data_cache.clear()
