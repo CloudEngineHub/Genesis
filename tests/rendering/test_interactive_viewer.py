@@ -1,3 +1,4 @@
+import functools
 import re
 import sys
 import threading
@@ -8,6 +9,7 @@ import pytest
 
 import av
 import OpenGL.error
+from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
 
 import genesis as gs
 import genesis.utils.geom as gu
@@ -209,6 +211,12 @@ def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot)
 
     monkeypatch.setattr("genesis.ext.pyrender.viewer.Viewer._get_save_filename", get_save_filename)
 
+    # Record losslessly, so that the decoded video holds the very frames the viewer handed over, whatever the encoder
+    monkeypatch.setattr(
+        "moviepy.video.io.ffmpeg_writer.FFMPEG_VideoWriter",
+        functools.partial(FFMPEG_VideoWriter, codec="libx264rgb", ffmpeg_params=["-qp", "0"], pixel_format="rgb24"),
+    )
+
     # Mock 'on_key_release' to determine whether requests have been processed
     n_key_releases = 0
     on_key_release_orig = gs.ext.pyrender.viewer.Viewer.on_key_release
@@ -245,6 +253,9 @@ def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot)
         gs.morphs.Box(
             size=(0.5, 0.5, 0.5),
             pos=(0.0, 0.0, 0.0),
+            # The viewer records whatever it last drew, which may lag a step behind the scene in contrast to cameras and
+            # camera sensors, so the box must not move by itself for the recorded frames to be deterministic
+            fixed=True,
         ),
     )
     scene.build()
