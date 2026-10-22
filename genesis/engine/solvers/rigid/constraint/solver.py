@@ -5576,16 +5576,6 @@ def func_solve_init(
     _B = dyn_state.dofs.acc_smooth.shape[1]
     n_dofs = dyn_state.dofs.acc_smooth.shape[0]
 
-    # The one arm whose factor, gradient and convergence certificate are all seeded inside its own body (see
-    # _kernel_solve_monolith) rather than here: the GPU monolith without the tiled factor seed self-inits per env, so
-    # every seed in this kernel routes around it (the block assembly stays here where the tiled seed is on). The
-    # decomposed arm only runs with the cooperative kernels, which imply the tiled seed, so the predicate holds for
-    # every arm this init can serve.
-    is_self_seeding = qd.static(
-        rigid_config.solver_type == gs.constraint_solver.Newton
-        and rigid_config.backend != gs.cpu
-        and (not rigid_config.enable_tiled_island_seed or rigid_config.has_scalar_seed_factor)
-    )
     if qd.static(rigid_config.enable_signorini_contact):
         # The first row update of the solve seeds every latch, see func_relatch_cone.
         n_cones = constraint_state.cone_latch.shape[0]
@@ -5692,17 +5682,20 @@ def func_solve_init(
             func_island_tiled_factor_solve_all(constraint_state, dyn_info, rigid_info, rigid_config, write_L)
             func_wrap_cone_hessian(constraint_state, rigid_config, is_removal=True, is_enabled=not write_L)
     else:
-        if qd.static(rigid_config.solver_type == gs.constraint_solver.Newton and not is_self_seeding):
-            # Seed the initial Hessian factor. The decomposed arm has no self-init: its graph is linesearch-first, so
-            # its first linesearch consumes the search direction computed here (this kernel is its "iteration 0"; the
-            # graph then computes each subsequent direction at the end of an iteration). The monolith seeds it here
-            # except where its body self-inits the factor per env (is_self_seeding).
+        # Where the solve is seeded one env per thread (see has_per_env_solve_seed in array_class.py), the factor, the
+        # gradient and the convergence certificate are left to the per-env seed at the end of this kernel.
+        if qd.static(
+            rigid_config.solver_type == gs.constraint_solver.Newton and not rigid_config.has_per_env_solve_seed
+        ):
+            # Seed the initial Hessian factor. The decomposed graph is linesearch-first, so its first linesearch
+            # consumes the search direction computed here (this kernel is its "iteration 0"; the graph then computes
+            # each subsequent direction at the end of an iteration).
             # compute_envelope=True computes each island's structural skyline envelope once, reused per iteration.
             func_hessian_and_cholesky_factor_direct(
                 constraint_state, dyn_info, rigid_info, rigid_config, compute_envelope=True
             )
 
-        if qd.static(not is_self_seeding):
+        if qd.static(not rigid_config.has_per_env_solve_seed):
             # Initial gradient (Mgrad = H^-1 grad for Newton, grad for CG), the decomposed arm's first search direction
             func_update_gradient(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
 
@@ -5713,10 +5706,12 @@ def func_solve_init(
         constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
 
     if qd.static(
-        not rigid_config.requires_grad and not rigid_config.enable_mujoco_compatibility and not is_self_seeding
+        not rigid_config.requires_grad
+        and not rigid_config.enable_mujoco_compatibility
+        and not rigid_config.has_per_env_solve_seed
     ):
-        # The certificate consumes the seed gradient, so the one arm that self-seeds it in its own body certifies
-        # there instead (see _kernel_solve_monolith). The differentiable path keeps its full iteration trace.
+        # The certificate consumes the seed gradient, so the per-env seed certifies on its own (see
+        # func_solve_seed_batch). The differentiable path keeps its full iteration trace.
         # TODO: Remove the MuJoCo compatibility gate once on MuJoCo 3.11, which carries this criterion natively.
         if qd.static(rigid_config.enable_cooperative_constraint_kernels):
             _K = qd.static(32)
@@ -5754,6 +5749,18 @@ def func_solve_init(
                     constraint_state.improved[i_b] = linesearch.func_exit_islands_serial(
                         i_b, constraint_state, rigid_info, rigid_config, certify=True
                     )
+
+    if qd.static(rigid_config.has_per_env_solve_seed):
+        # A fully-asleep env has no awake DOF to move, so its solve is a no-op that neither arm iterates.
+        qd.loop_config(name="solve_seed", serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+        for i_b in range(_B):
+            has_awake_work = constraint_state.n_constraints[i_b] > 0
+            if qd.static(rigid_config.use_hibernation):
+                has_awake_work = has_awake_work and rigid_info.n_awake_dofs[i_b] > 0
+            if has_awake_work:
+                func_solve_seed_batch(i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
+            else:
+                constraint_state.improved[i_b] = False
 
 
 @qd.func
@@ -5823,6 +5830,40 @@ def func_solve_iter(
         )
 
 
+@qd.func
+def func_solve_seed_batch(
+    i_b: int,
+    dyn_state: array_class.DynState,
+    constraint_state: array_class.ConstraintState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    """Seed the Newton solve of one env with its Hessian factor, its gradient, its first search direction and its
+    convergence certificate.
+
+    func_solve_init runs it one env per thread, for both solve arms, where the solve is seeded per env (see
+    has_per_env_solve_seed in array_class.py). The Hessian block of the env is already assembled into nt_H where the
+    tiled seed is on (see has_scalar_seed_factor), so only its factor remains to compute there.
+    """
+    n_dofs = constraint_state.qacc.shape[0]
+
+    if qd.static(rigid_config.enable_tiled_island_seed):
+        func_cholesky_factor_direct_batch(i_b, 0, constraint_state, rigid_info, rigid_config)
+    else:
+        func_hessian_and_cholesky_factor_direct_batch(
+            i_b, constraint_state, dyn_info, rigid_info, rigid_config, compute_envelope=True
+        )
+    func_update_gradient_batch(i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
+    for i_d in range(n_dofs):
+        constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
+    if qd.static(not rigid_config.requires_grad and not rigid_config.enable_mujoco_compatibility):
+        # Certificate gating: see func_solve_init.
+        constraint_state.improved[i_b] = linesearch.func_exit_islands_serial(
+            i_b, constraint_state, rigid_info, rigid_config, certify=True
+        )
+
+
 def _get_static_config(*args, **kwargs):
     # Positional index of rigid_config in func_solve_body's signature.
     return args[4] if len(args) > 4 else kwargs["rigid_config"]
@@ -5856,7 +5897,6 @@ def _kernel_solve_monolith(
     _n_iterations: int,
 ):
     _B = constraint_state.grad.shape[1]
-    n_dofs = constraint_state.qacc.shape[0]
 
     # The monolith arm solves each env whole (32 envs packed per warp); islands change only the per-env factor's block
     # structure, handled inside func_solve_iter, not the iteration scheme. Per-island parallelism is the decomposed
@@ -5869,28 +5909,6 @@ def _kernel_solve_monolith(
         if qd.static(rigid_config.use_hibernation):
             has_awake_work = has_awake_work and rigid_info.n_awake_dofs[i_b] > 0
         if has_awake_work:
-            if qd.static(
-                rigid_config.backend != gs.cpu
-                and rigid_config.solver_type == gs.constraint_solver.Newton
-                and (not rigid_config.enable_tiled_island_seed or rigid_config.has_scalar_seed_factor)
-            ):
-                # A GPU without the tiled factor seed: func_solve_init leaves the factor to the monolith, which
-                # self-seeds each island's scalar factor + gradient + search here (once per step), the block already
-                # assembled into nt_H where the tiled seed is on (see has_scalar_seed_factor).
-                if qd.static(rigid_config.enable_tiled_island_seed):
-                    func_cholesky_factor_direct_batch(i_b, 0, constraint_state, rigid_info, rigid_config)
-                else:
-                    func_hessian_and_cholesky_factor_direct_batch(
-                        i_b, constraint_state, dyn_info, rigid_info, rigid_config, compute_envelope=True
-                    )
-                func_update_gradient_batch(i_b, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
-                for i_d in range(n_dofs):
-                    constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
-                if qd.static(not rigid_config.requires_grad and not rigid_config.enable_mujoco_compatibility):
-                    # Certificate gating: see func_solve_init.
-                    constraint_state.improved[i_b] = linesearch.func_exit_islands_serial(
-                        i_b, constraint_state, rigid_info, rigid_config, certify=True
-                    )
             for it in range(rigid_info.iterations[None]):
                 # Checked at the top so a solve certified converged on its seed runs zero iterations.
                 if not constraint_state.improved[i_b]:
@@ -5923,6 +5941,54 @@ def func_solve_body_monolith(dyn_state, constraint_state, dyn_info, rigid_info, 
 
 
 @qd.func
+def func_contact_constraint_force(
+    i_c: int,
+    i_b: int,
+    n_first_contact: int,
+    collider_state: array_class.ColliderState,
+    constraint_state: array_class.ConstraintState,
+    rigid_config: qd.template(),
+):
+    """Compute the linear force of an awake contact from the solved forces of its constraint rows.
+
+    The contact sits at position i_c of the contacts of env i_b. The rows of the awake contacts follow the equality and
+    frictionloss constraints in contact order, past the first n_first_contact contacts, which belong to sleepers and
+    own no row.
+    """
+    const_start = constraint_state.n_constraints_equality[i_b] + constraint_state.n_constraints_frictionloss[i_b]
+    i_col = collider_state.contact_sort_idx[i_c, i_b]
+    contact_data_normal = collider_state.contact_data.normal[i_col, i_b]
+    contact_data_friction = collider_state.contact_data.friction[i_col, i_b]
+
+    rows_per_contact = qd.static(rigid_config.rows_per_contact)
+    i_row_group = i_c - n_first_contact
+    force = qd.Vector.zero(gs.qd_float, 3)
+    d1, d2 = gu.qd_orthogonals(contact_data_normal)
+    if qd.static(rigid_config.enable_elliptic_friction):
+        # The cone rows [normal, t1, t2(, spin)(, roll1, roll2)] are contiguous in the collision segment.
+        # The spin and rolling rows carry torque only, so the linear contact force sums the first three.
+        base = i_row_group * rows_per_contact + const_start
+        force = -contact_data_normal * constraint_state.efc_force[base, i_b]
+        force = force + d1 * constraint_state.efc_force[base + 1, i_b]
+        force = force + d2 * constraint_state.efc_force[base + 2, i_b]
+    else:
+        for i_dir in qd.static(range(4)):
+            d = (2 * (i_dir % 2) - 1) * (d1 if i_dir < 2 else d2)
+            n = d * contact_data_friction - contact_data_normal
+            force = force + n * constraint_state.efc_force[i_row_group * rows_per_contact + i_dir + const_start, i_b]
+        # The torsional and rolling pyramid pairs mix the spin and tangent axes through the angular Jacobian. Their
+        # linear part is the shared normal opposition.
+        if qd.static(rigid_config.enable_torsional_friction):
+            for i_dir in qd.static(range(4, rows_per_contact)):
+                force = (
+                    force
+                    - contact_data_normal
+                    * constraint_state.efc_force[i_row_group * rows_per_contact + i_dir + const_start, i_b]
+                )
+    return force
+
+
+@qd.func
 def func_update_contact_force(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -5938,53 +6004,36 @@ def func_update_contact_force(
     for i_l, i_b in qd.ndrange(n_links, _B):
         dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
+    # A kept contact of a sleeper (see n_contacts_hibernated in array_class.py) has no row and keeps the force of the
+    # last solve it took part in, so a resting sleeper keeps reporting the support force it is at rest under. Each awake
+    # contact takes its own thread where loops run in parallel, and the serial path visits the existing contacts only.
+    if qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL):
+        qd.loop_config(serialize=True)
+        for i_b in range(_B):
+            n_first_contact = collider_state.n_contacts_hibernated[i_b]
+            for i_c in range(n_first_contact, collider_state.n_contacts[i_b]):
+                i_col = collider_state.contact_sort_idx[i_c, i_b]
+                collider_state.contact_data.force[i_col, i_b] = func_contact_constraint_force(
+                    i_c, i_b, n_first_contact, collider_state, constraint_state, rigid_config
+                )
+    else:
+        qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
+        for i_c, i_b in qd.ndrange(collider_state.contact_sort_idx.shape[0], _B):
+            n_first_contact = collider_state.n_contacts_hibernated[i_b]
+            if i_c >= n_first_contact and i_c < collider_state.n_contacts[i_b]:
+                i_col = collider_state.contact_sort_idx[i_c, i_b]
+                collider_state.contact_data.force[i_col, i_b] = func_contact_constraint_force(
+                    i_c, i_b, n_first_contact, collider_state, constraint_state, rigid_config
+                )
+
+    # The forces of the contacts of a link are summed in contact order, which keeps the rounding of the sum fixed
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
-        const_start = constraint_state.n_constraints_equality[i_b] + constraint_state.n_constraints_frictionloss[i_b]
-
-        # contact constraints should be after equality and frictionloss constraints and before joint limit constraints.
-        # A kept contact of a sleeper (see n_contacts_hibernated in array_class.py) has no row and keeps the force of
-        # the last solve it took part in, so a resting sleeper keeps reporting the support force it is at rest under.
-        n_first_contact = collider_state.n_contacts_hibernated[i_b]
         for i_c in range(collider_state.n_contacts[i_b]):
             i_col = collider_state.contact_sort_idx[i_c, i_b]
-            contact_data_normal = collider_state.contact_data.normal[i_col, i_b]
-            contact_data_friction = collider_state.contact_data.friction[i_col, i_b]
             contact_data_link_a = collider_state.contact_data.link_a[i_col, i_b]
             contact_data_link_b = collider_state.contact_data.link_b[i_col, i_b]
-
-            rows_per_contact = qd.static(rigid_config.rows_per_contact)
             force = collider_state.contact_data.force[i_col, i_b]
-            if i_c >= n_first_contact:
-                i_row_group = i_c - n_first_contact
-                force = qd.Vector.zero(gs.qd_float, 3)
-                d1, d2 = gu.qd_orthogonals(contact_data_normal)
-                if qd.static(rigid_config.enable_elliptic_friction):
-                    # The cone rows [normal, t1, t2(, spin)(, roll1, roll2)] are contiguous in the collision segment.
-                    # The spin and rolling rows carry torque only, so the linear contact force sums the first three.
-                    base = i_row_group * rows_per_contact + const_start
-                    force = -contact_data_normal * constraint_state.efc_force[base, i_b]
-                    force = force + d1 * constraint_state.efc_force[base + 1, i_b]
-                    force = force + d2 * constraint_state.efc_force[base + 2, i_b]
-                else:
-                    for i_dir in qd.static(range(4)):
-                        d = (2 * (i_dir % 2) - 1) * (d1 if i_dir < 2 else d2)
-                        n = d * contact_data_friction - contact_data_normal
-                        force = (
-                            force
-                            + n * constraint_state.efc_force[i_row_group * rows_per_contact + i_dir + const_start, i_b]
-                        )
-                    # The torsional and rolling pyramid pairs mix the spin and tangent axes through the angular
-                    # jacobian; their linear part is the shared normal opposition.
-                    if qd.static(rigid_config.enable_torsional_friction):
-                        for i_dir in qd.static(range(4, rows_per_contact)):
-                            force = (
-                                force
-                                - contact_data_normal
-                                * constraint_state.efc_force[i_row_group * rows_per_contact + i_dir + const_start, i_b]
-                            )
-                collider_state.contact_data.force[i_col, i_b] = force
-
             dyn_state.links.contact_force[contact_data_link_a, i_b] = (
                 dyn_state.links.contact_force[contact_data_link_a, i_b] - force
             )
