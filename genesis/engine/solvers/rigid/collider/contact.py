@@ -158,6 +158,28 @@ def rotmatx(i0: int, i1: int, i2: int, matin: qd.types.matrix(3, 3), f0: int, f1
     return matres
 
 
+@qd.func
+def func_collider_reset_env(
+    i_b: int,
+    collider_state: array_class.ColliderState,
+    collider_static_config: qd.template(),
+    cache_only: qd.template(),
+):
+    """Drop what the collision detection of env i_b carries over from the previous steps.
+
+    The cache of contact normals and penetrations warm-starts the next detection. Unless 'cache_only', the next
+    detection also runs as the first one.
+    """
+    if qd.static(not cache_only):
+        collider_state.first_time[i_b] = True
+
+    # The contact cache is only held for the convex-convex pairs (see get_contact_cache in array_class.py)
+    if qd.static(collider_static_config.has_non_box_plane_convex_convex):
+        for i_pair in range(collider_state.contact_cache.normal.shape[0]):
+            collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
+
+
 @qd.kernel(fastcache=True)
 def collider_kernel_reset(
     envs_idx: qd.types.ndarray(),
@@ -169,15 +191,24 @@ def collider_kernel_reset(
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b_ in range(envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
+        func_collider_reset_env(i_b, collider_state, collider_static_config, cache_only=cache_only)
 
-        if qd.static(not cache_only):
-            collider_state.first_time[i_b] = True
 
-        # The contact cache is only held for the convex-convex pairs (see get_contact_cache in array_class.py)
-        if qd.static(collider_static_config.has_non_box_plane_convex_convex):
-            for i_pair in range(collider_state.contact_cache.normal.shape[0]):
-                collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
-                collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
+@qd.func
+def func_add_contacts_force_to_links(
+    i_b: int, dyn_state: array_class.DynState, collider_state: array_class.ColliderState
+):
+    """Add the force of every contact of env i_b to the contact force of the two links it pairs.
+
+    The forces are summed in contact order, which keeps the rounding of the sum fixed.
+    """
+    for i_c in range(collider_state.n_contacts[i_b]):
+        i_col = collider_state.contact_sort_idx[i_c, i_b]
+        i_la = collider_state.contact_data.link_a[i_col, i_b]
+        i_lb = collider_state.contact_data.link_b[i_col, i_b]
+        force = collider_state.contact_data.force[i_col, i_b]
+        dyn_state.links.contact_force[i_la, i_b] = dyn_state.links.contact_force[i_la, i_b] - force
+        dyn_state.links.contact_force[i_lb, i_b] = dyn_state.links.contact_force[i_lb, i_b] + force
 
 
 @qd.func
@@ -301,11 +332,17 @@ def kernel_collider_clear(
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
+    collider_static_config: qd.template(),
 ):
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b_ in range(envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
+        func_collider_reset_env(i_b, collider_state, collider_static_config, cache_only=False)
         func_collider_clear_env(i_b, dyn_state, collider_state, dyn_info, rigid_info, rigid_config)
+        # Only the contacts of the sleepers remain listed, so their links alone keep a contact force
+        for i_l in range(dyn_state.links.contact_force.shape[0]):
+            dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
+        func_add_contacts_force_to_links(i_b, dyn_state, collider_state)
 
 
 @qd.kernel(fastcache=True)
@@ -316,11 +353,17 @@ def kernel_masked_collider_clear(
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
+    collider_static_config: qd.template(),
 ):
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(envs_mask.shape[0]):
         if envs_mask[i_b]:
+            func_collider_reset_env(i_b, collider_state, collider_static_config, cache_only=False)
             func_collider_clear_env(i_b, dyn_state, collider_state, dyn_info, rigid_info, rigid_config)
+            # See 'kernel_collider_clear'
+            for i_l in range(dyn_state.links.contact_force.shape[0]):
+                dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            func_add_contacts_force_to_links(i_b, dyn_state, collider_state)
 
 
 @qd.kernel(fastcache=True)
@@ -383,11 +426,14 @@ def func_add_contact(
     errno: qd.Tensor,
 ):
     """Append a contact to the buffer of an environment, returning its slot, or -1 when the buffer is full."""
-    i_c = 0
-    if qd.static(use_atomic):
-        i_c = qd.atomic_add(collider_state.n_contacts[i_b], 1)
-    else:
-        i_c = collider_state.n_contacts[i_b]
+    i_c = func_reserve_contacts(
+        i_b,
+        n_contacts=1,
+        collider_state=collider_state,
+        collider_info=collider_info,
+        use_atomic=use_atomic,
+        errno=errno,
+    )
     i_c_added = -1
     if i_c < collider_info.max_candidate_contacts[None]:
         i_c_added = i_c
@@ -407,12 +453,34 @@ def func_add_contact(
             collider_info,
             errno,
         )
+    return i_c_added
 
+
+@qd.func
+def func_reserve_contacts(
+    i_b: int,
+    n_contacts: int,
+    collider_state: array_class.ColliderState,
+    collider_info: array_class.ColliderInfo,
+    use_atomic: qd.template(),
+    errno: qd.Tensor,
+):
+    """Reserve consecutive slots of the contact buffer of an environment, returning the first of them.
+
+    The slots past the end of the buffer are flagged as an overflow, and the caller drops their contacts. Without
+    atomics, the count of the buffer only grows by slots it holds.
+    """
+    i_c = 0
+    if qd.static(use_atomic):
+        i_c = qd.atomic_add(collider_state.n_contacts[i_b], n_contacts)
+    else:
+        i_c = collider_state.n_contacts[i_b]
+    if i_c + n_contacts <= collider_info.max_candidate_contacts[None]:
         if not qd.static(use_atomic):
-            collider_state.n_contacts[i_b] = i_c + 1
+            collider_state.n_contacts[i_b] = i_c + n_contacts
     else:
         errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_COLLISION_PAIRS
-    return i_c_added
+    return i_c
 
 
 @qd.func

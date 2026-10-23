@@ -172,8 +172,6 @@ def test_urdf_parsing(show_viewer, tol):
         for key in ((False, False), (False, True), (True, False), (True, True)):
             entities[key].set_pos(np.array([0.5, 0.0, 0.0]), relative=relative)
             entities[key].set_quat(np.array([0.0, 0.0, 0.0, 1.0]), relative=relative)
-        if show_viewer:
-            scene.visualizer.update()
         _check_entity_positions(0.0, tol=tol)
 
     # Check that `set_qpos` applies the same absolute transform in all cases. The fixed roots have no free joint to
@@ -189,8 +187,6 @@ def test_urdf_parsing(show_viewer, tol):
         entities[key].set_pos(np.array([0.0, config_y, 0.0]), relative=False)
         entities[key].set_quat(np.array(world_quat), relative=False)
         entities[key].set_qpos(door_angle)
-    if show_viewer:
-        scene.visualizer.update()
     _check_entity_positions(POS_OFFSET, tol=tol)
 
     # Add dof damping to stabilitze the physics
@@ -1009,13 +1005,13 @@ def test_color_overwrite(overwrite, urdf_with_external_assets, show_viewer):
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 @pytest.mark.parametrize(
-    "xml_path",
+    "model_name",
     [
         "xml/franka_emika_panda/panda.xml",
         "urdf/go2/urdf/go2.urdf",
         "urdf/panda_bullet/panda.urdf",
+        "urdf_with_legacy_parsed_primitives",
     ],
 )
 def test_robot_scale_and_dofs_armature(xml_path, monkeypatch, tol):
