@@ -1431,9 +1431,10 @@ class ColliderState:
     prism: qd.Tensor
     n_contacts: qd.Tensor = of_kind(DataKind.DERIVED)
     # Kept contacts of the sleepers, at the front of the contact buffer with the identity permutation: a hibernated
-    # link's contacts against fixed bodies are carried from step to step with the force of the last solve they took
-    # part in, for the contact getters and the per-link contact force alone. Every per-step pass (prune, sort, island
-    # edges, constraint rows, noslip) walks the live contacts after them, [n_contacts_hibernated, n_contacts).
+    # link's contacts against fixed links and other sleepers are carried from step to step with the force of the last
+    # solve they took part in, for the contact getters and the per-link contact force alone. Every per-step pass
+    # (prune, sort, island edges, constraint rows, noslip) walks the live contacts after them,
+    # [n_contacts_hibernated, n_contacts).
     n_contacts_hibernated: qd.Tensor = of_kind(DataKind.DERIVED)
     first_time: qd.Tensor = of_kind(DataKind.STATE)
     contact_cache: ContactCache
@@ -2392,6 +2393,12 @@ class LinksState:
     # assembly (the deterministic post-sort view of the contacts), consumed by the midpoint-integration eligibility;
     # the raw collider contact buffer is only valid through the contact_sort_idx indirection.
     is_constrained: qd.Tensor
+    # Midpoint angular velocity a free body eligible for midpoint integration converged to this substep, in its inertial
+    # frame, and the residual of the midpoint equation there. The integration the backward pass reverses resumes from
+    # them, since autodiff cannot reverse the Newton iteration (see func_midpoint_free_body). Allocated in differentiable
+    # mode only.
+    midpoint_ang: qd.Tensor = of_kind(DataKind.SCRATCH)
+    midpoint_res: qd.Tensor = of_kind(DataKind.SCRATCH)
     cd_ang_bw: qd.Tensor
     cd_vel_bw: qd.Tensor
     mass_sum: qd.Tensor
@@ -2441,6 +2448,8 @@ def get_links_state(solver):
         cd_ang=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         cd_vel=V(dtype=gs.qd_vec3, shape=shape, needs_grad=requires_grad),
         is_constrained=V(dtype=gs.qd_bool, shape=shape),
+        midpoint_ang=V(dtype=gs.qd_vec3, shape=maybe_shape(shape, requires_grad)),
+        midpoint_res=V(dtype=gs.qd_vec3, shape=maybe_shape(shape, requires_grad)),
         cd_ang_bw=V(dtype=gs.qd_vec3, shape=shape_bw, needs_grad=requires_grad),
         cd_vel_bw=V(dtype=gs.qd_vec3, shape=shape_bw, needs_grad=requires_grad),
         mass_sum=V(dtype=gs.qd_float, shape=shape, needs_grad=requires_grad),
@@ -2966,6 +2975,10 @@ class RigidAdjointCache:
     qpos: qd.Tensor
     dofs_vel: qd.Tensor
     dofs_acc: qd.Tensor
+    # The coupling wrench each substep consumes, which the couplers accumulate during the previous one (see
+    # func_integrate). The replay of a substep in the backward pass restores it.
+    links_cfrc_coupling_ang: qd.Tensor
+    links_cfrc_coupling_vel: qd.Tensor
 
 
 def get_rigid_adjoint_cache(solver):
@@ -2974,10 +2987,13 @@ def get_rigid_adjoint_cache(solver):
 
     qs_shape = maybe_shape((substeps_local + 1, solver.n_qs_, solver._B), requires_grad)
     dofs_shape = maybe_shape((substeps_local + 1, solver.n_dofs_, solver._B), requires_grad)
+    links_shape = maybe_shape((substeps_local + 1, solver.n_links_, solver._B), requires_grad)
     return RigidAdjointCache(
         qpos=V(dtype=gs.qd_float, shape=qs_shape, needs_grad=requires_grad),
         dofs_vel=V(dtype=gs.qd_float, shape=dofs_shape, needs_grad=requires_grad),
         dofs_acc=V(dtype=gs.qd_float, shape=dofs_shape, needs_grad=requires_grad),
+        links_cfrc_coupling_ang=V(dtype=gs.qd_vec3, shape=links_shape),
+        links_cfrc_coupling_vel=V(dtype=gs.qd_vec3, shape=links_shape),
     )
 
 
