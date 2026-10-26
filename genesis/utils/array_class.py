@@ -321,6 +321,7 @@ class ErrorCode(IntEnum):
     OVERFLOW_COLLISION_PAIRS = 0b00000000000000000000000000000001
     OVERFLOW_CANDIDATE_CONTACTS = 0b00000000000000000000000000000010
     OVERFLOW_CONTACTS = 0b00000000000000000000000000000100
+    UNSUPPORTED_COLLISION_PAIR = 0b00000000000000000000000000001000
     INVALID_CONTACT_NAN = 0b00000000000000000000000000010000
     INVALID_FORCE_NAN = 0b00000000000000000000000000100000
     INVALID_ACC_NAN = 0b00000000000000000000000001000000
@@ -392,6 +393,9 @@ class RigidInfo:
     dofs_mass_block_start: qd.Tensor
     dofs_mass_block_end: qd.Tensor
     dofs_mass_envelope_start: qd.Tensor
+    # Mass parent of each dof, -1 for none: the previous dof of its link, else the last dof of its nearest ancestor link
+    # holding one, when it lies in the same mass block.
+    dofs_mass_parent: qd.Tensor
     # Mask of the (dof, dof) pairs the mass matrix couples: a dof with its ancestors along the kinematic chain and
     # the dofs of its own link, within its mass block.
     mass_parent_mask: qd.Tensor
@@ -506,6 +510,7 @@ def get_rigid_info(solver, kinematic_only):
             dofs_mass_block_start=V(dtype=gs.qd_int, shape=()),
             dofs_mass_block_end=V(dtype=gs.qd_int, shape=()),
             dofs_mass_envelope_start=V(dtype=gs.qd_int, shape=()),
+            dofs_mass_parent=V(dtype=gs.qd_int, shape=()),
             mass_parent_mask=V(dtype=gs.qd_float, shape=()),
             substep_dt=V_SCALAR_FROM(dtype=gs.qd_float, value=0.0),
             iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=0),
@@ -556,6 +561,7 @@ def get_rigid_info(solver, kinematic_only):
         dofs_mass_block_start=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
         dofs_mass_block_end=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
         dofs_mass_envelope_start=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
+        dofs_mass_parent=V(dtype=gs.qd_int, shape=(solver.n_dofs_,)),
         mass_parent_mask=V(dtype=gs.qd_float, shape=(solver.n_dofs_, solver.n_dofs_)),
         substep_dt=V_SCALAR_FROM(dtype=gs.qd_float, value=solver._substep_dt),
         iterations=V_SCALAR_FROM(dtype=gs.qd_int, value=solver._options.iterations),
@@ -1033,8 +1039,9 @@ class ConstraintState:
     graph_counter: qd.types.ndarray()
     # Iterations left to the graph loop past the current one, which it resumes with once an env iterates on
     graph_counter_next: qd.Tensor
-    # Scratch of the noslip sweep (empty when noslip is off): M^{-1} J^T of the row being updated, in the column of the
-    # env, or of the lane of the cooperative sweep at [i_d, i_b * 32 + tid] (see func_noslip in noslip.py).
+    # Scratch of the noslip sweep (empty when noslip is off): M^{-1} J^T of the two rows of the pair being updated, in
+    # the two columns of the env, or of the lane of the cooperative sweep at [i_d, 2 * (i_b * 32 + tid) + i_r] (see
+    # func_noslip_update_row in noslip.py).
     noslip_MinvJT: qd.Tensor
     # Row coloring of the cooperative noslip sweep (empty otherwise, see func_color_rows_batch in noslip.py): the color
     # of each row, the color count of each island and the next free color of the mass block starting at each dof.
@@ -1206,7 +1213,7 @@ def get_constraint_state(constraint_solver, solver, collider):
         ),
         noslip_MinvJT=V(
             dtype=gs.qd_float,
-            shape=maybe_shape((solver.n_dofs_, noslip_n_lanes * _B), is_noslip_active),
+            shape=maybe_shape((solver.n_dofs_, 2 * noslip_n_lanes * _B), is_noslip_active),
             layout=dof_vec_layout if is_noslip_active else None,
         ),
         noslip_rows_color=V(
