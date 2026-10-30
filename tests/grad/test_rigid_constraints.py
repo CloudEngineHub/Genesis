@@ -101,7 +101,7 @@ def test_joint_limit_grad_matches_fd(grad_slider_limit, precision, show_viewer):
     "model_name",
     [
         "grad_slider_limit",
-        pytest.param("grad_cartpole", marks=pytest.mark.required),
+        "grad_cartpole",
         pytest.param("grad_hopper", marks=pytest.mark.required),
     ],
 )
@@ -162,7 +162,7 @@ def test_frictionloss_grad_matches_fd(grad_revolute_frictionloss, precision, sho
         n_envs=2,
         substeps=4,
         dt=1.0 / 60.0,
-        gravity=(0.0, 0.0, 0.0),
+        gravity=(0.0, 0.0, -5.0),
         enable_joint_limit=False,
         disable_constraint=False,
         show_viewer=show_viewer,
@@ -172,27 +172,37 @@ def test_frictionloss_grad_matches_fd(grad_revolute_frictionloss, precision, sho
     cs = pair.scene_fd.rigid_solver.constraint_solver.constraint_state
     assert (qd_to_torch(cs.n_constraints_frictionloss) == 1).all()
 
+    # The joint slides then sticks, holding a gravity load below its frictionloss, and the loss reads its actuator force
+    # between steps, whose frictionloss effort comes out of the constraint solve
+    actuator_forces = []
+
+    def step_fn(entity, i_step):
+        if i_step == 0:
+            actuator_forces.clear()
+        else:
+            actuator_forces.append(entity.solver.get_dofs_actuator_force())
+
     assert_grad_matches_fd(
         pair,
         [np.array([[2.0], [1.2]])],
         lambda e, x: e.set_dofs_velocity(x),
-        lambda scene, entity: (entity.get_qpos()[:, 0] ** 2).sum(),
+        lambda scene, entity: (entity.get_qpos()[:, 0] ** 2).sum() + sum([force.sum() for force in actuator_forces]),
         n_steps=10,
+        step_fn=step_fn,
         rtol=1e-10 if precision == "64" else 5e-5,
         atol=1e-10 if precision == "64" else 5e-5,
-        eps=3e-6 if precision == "64" else 1e-2,
+        eps=3e-5 if precision == "64" else 3e-2,
     )
 
 
-@pytest.mark.required
 @pytest.mark.parametrize(
     "model_name, n_rows",
     [
         ("grad_hinge_pair_joint_eq_linear", 1),
-        ("grad_hinge_pair_joint_eq_quadratic", 1),
-        ("grad_hinge_joint_eq_constant", 1),
-        ("grad_connect_loop", 3),
-        ("grad_weld_pair", 6),
+        pytest.param("grad_hinge_pair_joint_eq_quadratic", 1, marks=pytest.mark.required),
+        pytest.param("grad_hinge_joint_eq_constant", 1, marks=pytest.mark.required),
+        pytest.param("grad_connect_loop", 3, marks=pytest.mark.required),
+        pytest.param("grad_weld_pair", 6, marks=pytest.mark.required),
     ],
 )
 def test_equality_grad_matches_fd(model_name, n_rows, request, precision, show_viewer):
