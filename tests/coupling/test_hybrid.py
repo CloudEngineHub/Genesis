@@ -300,6 +300,58 @@ def test_deformable_parallel(show_viewer):
     assert_allclose(water.get_particles_vel(), 0.0, atol=5e-2)
 
 
+@pytest.mark.required
+def test_fem_outside_mpm_grid(precision, show_viewer, tol):
+    GRAVITY = -9.81
+    DT = 2e-3
+    N_STEPS = 10
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            substeps=10,
+            gravity=(0.0, 0.0, GRAVITY),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.1, -0.1, 0.0),
+            upper_bound=(0.1, 0.1, 0.2),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.0, -1.0, 0.8),
+            camera_lookat=(0.2, 0.0, 0.3),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.1),
+            size=(0.05, 0.05, 0.05),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
+    # FIXME: Building should raise when the scene cannot meet the accuracy of the simulation. The explicit time step
+    # must stay under about h / c, with h the smallest element size, c = sqrt((lambda + 2 * mu) / rho) the wave speed,
+    # lambda = E * nu / ((1 + nu) * (1 - 2 * nu)) and mu = E / (2 * (1 + nu)). The rest shape of a body accumulates
+    # a velocity noise of the order of t * E * eps / (rho * h) after a time t, with eps the machine epsilon, which must
+    # stay under the tolerance. Meanwhile, single precision takes a softer material.
+    fem = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.4, 0.0, 0.5),
+            size=(0.1, 0.1, 0.1),
+        ),
+        material=gs.materials.FEM.Elastic(
+            E=1e6 if precision == "64" else 1e5,
+        ),
+    )
+    scene.build(n_envs=2)
+
+    for _ in range(N_STEPS):
+        scene.step()
+
+    # An unstressed body far from the grid falls freely, every vertex at the same velocity
+    assert_allclose(fem.get_state().vel, (0.0, 0.0, GRAVITY * DT * N_STEPS), tol=tol)
+
+
 @pytest.mark.parametrize(
     "n_envs, material_type",
     [

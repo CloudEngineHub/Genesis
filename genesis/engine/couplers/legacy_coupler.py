@@ -9,6 +9,7 @@ import genesis.utils.sdf as sdf
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.repr_base import RBC
 from genesis.utils.array_class import GeomsInfo, GeomsState, LinksInfo, LinksState, RigidInfo, SDFInfo
+from genesis.utils.data import opt_in
 from genesis.utils.geom import qd_inv_transform_by_trans_quat, qd_transform_by_trans_quat
 
 if TYPE_CHECKING:
@@ -38,11 +39,26 @@ class LegacyCoupler(RBC):
         self.fem_solver = self.sim.fem_solver
         self.sf_solver = self.sim.sf_solver
 
+        # The particles and the FEM vertices collide with the rigid geoms through their SDF
+        opt_in(SDFInfo, cond=lambda: any(self.rigid_couplings))
+
+    @property
+    def rigid_couplings(self) -> tuple[bool, bool, bool, bool]:
+        """Whether the rigid geoms couple with the MPM, SPH, PBD and FEM solvers, in this order."""
+        return tuple(
+            [
+                self.rigid_solver.is_active and solver.is_active and is_enabled
+                for solver, is_enabled in (
+                    (self.mpm_solver, self.options.rigid_mpm),
+                    (self.sph_solver, self.options.rigid_sph),
+                    (self.pbd_solver, self.options.rigid_pbd),
+                    (self.fem_solver, self.options.rigid_fem),
+                )
+            ]
+        )
+
     def build(self) -> None:
-        self._rigid_mpm = self.rigid_solver.is_active and self.mpm_solver.is_active and self.options.rigid_mpm
-        self._rigid_sph = self.rigid_solver.is_active and self.sph_solver.is_active and self.options.rigid_sph
-        self._rigid_pbd = self.rigid_solver.is_active and self.pbd_solver.is_active and self.options.rigid_pbd
-        self._rigid_fem = self.rigid_solver.is_active and self.fem_solver.is_active and self.options.rigid_fem
+        self._rigid_mpm, self._rigid_sph, self._rigid_pbd, self._rigid_fem = self.rigid_couplings
         self._mpm_sph = self.mpm_solver.is_active and self.sph_solver.is_active and self.options.mpm_sph
         self._mpm_pbd = self.mpm_solver.is_active and self.pbd_solver.is_active and self.options.mpm_pbd
         self._fem_mpm = self.fem_solver.is_active and self.mpm_solver.is_active and self.options.fem_mpm
@@ -539,11 +555,16 @@ class LegacyCoupler(RBC):
                     mpm_fx = pos * self.mpm_solver.inv_dx - mpm_base.cast(gs.qd_float)
                     mpm_w = [0.5 * (1.5 - mpm_fx) ** 2, 0.75 - (mpm_fx - 1.0) ** 2, 0.5 * (mpm_fx - 0.5) ** 2]
                     new_vel_fem_sv = vel_fem_sv
+                    grid_res = qd.Vector(self.mpm_solver.grid_res, dt=gs.qd_int)
                     for mpm_offset in qd.static(qd.grouped(self.mpm_solver.stencil_range())):
                         mpm_grid_I = mpm_base - self.mpm_solver.grid_offset + mpm_offset
-                        mpm_grid_mass = (
-                            self.mpm_solver.grid[f, mpm_grid_I, i_b].mass / self.mpm_solver.particle_volume_scale
-                        )
+                        # A vertex outside the domain of the grid exchanges nothing with the cells the grid lacks
+                        is_cell_in_grid = (mpm_grid_I >= 0).all() and (mpm_grid_I < grid_res).all()
+                        mpm_grid_mass = gs.qd_float(0.0)
+                        if is_cell_in_grid:
+                            mpm_grid_mass = (
+                                self.mpm_solver.grid[f, mpm_grid_I, i_b].mass / self.mpm_solver.particle_volume_scale
+                            )
 
                         mpm_weight = gs.qd_float(1.0)
                         for d in qd.static(range(3)):
@@ -552,7 +573,8 @@ class LegacyCoupler(RBC):
                         # FEM -> MPM
                         mpm_grid_pos = (mpm_grid_I + self.mpm_solver.grid_offset) * self.mpm_solver.dx
                         signed_dist = (mpm_grid_pos - pos).dot(surface_normal)
-                        if signed_dist <= self.mpm_solver.dx:  # NOTE: use dx as minimal unit for collision
+                        # NOTE: use dx as minimal unit for collision
+                        if is_cell_in_grid and signed_dist <= self.mpm_solver.dx:
                             vel_mpm_at_cell = mpm_weight * self.mpm_solver.grid[f, mpm_grid_I, i_b].vel_out
                             mass_mpm_at_cell = mpm_weight * mpm_grid_mass
 
@@ -859,7 +881,7 @@ class LegacyCoupler(RBC):
                 f,
                 self.rigid_solver.dyn_state.geoms,
                 self.rigid_solver.dyn_info.geoms,
-                self.rigid_solver.collider.sdf.sdf_info,
+                self.rigid_solver.collider.collider_info.sdf,
                 self.rigid_solver.rigid_info,
                 self.rigid_solver.collider.collider_config,
             )
@@ -874,7 +896,7 @@ class LegacyCoupler(RBC):
                 geoms_info=self.rigid_solver.dyn_info.geoms,
                 links_state=self.rigid_solver.dyn_state.links,
                 rigid_info=self.rigid_solver.rigid_info,
-                sdf_info=self.rigid_solver.collider.sdf.sdf_info,
+                sdf_info=self.rigid_solver.collider.collider_info.sdf,
                 collider_config=self.rigid_solver.collider.collider_config,
             )
 
@@ -887,7 +909,7 @@ class LegacyCoupler(RBC):
                 self.rigid_solver.dyn_state.links,
                 self.rigid_solver.dyn_info.links,
                 self.rigid_solver.rigid_info,
-                self.rigid_solver.collider.sdf.sdf_info,
+                self.rigid_solver.collider.collider_info.sdf,
                 self.rigid_solver.collider.collider_config,
             )
 
@@ -897,7 +919,7 @@ class LegacyCoupler(RBC):
                 geoms_state=self.rigid_solver.dyn_state.geoms,
                 geoms_info=self.rigid_solver.dyn_info.geoms,
                 links_state=self.rigid_solver.dyn_state.links,
-                sdf_info=self.rigid_solver.collider.sdf.sdf_info,
+                sdf_info=self.rigid_solver.collider.collider_info.sdf,
                 rigid_info=self.rigid_solver.rigid_info,
                 collider_config=self.rigid_solver.collider.collider_config,
             )
@@ -914,7 +936,7 @@ class LegacyCoupler(RBC):
                 self.rigid_solver.dyn_info.geoms,
                 self.rigid_solver.dyn_state.links,
                 self.rigid_solver.rigid_info,
-                self.rigid_solver.collider.sdf.sdf_info,
+                self.rigid_solver.collider.collider_info.sdf,
                 self.rigid_solver.collider.collider_config,
             )
             self.fem_rigid_link_constraints()
