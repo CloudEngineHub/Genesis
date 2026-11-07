@@ -10,7 +10,7 @@ import typing
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextvars import ContextVar
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from typing import Annotated, Any, ClassVar, NamedTuple, dataclass_transform
 
 import numpy as np
@@ -20,7 +20,6 @@ import pydantic
 from pydantic import TypeAdapter
 
 import quadrants as qd
-from quadrants.lang import impl
 from quadrants.lang.util import to_numpy_type
 
 import genesis as gs
@@ -28,10 +27,6 @@ from genesis.typing import StrictBool, StrictInt, ValidFloat
 from genesis.utils.misc import data_to_array, get_own_annotations
 
 
-# FIXME: quadrants#936 - a vector or matrix tensor takes no layout, so those read environment by environment are
-# allocated and indexed with the environment first instead of last, against the convention of every other tensor.
-# FIXME: quadrants#935 - indexing a laid-out tensor by a list or tuple skips its axis permutation, so laid-out tensors
-# are indexed by plain subscripts alone.
 def V(*args, **kwargs):
     return qd.tensor(*args, backend=qd.Backend.NDARRAY if gs.use_ndarray else qd.Backend.FIELD, **kwargs)
 
@@ -42,10 +37,10 @@ class StaticConfig:
     """
     Base of the static configs, the compile-time switches kernels take as `qd.template()`.
 
-    A subclass declares its fields as annotations of type bool, int, IntEnum or another static config, an optional
-    default as their value. Kernels key their compiled instances on the configs they take, by equality, so a rebuilt
-    scene with the same values reuses its kernels. A config is immutable, since a write would change the key under which
-    its kernels are stored and leave them unreachable.
+    A subclass declares its fields as annotations of type bool, int, IntEnum, StrEnum or another static config, an
+    optional default as their value. Kernels key their compiled instances on the configs they take, by equality, so a
+    rebuilt scene with the same values reuses its kernels. A config is immutable, since a write would change the key
+    under which its kernels are stored and leave them unreachable.
     """
 
     def __init_subclass__(cls, **kwargs):
@@ -63,12 +58,12 @@ class StaticConfig:
                 validators[key] = TypeAdapter(StrictBool)
             elif annotation is int:
                 validators[key] = TypeAdapter(StrictInt)
-            elif isinstance(annotation, type) and issubclass(annotation, IntEnum):
+            elif isinstance(annotation, type) and issubclass(annotation, (IntEnum, StrEnum)):
                 validators[key] = TypeAdapter(annotation)
             elif isinstance(annotation, type) and issubclass(annotation, StaticConfig):
                 validators[key] = TypeAdapter(annotation, config=pydantic.ConfigDict(arbitrary_types_allowed=True))
             else:
-                raise TypeError(f"{name}.{key}: a static config holds bool, int, IntEnum or static configs.")
+                raise TypeError(f"{name}.{key}: a static config holds bool, int, IntEnum, StrEnum or static configs.")
         defaults = {key: cls.__dict__[key] for key in annotations if key in cls.__dict__}
 
         def __init__(self, **kwargs):
@@ -173,6 +168,9 @@ class SizeExpr(_SizeArithmetic):
 
 # The environments, the last axis of every per-environment array in canonical order
 ENVS = Size("envs")
+# The workers of a detection scratch: one per environment, or one per thread of a pass draining a queue of pairs. They
+# stand for the environments in the memory order of the arrays (see 'env_first' in Data).
+WORKERS = Size("workers")
 
 
 class FieldRef:
@@ -730,35 +728,6 @@ def _selection_depth(scope, items, leaf) -> int | None:
     return max(depths, default=None)
 
 
-# FIXME: quadrants#941 - a Python-scope fill of a field still being declared closes its SNode tree, one tree per filled
-# constant. A constant waits for the next materialization instead, at the cost of one synchronization there.
-_pending_fields_fill: list[tuple[qd.Tensor, Any]] = []
-_materialize = impl.PyQuadrants.materialize
-_clear = impl.PyQuadrants.clear
-
-
-def _materialize_then_fill(self):
-    _materialize(self)
-    # The list is emptied before replaying it, since each fill launches a kernel that materializes again. The replay
-    # ends with a synchronization because a DLPack export materializes right before handing out its buffer, which
-    # leaves its caller no chance to synchronize between the fill and the first read.
-    fields_fill = _pending_fields_fill.copy()
-    _pending_fields_fill.clear()
-    for tensor, value in fields_fill:
-        tensor.fill(value)
-    if fields_fill:
-        self.prog.synchronize()
-
-
-def _clear_then_drop_fills(self):
-    _clear(self)
-    _pending_fields_fill.clear()
-
-
-impl.PyQuadrants.materialize = _materialize_then_fill
-impl.PyQuadrants.clear = _clear_then_drop_fills
-
-
 def _allocate(struct_name, leaf, properties, sizes, values, requires_grad):
     # The element type, its base resolved to the precision of the simulation and its element shape to the sizes
     dtype, element_shape = leaf.spec.dtype if isinstance(leaf.spec.dtype, tuple) else (leaf.spec.dtype, ())
@@ -784,17 +753,9 @@ def _allocate(struct_name, leaf, properties, sizes, values, requires_grad):
         value = values
         for name in leaf.path:
             value = value[name]
-        array = V(dtype=dtype, shape=())
         if isinstance(value, tuple):
             value = qd.Vector(value, dt=dtype.dtype)
-        # Filling a field now would close the SNode tree still collecting fields, so the fill waits for the next
-        # materialization (see quadrants#941 above). An ndarray is filled at once: on CPU and Compute Unified Device
-        # Architecture (CUDA) GPUs, its zero-copy export materializes nothing, so a deferred fill would come too late.
-        if not gs.use_ndarray:
-            _pending_fields_fill.append((array, value))
-        else:
-            array.fill(value)
-        return array
+        return V(dtype=dtype, shape=(), fill=value)
 
     dims, axes = [], []
     for dim in leaf.shape:
@@ -808,10 +769,10 @@ def _allocate(struct_name, leaf, properties, sizes, values, requires_grad):
         axes.append(dim)
     layout = properties.get("layout")
     if properties.get("env_first") is not None:
-        if ENVS not in axes:
+        i_env = next((i for i, dim in enumerate(axes) if dim is ENVS or dim is WORKERS), None)
+        if i_env is None:
             raise TypeError(f"'env_first' selects {'.'.join(leaf.path)}, which spans no environment dimension.")
-        order = [i for i, dim in enumerate(axes) if dim != ENVS]
-        i_env = axes.index(ENVS)
+        order = [i for i in range(len(axes)) if i != i_env]
         order = [i_env, *order] if properties["env_first"] else [*order, i_env]
         layout = tuple(order) if order != list(range(len(axes))) else None
     # A tensor holds at most 2^31 - 1 elements, and at most 2 GiB on Metal

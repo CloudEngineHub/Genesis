@@ -10,6 +10,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.constants import link_ref_frame
 from genesis.engine.entities import DroneEntity, RigidEntity, TerrainEntity
+from genesis.engine.entities.rigid_entity.description import _balanced_variant_mapping
 from genesis.engine.materials import Rigid
 from genesis.engine.state_change import MutatedLinks, StateChange, mutates
 from genesis.engine.states import RigidSolverState, SolverCheckpoint
@@ -45,7 +46,6 @@ from genesis.utils.misc import (
 from ..base_solver import GravityMixin, TimeBasedMixin
 from ..kinematic_solver import (
     KinematicSolver,
-    _balanced_variant_mapping,
     _fill_base_link_geom_offsets,
     _offset_world_shift,
     _select_links_offset,
@@ -245,11 +245,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         else:
             self._hibernation_thresh_vel = options.hibernation_thresh_vel
 
-        self._sol_min_timeconst = TIME_CONSTANT_SAFETY_FACTOR * self._substep_dt
-        self._sol_default_timeconst = (
-            None if options.constraint_timeconst is None else max(options.constraint_timeconst, self._sol_min_timeconst)
-        )
-
         if options.friction_cone == gs.friction_cone.elliptic and self._requires_grad:
             gs.raise_exception("The elliptic friction cone is not supported yet when 'requires_grad' is True.")
         if options.box_box_detection and self._requires_grad:
@@ -295,6 +290,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         self.qpos: qd.Tensor | qd.Field | qd.Ndarray | None = None
 
     def build(self):
+        # The simulator settles the substep shared by every solver before building them, possibly at the rate another
+        # solver asks for, so the time constants are floored against it here rather than at construction.
+        self._sol_min_timeconst = TIME_CONSTANT_SAFETY_FACTOR * self._substep_dt
+        self._sol_default_timeconst = None
+        if self._options.constraint_timeconst is not None:
+            self._sol_default_timeconst = max(self._options.constraint_timeconst, self._sol_min_timeconst)
+
         self._n_geoms = self.n_geoms
         self._n_verts = self.n_verts
         self._n_free_verts = self.n_free_verts
