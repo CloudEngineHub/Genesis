@@ -49,6 +49,7 @@ class Muscle(Elastic):
     _update_stress_without_actuation: Any = PrivateAttr(default=None)
     _build_without_actuation: Any = PrivateAttr(default=None)
     _pre_compute_without_actuation: Any = PrivateAttr(default=None)
+    _pre_compute_grad_without_actuation: Any = PrivateAttr(default=None)
     _compute_energy_gradient_without_actuation: Any = PrivateAttr(default=None)
     _compute_energy_without_actuation: Any = PrivateAttr(default=None)
 
@@ -62,6 +63,8 @@ class Muscle(Elastic):
         self.build = self._build_with_actuation
         self._pre_compute_without_actuation = self.pre_compute
         self.pre_compute = self._pre_compute_with_actuation
+        self._pre_compute_grad_without_actuation = self.pre_compute_grad
+        self.pre_compute_grad = self._pre_compute_grad_with_actuation
         self._compute_energy_gradient_without_actuation = self.compute_energy_gradient
         self.compute_energy_gradient = self._compute_energy_gradient_with_actuation
         self._compute_energy_without_actuation = self.compute_energy
@@ -81,6 +84,31 @@ class Muscle(Elastic):
         self._pre_compute_without_actuation(i_e, i_b, J, F, m_dir)
         fiber = F @ m_dir
         self._fibers_dir[i_b, i_e] = fiber / fiber.norm(self._fiber_length_eps[None])
+
+    @qd.func
+    def _pre_compute_grad_with_actuation(
+        self,
+        i_e: int,
+        i_b: int,
+        mu: float,
+        lam: float,
+        F_start: qd.types.matrix(3, 3),
+        F: qd.types.matrix(3, 3),
+        dF_damping: qd.types.matrix(3, 3),
+        gradient_grad: qd.types.matrix(3, 3),
+        actu: float,
+        m_dir: qd.types.vector(3),
+    ):
+        F_start_grad = self._pre_compute_grad_without_actuation(
+            i_e, i_b, mu, lam, F_start, F, dF_damping, gradient_grad, actu, m_dir
+        )
+        # The fiber direction enters the energy gradient through the active stress stiffness * actu * fiber_dir m^T
+        fiber_dir_grad = self.stiffness * actu * gradient_grad @ m_dir
+        fiber = F_start @ m_dir
+        fiber_length = fiber.norm(self._fiber_length_eps[None])
+        fiber_dir = fiber / fiber_length
+        fiber_grad = (fiber_dir_grad - fiber_dir.dot(fiber_dir_grad) * fiber_dir) / fiber_length
+        return F_start_grad + fiber_grad.outer_product(m_dir)
 
     @qd.func
     def _compute_energy_gradient_with_actuation(
