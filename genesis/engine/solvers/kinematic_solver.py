@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
@@ -12,35 +12,28 @@ from genesis.engine.entities.rigid_entity.description import _balanced_variant_m
 from genesis.engine.entities.rigid_entity.rigid_entity import get_variants_kinematics
 from genesis.engine.materials import Kinematic
 from genesis.engine.solvers.rigid.abd.inverse_kinematics import (
+    IKScratch,
     kernel_forward_kinematics_query,
     kernel_get_jacobian,
     kernel_get_jacobian_zero,
     kernel_inverse_kinematics_entity,
     kernel_set_ik_targets,
 )
+from genesis.engine.solvers.rigid.data import RigidConfig, RigidData
 from genesis.engine.state_change import MutatedLinks, StateChange, mutates
-from genesis.engine.states.solvers import KinematicSolverState, SolverCheckpoint
+from genesis.engine.states.solvers import SolverCheckpoint
 from genesis.options.morphs import Morph
 from genesis.options.solvers import KinematicOptions
-from genesis.utils.array_class import IKScratch, RigidData, RigidSimStaticConfig
 from genesis.utils.data import ConfigItem, DataItem, DataKind, iter_data
-from genesis.utils.misc import (
-    assign_indexed_tensor,
-    broadcast_tensor,
-    indices_to_mask,
-    qd_to_numpy,
-    qd_to_torch,
-)
+from genesis.utils.misc import assign_indexed_tensor, broadcast_tensor, indices_to_mask, qd_to_numpy, qd_to_torch
 
 from .base_solver import Solver
 from .rigid.abd.accessor import (
-    kernel_get_kinematic_state,
     kernel_get_links_vel,
     kernel_get_terrain_height,
     kernel_set_dofs_position,
     kernel_set_dofs_velocity,
     kernel_set_dofs_zero_velocity,
-    kernel_set_kinematic_state,
     kernel_set_links_pos,
     kernel_set_links_quat,
     kernel_set_qpos,
@@ -326,7 +319,7 @@ class KinematicSolver(Solver):
         self.n_custom_vfaces_ = max(1, self.n_custom_vfaces)
         self.n_entities_ = max(1, self.n_entities)
 
-        # The kinematic roots and trees, see roots_link_idx and trees_root_idx in array_class.py. A link no dof moves,
+        # The kinematic roots and trees, see roots_link_idx and trees_root_idx in rigid/data.py. A link no dof moves,
         # its own or an ancestor's, is static and belongs to no tree. A moving link roots the tree of its parent, or its
         # own when its parent is static or absent. The parents precede the children.
         self._n_roots = len({link.root_idx for link in self.links})
@@ -344,7 +337,7 @@ class KinematicSolver(Solver):
         self.n_trees_ = max(1, self._n_trees)
 
         # The level of a link in its root and in its tree is its number of ancestors below the root link of either (see
-        # trees_levels_links_idx in array_class.py). Each pass moves every link one ancestor up, so the depth of a link
+        # trees_levels_links_idx in rigid/data.py). Each pass moves every link one ancestor up, so the depth of a link
         # is the number of passes it takes to run out of parents.
         links_depth = np.zeros(self.n_links, dtype=gs.np_int)
         links_ancestor_idx = self._links_parent_idx
@@ -363,7 +356,7 @@ class KinematicSolver(Solver):
             self._options.batch_joints_info = True
             self._options.batch_dofs_info = True
 
-        self._build_static_config()
+        self._build_config()
         self._create_data_manager()
 
         self._init_dof_fields()
@@ -390,9 +383,9 @@ class KinematicSolver(Solver):
         self.update_vgeoms()
         self.update_vverts_for_vgeoms(opt_in_vgeoms_idx)
 
-    def _build_static_config(self):
+    def _build_config(self):
         # Static config with all physics disabled
-        self.rigid_config = RigidSimStaticConfig(
+        self.rigid_config = RigidConfig(
             backend=gs.backend,
             para_level=self.sim._para_level,
             requires_grad=False,
@@ -467,13 +460,13 @@ class KinematicSolver(Solver):
 
     def _init_tree_fields(self):
         """Initialize the fields describing the kinematic roots and trees (see roots_link_idx and trees_root_idx in
-        array_class.py).
+        rigid/data.py).
 
         The links come parent first and each branch occupies a contiguous index range, so the dofs of a tree form one
         contiguous range and the trees are disjoint in dof space.
         """
         # A static link belongs to no tree, and a scene without any tree keeps its padded tree slot empty (see
-        # trees_root_idx in array_class.py)
+        # trees_root_idx in rigid/data.py)
         links_tree_idx = np.full(self.n_links_, -1, dtype=gs.np_int)
         if self._n_roots:
             roots_link_idx, links_root_rank = np.unique(self._links_root_idx, return_inverse=True)
@@ -516,7 +509,7 @@ class KinematicSolver(Solver):
         self.rigid_info.links_tree_idx.from_numpy(links_tree_idx)
 
         # Fill the level tables of every tree and root for the level sweep (see trees_levels_links_idx in
-        # array_class.py). A scene without any tree keeps its padded tree slot at zero levels.
+        # rigid/data.py). A scene without any tree keeps its padded tree slot at zero levels.
         if self._n_roots and self.rigid_config.enable_level_sweep:
             for links_group_idx, links_group_level, n_groups, groups_fields in (
                 (
@@ -847,50 +840,51 @@ class KinematicSolver(Solver):
     # -------------------------------- state get/set -------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def get_state(self, f=None):
-        if self.is_active:
-            state = KinematicSolverState(self._scene, self.sim.cur_step_global)
+    def get_state(self) -> SolverCheckpoint:
+        # The poses of the links a state holds are those its configuration implies, which the step loop leaves one
+        # integration behind whenever it defers the refresh that follows it
+        self.update_forward_pos()
+        return super().get_state()
 
-            kernel_get_kinematic_state(
-                state.qpos,
-                state.dofs_vel,
-                state.links_pos,
-                state.links_quat,
+    @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
+    def set_state(
+        self,
+        state: SolverCheckpoint,
+        envs_idx: int | Sequence[int] | np.ndarray | torch.Tensor | None = None,
+        *,
+        partial: bool = False,
+    ) -> None:
+        """
+        Write back the state 'get_state' returned, for the given environments, all of them if None.
+
+        With `partial`, the forward kinematics of the restored configuration is left to the next step, which spares it
+        to a reset followed by setters. The link poses read before that step are those of the previous configuration.
+        """
+        super().set_state(state, envs_idx)
+        if partial:
+            self._is_forward_pos_updated = False
+            self._is_forward_vel_updated = False
+        else:
+            # FIXME: quadrants#1086 - fast math reassociates sums by code layout, so the kinematics recomputed here can
+            # differ in the last bits from those the step left, and a replay from a saved state matches up to rounding.
+            kernel_forward_kinematics(
+                self._scene._sanitize_envs_idx(envs_idx),
                 self.dyn_state,
+                self.dyn_info,
                 self.rigid_info,
                 self.rigid_config,
             )
-        else:
-            state = None
-        return state
-
-    @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
-    def set_state(self, f, state, envs_idx=None, *, partial: bool = False) -> None:
-        if not self.is_active:
-            return
-
-        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-
-        kernel_set_kinematic_state(
-            envs_idx,
-            state.qpos,
-            state.dofs_vel,
-            state.links_pos,
-            state.links_quat,
-            self.dyn_state,
-            self.rigid_info,
-            self.rigid_config,
-        )
-        if not partial:
-            kernel_forward_kinematics(envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
             self._is_forward_pos_updated = True
             self._is_forward_vel_updated = True
-        else:
-            self._is_forward_pos_updated = False
-            self._is_forward_vel_updated = False
 
-    def load_checkpoint(self, checkpoint: SolverCheckpoint, *, boundary_only: bool = False) -> None:
-        super().load_checkpoint(checkpoint, boundary_only=boundary_only)
+    def load_checkpoint(
+        self,
+        checkpoint: SolverCheckpoint,
+        *,
+        boundary_only: bool = False,
+        envs_idx: int | Sequence[int] | np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        super().load_checkpoint(checkpoint, boundary_only=boundary_only, envs_idx=envs_idx)
         if DataKind.DERIVED not in checkpoint.kinds:
             # Without the derived arrays, the next step recomputes them from the state. A restored record runs forward
             # kinematics at once, since the scene may be drawn from it, while the replay of a step restoring a boundary

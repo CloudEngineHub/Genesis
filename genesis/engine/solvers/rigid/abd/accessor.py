@@ -15,7 +15,9 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.array_class import ColliderState, ConstraintState, DynInfo, DynState, RigidInfo
+from genesis.engine.solvers.rigid.collider.data import ColliderState
+from genesis.engine.solvers.rigid.constraint.data import ConstraintState
+from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
 from genesis.utils.data import eoa
 
 from .forward_dynamics import func_refresh_links_invweight_and_meaninertia
@@ -28,115 +30,6 @@ class ConstraintType(IntEnum):
     GEOM = 0
     JOINT = 1
     EQUALITY = 2
-
-
-@qd.kernel(fastcache=True)
-def kernel_get_kinematic_state(
-    qpos: qd.types.ndarray(),
-    vel: qd.types.ndarray(),
-    links_pos: qd.types.ndarray(),
-    links_quat: qd.types.ndarray(),
-    dyn_state: DynState,
-    rigid_info: RigidInfo,
-    rigid_config: qd.template(),
-):
-    n_qs = qpos.shape[1]
-    n_dofs = vel.shape[1]
-    n_links = links_pos.shape[1]
-    _B = qpos.shape[0]
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_q, i_b in qd.ndrange(n_qs, _B, axes=qd.static(eoa(rigid_info.qpos))):
-        qpos[i_b, i_q] = rigid_info.qpos[i_q, i_b]
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_d, i_b in qd.ndrange(n_dofs, _B, axes=qd.static(eoa(dyn_state.dofs.vel))):
-        vel[i_b, i_d] = dyn_state.dofs.vel[i_d, i_b]
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_l, i_b in qd.ndrange(n_links, _B, axes=qd.static(eoa(dyn_state.links.pos))):
-        for j in qd.static(range(3)):
-            links_pos[i_b, i_l, j] = dyn_state.links.pos[i_l, i_b][j]
-        for j in qd.static(range(4)):
-            links_quat[i_b, i_l, j] = dyn_state.links.quat[i_l, i_b][j]
-
-
-@qd.kernel(fastcache=True)
-def kernel_set_kinematic_state(
-    envs_idx: qd.types.ndarray(),
-    qpos: qd.types.ndarray(),
-    dofs_vel: qd.types.ndarray(),
-    links_pos: qd.types.ndarray(),
-    links_quat: qd.types.ndarray(),
-    dyn_state: DynState,
-    rigid_info: RigidInfo,
-    rigid_config: qd.template(),
-):
-    n_qs = qpos.shape[1]
-    n_dofs = dofs_vel.shape[1]
-    n_links = links_pos.shape[1]
-    _B = envs_idx.shape[0]
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_q, i_b_ in qd.ndrange(n_qs, _B, axes=qd.static(eoa(rigid_info.qpos))):
-        rigid_info.qpos[i_q, envs_idx[i_b_]] = qpos[envs_idx[i_b_], i_q]
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_d, i_b_ in qd.ndrange(n_dofs, _B, axes=qd.static(eoa(dyn_state.dofs.vel))):
-        dyn_state.dofs.vel[i_d, envs_idx[i_b_]] = dofs_vel[envs_idx[i_b_], i_d]
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_l, i_b_ in qd.ndrange(n_links, _B, axes=qd.static(eoa(dyn_state.links.pos))):
-        for j in qd.static(range(3)):
-            dyn_state.links.pos[i_l, envs_idx[i_b_]][j] = links_pos[envs_idx[i_b_], i_l, j]
-        for j in qd.static(range(4)):
-            dyn_state.links.quat[i_l, envs_idx[i_b_]][j] = links_quat[envs_idx[i_b_], i_l, j]
-
-
-@qd.kernel(fastcache=True)
-def kernel_set_state(
-    envs_idx: qd.types.ndarray(),
-    qpos: qd.types.ndarray(),
-    dofs_vel: qd.types.ndarray(),
-    dofs_acc: qd.types.ndarray(),
-    links_pos: qd.types.ndarray(),
-    links_quat: qd.types.ndarray(),
-    friction_ratio: qd.types.ndarray(),
-    dyn_state: DynState,
-    rigid_info: RigidInfo,
-    rigid_config: qd.template(),
-):
-    n_qs = qpos.shape[1]
-    n_dofs = dofs_vel.shape[1]
-    n_links = links_pos.shape[1]
-    n_geoms = friction_ratio.shape[1]
-    _B = envs_idx.shape[0]
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_q, i_b_ in qd.ndrange(n_qs, _B, axes=qd.static(eoa(rigid_info.qpos))):
-        rigid_info.qpos[i_q, envs_idx[i_b_]] = qpos[envs_idx[i_b_], i_q]
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_d, i_b_ in qd.ndrange(n_dofs, _B, axes=qd.static(eoa(dyn_state.dofs.vel))):
-        dyn_state.dofs.vel[i_d, envs_idx[i_b_]] = dofs_vel[envs_idx[i_b_], i_d]
-        dyn_state.dofs.acc[i_d, envs_idx[i_b_]] = dofs_acc[envs_idx[i_b_], i_d]
-        dyn_state.dofs.ctrl_force[i_d, envs_idx[i_b_]] = gs.qd_float(0.0)
-        dyn_state.dofs.ctrl_mode[i_d, envs_idx[i_b_]] = gs.CTRL_MODE.FORCE
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_l, i_b_ in qd.ndrange(n_links, _B, axes=qd.static(eoa(dyn_state.links.pos))):
-        for j in qd.static(range(3)):
-            dyn_state.links.pos[i_l, envs_idx[i_b_]][j] = links_pos[envs_idx[i_b_], i_l, j]
-            dyn_state.links.cfrc_applied_vel[i_l, envs_idx[i_b_]][j] = 0.0
-            dyn_state.links.cfrc_applied_ang[i_l, envs_idx[i_b_]][j] = 0.0
-            dyn_state.links.cfrc_coupling_vel[i_l, envs_idx[i_b_]][j] = 0.0
-            dyn_state.links.cfrc_coupling_ang[i_l, envs_idx[i_b_]][j] = 0.0
-        for j in qd.static(range(4)):
-            dyn_state.links.quat[i_l, envs_idx[i_b_]][j] = links_quat[envs_idx[i_b_], i_l, j]
-
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_l, i_b_ in qd.ndrange(n_geoms, _B, axes=qd.static(eoa(dyn_state.geoms.friction_ratio))):
-        dyn_state.geoms.friction_ratio[i_l, envs_idx[i_b_]] = friction_ratio[envs_idx[i_b_], i_l]
 
 
 @qd.kernel(fastcache=True)
@@ -210,7 +103,7 @@ def kernel_wake_up_entities_held_by_links(
     """Wake up the hibernated islands resting on or constrained to the specified links.
 
     A fixed link never sleeps, so moving it wakes nothing by itself, while the links it holds would stay asleep where
-    it was. They are found through the contacts a sleeper keeps (see n_contacts_hibernated in array_class.py) and the
+    it was. They are found through the contacts a sleeper keeps (see n_contacts_hibernated in collider/data.py) and the
     equality constraints.
     """
     n_links = rigid_info.links_tree_idx.shape[0]

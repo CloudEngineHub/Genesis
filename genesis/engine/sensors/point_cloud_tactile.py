@@ -11,14 +11,16 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.sdf as sdf
+from genesis.engine.bvh import BVHTreeState
+from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
 from genesis.options.sensors import (
     ElastomerTaxel as ElastomerTaxelSensorOptions,
     ProximityTaxel as ProximityTaxelOptions,
 )
-from genesis.utils.array_class import BVHTreeState, ColliderInfo, DynInfo, DynState
 from genesis.utils.misc import concat_with_tensor, make_tensor_field, tensor_to_array
 from genesis.utils.point_cloud import sample_mesh_point_cloud
 from genesis.utils.raycast_qd import closest_point_on_triangle, get_triangle_vertices, triangle_face_normal
+from genesis.utils.sdf import SDFInfo
 
 from .base_sensor import RigidSensorMetadataMixin, RigidSensorMixin, SimpleSensor, SimpleSensorMetadata
 from .probe import (
@@ -374,6 +376,7 @@ def _kernel_point_cloud_proximity_taxel_bvh(
     taxel_signal_buf: qd.types.ndarray(),
     dyn_state: DynState,
     eps: float,
+    bvh_stack_size: qd.template(),
 ):
     total_n_probes = probe_positions_local.shape[0]
     n_batches = output_gt.shape[-1]
@@ -440,7 +443,7 @@ def _kernel_point_cloud_proximity_taxel_bvh(
             # BVH nodes live in tracked-link local frame: bring the probe sphere center over.
             probe_link = gu.qd_inv_transform_by_trans_quat(probe_world, track_pos, track_quat)
 
-            stack = qd.Vector.zero(gs.qd_int, qd.static(BVH_STACK_SIZE))
+            stack = qd.Vector.zero(gs.qd_int, qd.static(bvh_stack_size))
             stack[0] = bvh.chunk_node_start[i_c]
             stack_idx = 1
 
@@ -496,7 +499,7 @@ def _kernel_point_cloud_proximity_taxel_bvh(
                     right = bvh.node_right[n]
                     # Median split bounds depth at log2(N / leaf_size) << BVH_STACK_SIZE; the guard mirrors the
                     # global rigid-BVH kernel so a future build strategy can't silently overflow the stack.
-                    if stack_idx < qd.static(BVH_STACK_SIZE - 2):
+                    if stack_idx < qd.static(bvh_stack_size - 2):
                         stack[stack_idx] = left
                         stack[stack_idx + 1] = right
                         stack_idx += 2
@@ -799,6 +802,7 @@ class ProximityTaxelSensor(
             shared_metadata.taxel_signal_buf,
             solver.dyn_state,
             gs.EPS,
+            BVH_STACK_SIZE,
         )
         if ground_truth_data_timeline is not None:
             ground_truth_data_timeline.at(0, copy=False).copy_(current_ground_truth_data_T.T)
@@ -828,7 +832,7 @@ def _func_elastomer_min_sdf_over_active_geoms(
     geom_active_envs_mask: qd.types.ndarray(),
     dyn_state: DynState,
     dyn_info: DynInfo,
-    collider_info: ColliderInfo,
+    sdf_info: SDFInfo,
 ) -> float:
     min_sdf = float(1.0e6)
     geom_end = geom_start + geom_n
@@ -851,7 +855,7 @@ def _func_elastomer_min_sdf_over_active_geoms(
             or point_world[2] > amax[2]
         ):
             continue
-        sd = sdf.sdf_func_world(i_g, i_b, point_world, dyn_state.geoms, dyn_info.geoms, collider_info.sdf)
+        sd = sdf.sdf_func_world(i_g, i_b, point_world, dyn_state.geoms, dyn_info.geoms, sdf_info)
         if sd < min_sdf:
             min_sdf = sd
     return min_sdf
@@ -1081,6 +1085,7 @@ def _func_elastomer_min_signed_dist_bvh(
     bvh_tree_state: BVHTreeState,
     dyn_info: DynInfo,
     max_query_dist: float,
+    eps: float,
 ) -> float:
     """
     BVH-based signed distance from ``probe_world`` to the nearest triangle of any geom flagged for this sensor in
@@ -1131,7 +1136,7 @@ def _func_elastomer_min_signed_dist_bvh(
             d_sq = diff.dot(diff)
             if d_sq < best_dist_sq:
                 d = qd.sqrt(d_sq)
-                fn = triangle_face_normal(v0, v1, v2)
+                fn = triangle_face_normal(v0, v1, v2, eps)
                 # Sign: probe outside if (probe - closest) aligns with outward face normal.
                 sign_v = qd.select(diff.dot(fn) >= gs.qd_float(0.0), gs.qd_float(1.0), gs.qd_float(-1.0))
                 best_signed = d * sign_v
@@ -1160,6 +1165,7 @@ def _kernel_elastomer_probe_depth_bvh(
     bvh_tree_state_a: BVHTreeState,
     bvh_tree_state_b: BVHTreeState,
     dyn_info: DynInfo,
+    rigid_info: RigidInfo,
     max_query_dist: float,
     is_split: qd.template(),
 ):
@@ -1194,6 +1200,7 @@ def _kernel_elastomer_probe_depth_bvh(
             bvh_tree_state_a,
             dyn_info,
             max_query_dist,
+            eps=rigid_info.EPS[None],
         )
         if is_split:
             # The collision faces are partitioned over two trees (see RaycastContext.activate); |signed| is the
@@ -1208,6 +1215,7 @@ def _kernel_elastomer_probe_depth_bvh(
                 bvh_tree_state_b,
                 dyn_info,
                 max_query_dist,
+                eps=rigid_info.EPS[None],
             )
             if qd.abs(signed_b) < qd.abs(signed):
                 signed = signed_b
@@ -1227,7 +1235,7 @@ def _kernel_elastomer_probe_depth(
     probe_depth_buf: qd.types.ndarray(),
     dyn_state: DynState,
     dyn_info: DynInfo,
-    collider_info: ColliderInfo,
+    sdf_info: SDFInfo,
 ):
     """Per-probe contact depth from track-geom SDF, parallel over (env, probe).
 
@@ -1258,7 +1266,7 @@ def _kernel_elastomer_probe_depth(
             track_geom_active_envs_mask,
             dyn_state,
             dyn_info,
-            collider_info,
+            sdf_info,
         )
 
         probe_depth_buf[i_b, i_p] = qd.max(gs.qd_float(0.0), -min_sdf)
@@ -1359,7 +1367,7 @@ def _kernel_elastomer_surface_state_bvh(
     surface_candidate_buf: qd.types.ndarray(),
     dyn_state: DynState,
     dyn_info: DynInfo,
-    collider_info: ColliderInfo,
+    sdf_info: SDFInfo,
     aabb_margin: float,
     bvh_stack_size: qd.template(),
 ):
@@ -1472,7 +1480,7 @@ def _kernel_elastomer_surface_state_bvh(
                         elastomer_geom_active_envs_mask,
                         dyn_state,
                         dyn_info,
-                        collider_info,
+                        sdf_info,
                     )
 
                     surface_depth_buf[i_b, i_o] = qd.max(gs.qd_float(0.0), -min_sdf)
@@ -1522,6 +1530,7 @@ def _kernel_elastomer_surface_state_via_global_bvh(
     global_bvh_tree_a: BVHTreeState,
     global_bvh_tree_b: BVHTreeState,
     dyn_info: DynInfo,
+    rigid_info: RigidInfo,
     aabb_margin: float,
     max_query_dist: float,
     bvh_stack_size: qd.template(),
@@ -1631,6 +1640,7 @@ def _kernel_elastomer_surface_state_via_global_bvh(
                         global_bvh_tree_a,
                         dyn_info,
                         max_query_dist,
+                        eps=rigid_info.EPS[None],
                     )
                     if is_split:
                         # See _kernel_elastomer_probe_depth_bvh for the two-tree fold.
@@ -1644,6 +1654,7 @@ def _kernel_elastomer_surface_state_via_global_bvh(
                             global_bvh_tree_b,
                             dyn_info,
                             max_query_dist,
+                            eps=rigid_info.EPS[None],
                         )
                         if qd.abs(min_sdf_b) < qd.abs(min_sdf):
                             min_sdf = min_sdf_b
@@ -2253,7 +2264,7 @@ class ElastomerTaxelSensor(
                 shared_metadata.probe_depth_buf,
                 solver.dyn_state,
                 solver.dyn_info,
-                solver.collider.collider_info,
+                solver.collider.sdf.sdf_info,
             )
         else:
             collision_bvh_contexts = shared_context.collision_bvh_contexts
@@ -2271,6 +2282,7 @@ class ElastomerTaxelSensor(
                 entry_a.bvh_state.tree,
                 entry_b.bvh_state.tree,
                 solver.dyn_info,
+                solver.rigid_info,
                 _ELASTOMER_RAYCAST_QUERY_DIST,
                 is_split=entry_b is not entry_a,
             )
@@ -2330,7 +2342,7 @@ class ElastomerTaxelSensor(
                     shared_metadata.surface_candidate_buf,
                     solver.dyn_state,
                     solver.dyn_info,
-                    solver.collider.collider_info,
+                    solver.collider.sdf.sdf_info,
                     _ELASTOMER_QUERY_AABB_MARGIN,
                     BVH_STACK_SIZE,
                 )
@@ -2361,6 +2373,7 @@ class ElastomerTaxelSensor(
                     entry_a.bvh_state.tree,
                     entry_b.bvh_state.tree,
                     solver.dyn_info,
+                    solver.rigid_info,
                     _ELASTOMER_QUERY_AABB_MARGIN,
                     _ELASTOMER_RAYCAST_QUERY_DIST,
                     BVH_STACK_SIZE,

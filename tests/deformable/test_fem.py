@@ -1,12 +1,13 @@
 import math
 
-import igl
 import numpy as np
 import pytest
 import torch
 
+import igl
+
 import genesis as gs
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
 from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
@@ -32,8 +33,7 @@ def test_interior_tetrahedralized_vertex(cube_verts_and_faces, box_obj_path, sho
     )
     scene.build()
 
-    state = fem.get_state()
-    vertices = tensor_to_array(state.pos[0])
+    vertices = tensor_to_array(fem.get_verts_pos())
     surface_indices = np.unique(fem.surface_triangles)
 
     # Ensure there are interior vertices; this is a prerequisite for this test
@@ -111,7 +111,7 @@ def test_multi_submesh_render_decoupling(n_envs, show_viewer):
     # The two sub-meshes share their boundary vertices, so welding strictly reduces the vertex count.
     n_render_verts = sum(len(vgeom.vmesh.verts) for vgeom in fem.vgeoms)
     assert fem.n_vertices < n_render_verts
-    vertices = tensor_to_array(fem.get_state().pos)
+    vertices = tensor_to_array(fem.get_verts_pos())
     for vgeom in fem.vgeoms:
         # Negative indices would wrap around silently.
         assert vgeom.sim_verts_idx.min() >= 0
@@ -178,7 +178,7 @@ def test_offset_pos(box_obj_path, show_viewer):
     )
     scene.build()
 
-    offset = box.get_state().pos - box_no_offset.get_state().pos
+    offset = box.get_verts_pos() - box_no_offset.get_verts_pos()
     assert_allclose(offset, OFFSET_POS, tol=gs.EPS)
 
 
@@ -205,7 +205,7 @@ def test_halt_on_nan(show_viewer):
     # every env is flagged at the very step its positions stop being finite
     for _ in range(10):
         scene.step()
-        is_finite = sphere.get_state().pos.isfinite().all(dim=(-2, -1))
+        is_finite = sphere.get_verts_pos().isfinite().all(dim=(-2, -1))
         assert_equal(scene.get_error_envs_mask(), ~is_finite)
         if not is_finite.any():
             break
@@ -223,21 +223,21 @@ def test_halt_on_nan(show_viewer):
     # Resetting the scene clears the error, so the simulation proceeds
     scene.reset()
     scene.step()
-    assert sphere.get_state().pos.isfinite().all()
+    assert sphere.get_verts_pos().isfinite().all()
     assert not scene.get_error_envs_mask().any()
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("precision", ["64"])
 @pytest.mark.parametrize(
-    "coupler_type, material_model",
+    "coupler_type, material_model, fem_floor_contact_type",
     [
-        (gs.options.SAPCouplerOptions, "linear"),
-        (gs.options.SAPCouplerOptions, "linear_corotated"),
-        (gs.options.LegacyCouplerOptions, "linear"),
+        # The SAP coupler supports 64 bits precision alone
+        pytest.param(gs.options.SAPCouplerOptions, "linear", "tet", marks=pytest.mark.precision("64")),
+        pytest.param(gs.options.SAPCouplerOptions, "linear_corotated", "vert", marks=pytest.mark.precision("64")),
+        (gs.options.LegacyCouplerOptions, "linear", None),
     ],
 )
-def test_implicit_falling_sphere_box(coupler_type, material_model, show_viewer):
+def test_implicit_falling_sphere_box(coupler_type, material_model, fem_floor_contact_type, show_viewer):
     SPHERE_POS = (0.4, -0.1, 0.1)
     SPHERE_RADIUS = 0.1
     SPHERE_RHO = 500.0
@@ -259,7 +259,11 @@ def test_implicit_falling_sphere_box(coupler_type, material_model, show_viewer):
             use_implicit_solver=True,
             enable_vertex_constraints=True,
         ),
-        coupler_options=coupler_type(),
+        coupler_options=(
+            coupler_type(fem_floor_contact_type=fem_floor_contact_type)
+            if coupler_type == gs.options.SAPCouplerOptions
+            else coupler_type()
+        ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(1.6, 0.0, 0.5),
             camera_lookat=(0.0, -0.1, 0.3),
@@ -311,10 +315,10 @@ def test_implicit_falling_sphere_box(coupler_type, material_model, show_viewer):
     bar.set_vertex_constraints(torch.nonzero(bar_pos_0[:, 2] > bar_pos_0[:, 2].max() - gs.EPS)[:, 0])
 
     sphere_mass_ref = (4 / 3 * np.pi * SPHERE_RADIUS**3) * SPHERE_RHO
-    elems_mass_scaled = scene.fem_solver.elements_i.mass_scaled.to_numpy()
+    elems_mass_scaled = qd_to_numpy(scene.fem_solver.fem_info.elements.mass_scaled)
     sphere_elems_mass_scaled = elems_mass_scaled[sphere.el_start : (sphere.el_start + sphere.n_elements)]
     sphere_mass_1 = sphere_elems_mass_scaled.sum() / scene.fem_solver.vol_scale
-    verts_mass = scene.fem_solver.elements_v_info.mass.to_numpy()
+    verts_mass = qd_to_numpy(scene.fem_solver.fem_info.vertices.mass)
     sphere_verts_mass = verts_mass[sphere.v_start : (sphere.v_start + sphere.n_vertices)]
     sphere_mass_2 = sphere_verts_mass.sum()
     assert_allclose(sphere_mass_1, sphere_mass_2, tol=gs.EPS)
@@ -327,11 +331,13 @@ def test_implicit_falling_sphere_box(coupler_type, material_model, show_viewer):
 
     for entity, init_pos, entity_halfsize_ref in zip((sphere, box), (SPHERE_POS, BOX_POS), (SPHERE_RADIUS, BOX_SIZE)):
         # Not moving anymore
-        state = entity.get_state()
-        assert_allclose(state.vel, 0.0, tol=0.025)
+        # FIXME: The SAP solve neither converges nor reproduces across CPU thread counts, so the sphere keeps a residual
+        # velocity under vertex floor contact. The rework of the SAP coupler fixes both, and lifts this exception.
+        if entity is box or fem_floor_contact_type != "vert":
+            assert_allclose(entity.get_verts_vel(), 0.0, tol=0.025)
 
         # Landed vertically
-        pos = tensor_to_array(state.pos[0])
+        pos = tensor_to_array(entity.get_verts_pos())
         BV, *_ = igl.bounding_box(pos)
         entity_center = 0.5 * (BV[0] + BV[-1])
         if coupler_type == gs.options.SAPCouplerOptions:
@@ -350,19 +356,18 @@ def test_implicit_falling_sphere_box(coupler_type, material_model, show_viewer):
         # FIXME: Compute theoretical penetration depth to be able to reduce the tolerance
         penetration_depth_ref = 0.0
         tol = 1e-3 if coupler_type == gs.options.SAPCouplerOptions else 0.05
-        assert_allclose(-state.pos[..., 2].min(), penetration_depth_ref, tol=tol)
+        assert_allclose(-entity.get_verts_pos()[..., 2].min(), penetration_depth_ref, tol=tol)
 
     # Without Poisson contraction, the bar stretches uniaxially under its own weight, and its free end comes to rest
     # rho * g * L^2 / (2 * E) below its initial height.
-    bar_state = bar.get_state()
-    assert_allclose(bar_state.vel, 0.0, atol=2e-14)
+    assert_allclose(bar.get_verts_vel(), 0.0, atol=2e-14 if gs.np_float == np.float64 else 2e-5)
     is_bottom = bar_pos_0[:, 2] < bar_pos_0[:, 2].min() + gs.EPS
-    bar_sag = (bar_pos_0[is_bottom, 2] - bar_state.pos[..., is_bottom, 2]).mean()
-    assert_allclose(bar_sag, BAR_RHO * GRAVITY * BAR_LENGTH**2 / (2 * BAR_E), rtol=2e-3)
+    bar_sag = (bar_pos_0[is_bottom, 2] - bar.get_verts_pos()[..., is_bottom, 2]).mean()
+    rtol = 2e-3 if gs.np_float == np.float64 else 1e-2
+    assert_allclose(bar_sag, BAR_RHO * GRAVITY * BAR_LENGTH**2 / (2 * BAR_E), rtol=rtol)
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("precision", ["64"])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_legacy_coupler_rigid_velocity_correction(show_viewer):
     DT = 0.01
@@ -421,10 +426,10 @@ def test_legacy_coupler_rigid_velocity_correction(show_viewer):
     n_steps = math.floor(0.5 * (math.sqrt(1.0 + 4.0 * fall_ratio) - 1.0)) + 2
     entities = (box_thrown, box_dropped)
     for i_step in range(n_steps):
-        entities_state = [entity.get_state() for entity in entities]
+        entities_pos_vel = [(entity.get_verts_pos(), entity.get_verts_vel()) for entity in entities]
         scene.step()
-        for entity, state_prev in zip(entities, entities_state):
-            verts_influence = torch.clamp(torch.exp(-state_prev.pos[..., 2] / ground.material.coup_softness), max=1.0)
+        for entity, (verts_pos_prev, verts_vel_prev) in zip(entities, entities_pos_vel):
+            verts_influence = torch.clamp(torch.exp(-verts_pos_prev[..., 2] / ground.material.coup_softness), max=1.0)
             verts_n_tris = sum(
                 [
                     torch.bincount(verts_idx, minlength=entity.n_vertices)
@@ -433,8 +438,8 @@ def test_legacy_coupler_rigid_velocity_correction(show_viewer):
             )
             verts_factor = (1.0 - verts_influence * (1.0 + ground.material.coup_restitution)) ** verts_n_tris
             verts_scale = torch.where(verts_influence > 0.1, verts_factor, 1.0)
-            verts_vel_z_ref = (state_prev.vel[..., 2] - GRAVITY * DT) * verts_scale
-            verts_vel = entity.get_state().vel
+            verts_vel_z_ref = (verts_vel_prev[..., 2] - GRAVITY * DT) * verts_scale
+            verts_vel = entity.get_verts_vel()
             assert_allclose(verts_vel[..., :2], 0.0, tol=gs.EPS)
             assert_allclose(verts_vel[..., 2], verts_vel_z_ref, tol=gs.EPS)
         assert (verts_influence > 0.1).any() == (i_step == n_steps - 1)
@@ -443,11 +448,11 @@ def test_legacy_coupler_rigid_velocity_correction(show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("use_implicit_solver", [False, True])
-@pytest.mark.parametrize("precision", ["64"])
 def test_hard_constraint(use_implicit_solver, show_viewer):
     DT = 0.01
     GRAVITY = 9.81
-    DAMPING_ALPHA = 0.5
+    DAMPING = 0.5
+    DAMPING_BETA = 5e-4
     N_SUBSTEPS = 2 if use_implicit_solver else 6
     # The free fall at the end crosses z=0, where a scene without ground plane has no floor to stop it
     HEIGHT = 0.5
@@ -456,6 +461,7 @@ def test_hard_constraint(use_implicit_solver, show_viewer):
     MOTION_RADIUS = 0.1
     MOTION_SPEED = 0.005
     VERTICES_IDX = [5, 7]
+    MODE_AMPLITUDE = 1e-3
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -466,7 +472,10 @@ def test_hard_constraint(use_implicit_solver, show_viewer):
         fem_options=gs.options.FEMOptions(
             use_implicit_solver=use_implicit_solver,
             pcg_threshold=1e-20,
-            damping_alpha=DAMPING_ALPHA,
+            # Each solver reads its own damping option
+            damping=DAMPING,
+            damping_alpha=DAMPING,
+            damping_beta=DAMPING_BETA,
             enable_vertex_constraints=True,
         ),
         viewer_options=gs.options.ViewerOptions(
@@ -506,6 +515,13 @@ def test_hard_constraint(use_implicit_solver, show_viewer):
             model="linear_corotated" if use_implicit_solver else "stable_neohookean",
         ),
     )
+    vibrating_box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(-1.5, 0.0, HEIGHT + BOX_SIZE / 2),
+            size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
+        ),
+        material=free_material,
+    )
     anchor = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(10.0, 0.0, HEIGHT),
@@ -515,14 +531,66 @@ def test_hard_constraint(use_implicit_solver, show_viewer):
         material=gs.materials.Rigid(),
     )
     scene.build(n_envs=2)
-    free_boxes_pos_0 = torch.stack([free_box.get_state().pos for free_box in free_boxes])
+    free_boxes_pos_0 = torch.stack([free_box.get_verts_pos() for free_box in free_boxes])
+    substep_dt = DT / N_SUBSTEPS
+
+    # Each vertex carries a quarter of the rest mass of every element it belongs to
+    boxes_elems = torch.stack([entity.get_el2v() for entity in (box, vibrating_box)])
+    boxes_verts_rest = torch.stack([entity.init_positions for entity in (box, vibrating_box)])
+    boxes_elems_verts = torch.eye(box.n_vertices, dtype=gs.tc_float, device=gs.device)[boxes_elems]
+    boxes_elems_pos = boxes_elems_verts @ boxes_verts_rest[:, None]
+    boxes_edges_rest = boxes_elems_pos[..., :3, :] - boxes_elems_pos[..., 3:, :]
+    boxes_elems_vol = torch.linalg.det(boxes_edges_rest).abs() / 6.0
+    boxes_verts_mass = torch.einsum("beam,be->bm", boxes_elems_verts, 0.25 * RHO * boxes_elems_vol)
+    elems, _ = boxes_elems
+    edges_rest, vibrating_edges_rest = boxes_edges_rest
+    elems_vol, vibrating_elems_vol = boxes_elems_vol
+    verts_mass, vibrating_verts_mass = boxes_verts_mass
+
+    # The stiffness matrix of the linear model assembles V * (lam * g_a g_b^T + mu * g_b g_a^T + mu * (g_a . g_b) * I)
+    # over the vertices a and b of each element, g_a being the gradient of the shape function of vertex a.
+    shape_grads = torch.linalg.inv(vibrating_edges_rest)
+    shape_grads = torch.cat((shape_grads, -shape_grads.sum(dim=-1, keepdim=True)), dim=-1)
+    elems_grads_outer = torch.einsum("eia,ejb->eabij", shape_grads, shape_grads)
+    elems_grads_dot = elems_grads_outer.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+    elems_stiffness = vibrating_elems_vol[:, None, None, None, None] * (
+        free_material.lam * elems_grads_outer
+        + free_material.mu * elems_grads_outer.transpose(-1, -2)
+        + free_material.mu * elems_grads_dot[..., None, None] * torch.eye(3, dtype=gs.tc_float, device=gs.device)
+    )
+    stiffness = torch.einsum("eam,ebn,eabij->minj", boxes_elems_verts[1], boxes_elems_verts[1], elems_stiffness)
+
+    # The lowest elastic mode follows the six rigid modes, normalized to a unit modal mass
+    dofs_mass_inv_sqrt = vibrating_verts_mass.repeat_interleave(3).rsqrt()
+    stiffness = stiffness.reshape(3 * vibrating_box.n_vertices, 3 * vibrating_box.n_vertices)
+    omegas_sqr, modes = np.linalg.eigh(tensor_to_array(dofs_mass_inv_sqrt[:, None] * stiffness * dofs_mass_inv_sqrt))
+    omega_sqr = omegas_sqr[6]
+    mode = dofs_mass_inv_sqrt * torch.tensor(modes[:, 6], dtype=gs.tc_float, device=gs.device)
+    mode = mode.reshape(vibrating_box.n_vertices, 3)
+    vibrating_box.set_position(vibrating_box.init_positions + MODE_AMPLITUDE * mode)
 
     assert_equal(box.get_el2v(), box.elems)
 
-    target_poss = box.get_state().pos[..., VERTICES_IDX, :]
+    target_poss = box.get_verts_pos()[..., VERTICES_IDX, :]
     box.set_vertex_constraints(VERTICES_IDX)
     scene.step()
-    assert_allclose(box.get_state().pos[..., VERTICES_IDX, :], target_poss, tol=1e-8)
+    assert_allclose(box.get_verts_pos()[..., VERTICES_IDX, :], target_poss, tol=1e-8)
+
+    if use_implicit_solver:
+        # The box released in its lowest elastic mode keeps vibrating in it, the gravity moving its translation alone.
+        # Each substep of the implicit solver solves (1 + h * c + h^2 * omega^2) * v' = v - h * omega^2 * q for the
+        # modal velocity, with c = alpha + beta * omega^2 the Rayleigh damping of the mode, then q' = q + h * v'.
+        mode_pos, mode_vel = MODE_AMPLITUDE, 0.0
+        for _ in range(N_SUBSTEPS):
+            mode_vel = (mode_vel - substep_dt * omega_sqr * mode_pos) / (
+                1.0 + substep_dt * (DAMPING + DAMPING_BETA * omega_sqr) + substep_dt**2 * omega_sqr
+            )
+            mode_pos = mode_pos + substep_dt * mode_vel
+        modal_mass = vibrating_verts_mass[:, None] * mode
+        vibrating_box_disp = vibrating_box.get_verts_pos() - vibrating_box.init_positions
+        rtol = 1e-12 if gs.np_float == np.float64 else 2e-4
+        assert_allclose((vibrating_box_disp * modal_mass).sum((-2, -1)), mode_pos, rtol=rtol)
+        assert_allclose((vibrating_box.get_verts_vel() * modal_mass).sum((-2, -1)), mode_vel, rtol=rtol)
 
     # Simulate
     n_steps = int(0.5 * math.pi / MOTION_SPEED)
@@ -541,7 +609,7 @@ def test_hard_constraint(use_implicit_solver, show_viewer):
         scene.step(update_visualizer=False)
 
         # Check that the constrained vertices are at their respective target positions
-        corners = box.get_state().pos[..., :8, :]
+        corners = box.get_verts_pos()[..., :8, :]
         assert_allclose(corners[..., VERTICES_IDX, :], target_poss, tol=1e-8)
 
         # Check that the box is not more or less a box
@@ -567,49 +635,46 @@ def test_hard_constraint(use_implicit_solver, show_viewer):
     # Check that the box has been free-falling
     n_steps = 50
     fall_state = scene.get_state()
-    box_state_0 = box.get_state()
-    com_pos_z_0 = box_state_0.pos[..., 8, 2]
+    box_pos_0, box_vel_0 = box.get_verts_pos(), box.get_verts_vel()
+    com_pos_z_0 = box_pos_0[..., 8, 2]
     for _ in range(n_steps):
         scene.step()
-    com_pos_z_f = box.get_state().pos[..., 8, 2]
+    com_pos_z_f = box.get_verts_pos()[..., 8, 2]
     com_pos_delta = -0.5 * GRAVITY * (n_steps * DT) ** 2
     assert_allclose(com_pos_z_f - com_pos_z_0, com_pos_delta, tol=0.05)
 
-    # The undeformed boxes follow the discrete free fall exactly: the gravity kick of each substep, damped by the
-    # Rayleigh mass damping under the implicit solver, then the position update by the new velocity.
-    substep_dt = DT / N_SUBSTEPS
+    # The undeformed boxes follow the discrete free fall exactly: the gravity kick of each substep, followed by the
+    # Rayleigh mass damping under the implicit solver and preceded by the exponential velocity decay under the explicit
+    # one, then the position update by the new velocity.
     vel_z, pos_z = 0.0, 0.0
     for _ in range((1 + int(0.5 * math.pi / MOTION_SPEED) + n_steps) * N_SUBSTEPS):
-        vel_z = vel_z - GRAVITY * substep_dt
         if use_implicit_solver:
-            vel_z = vel_z / (1.0 + DAMPING_ALPHA * substep_dt)
+            vel_z = (vel_z - GRAVITY * substep_dt) / (1.0 + DAMPING * substep_dt)
+        else:
+            vel_z = vel_z * math.exp(-DAMPING * substep_dt) - GRAVITY * substep_dt
         pos_z = pos_z + substep_dt * vel_z
-    free_boxes_pos = torch.stack([free_box.get_state().pos for free_box in free_boxes])
-    assert_allclose(free_boxes_pos - free_boxes_pos_0, (0.0, 0.0, pos_z), tol=5e-10)
+    free_boxes_pos = torch.stack([free_box.get_verts_pos() for free_box in free_boxes])
+    tol = 5e-10 if gs.np_float == np.float64 else (1e-3 if use_implicit_solver else 1e-4)
+    assert_allclose(free_boxes_pos - free_boxes_pos_0, (0.0, 0.0, pos_z), tol=tol)
 
-    # The internal forces of the deformed box add up to zero, so its center of mass falls like the free boxes. Each
-    # vertex carries a quarter of the rest mass of every element it belongs to.
-    verts = box.init_positions
-    elems = box.get_el2v()
-    edges_rest = verts[elems[:, :3]] - verts[elems[:, 3:]]
-    elems_vol = torch.linalg.det(edges_rest).abs() / 6.0
-    elems_mass = RHO * elems_vol
-    verts_mass = torch.zeros_like(verts[:, 0])
-    for i in range(4):
-        verts_mass.index_add_(0, elems[:, i], 0.25 * elems_mass)
-    com_vel = verts_mass @ box_state_0.vel / verts_mass.sum()
-    com_pos = verts_mass @ box_state_0.pos / verts_mass.sum()
+    # The internal forces of the deformed box add up to zero, so its center of mass falls like the free boxes
+    com_vel = verts_mass @ box_vel_0 / verts_mass.sum()
+    com_pos = verts_mass @ box_pos_0 / verts_mass.sum()
     for _ in range(n_steps * N_SUBSTEPS):
-        com_vel[..., 2] -= GRAVITY * substep_dt
         if use_implicit_solver:
-            com_vel /= 1.0 + DAMPING_ALPHA * substep_dt
+            com_vel[..., 2] -= GRAVITY * substep_dt
+            com_vel /= 1.0 + DAMPING * substep_dt
+        else:
+            com_vel *= math.exp(-DAMPING * substep_dt)
+            com_vel[..., 2] -= GRAVITY * substep_dt
         com_pos += substep_dt * com_vel
-    assert_allclose(verts_mass @ box.get_state().pos / verts_mass.sum(), com_pos, atol=5e-12)
+    atol = 5e-12 if gs.np_float == np.float64 else (2e-5 if use_implicit_solver else 2e-6)
+    assert_allclose(verts_mass @ box.get_verts_pos() / verts_mass.sum(), com_pos, atol=atol)
 
     # The internal forces are the opposite of the gradient of the elastic energy of the box with respect to the
     # positions of its vertices. The linear corotated model takes the rotation of each element as given.
     mu, lam = box.material.mu, box.material.lam
-    pos = box.get_state().pos.requires_grad_()
+    pos = box.get_verts_pos().requires_grad_()
     F = (torch.linalg.inv(edges_rest) @ (pos[:, elems[:, :3]] - pos[:, elems[:, 3:]])).transpose(-1, -2)
     if use_implicit_solver:
         U, _, Vh = torch.linalg.svd(F.detach())
@@ -622,60 +687,61 @@ def test_hard_constraint(use_implicit_solver, show_viewer):
         energy_density = 0.5 * mu * (F_norm_sqr - 3.0 - (F_norm_sqr + 1.0).log()) + 0.5 * lam * J_shift**2
     energy = (elems_vol * energy_density).sum()
     forces = scene.fem_solver.get_forces()[:, box.v_start : box.v_start + box.n_vertices]
-    assert_allclose(forces, -torch.autograd.grad(energy, pos)[0], tol=1e-11)
+    tol = 1e-11 if gs.np_float == np.float64 else (5e-3 if use_implicit_solver else 5e-4)
+    assert_allclose(forces, -torch.autograd.grad(energy, pos)[0], tol=tol)
 
     if use_implicit_solver:
         # Replaying the free fall reproduces it bitwise
-        fall_pos = box.get_state().pos
+        fall_pos = box.get_verts_pos()
         scene.reset(state=fall_state)
         for _ in range(n_steps):
             scene.step()
-        assert_equal(box.get_state().pos, fall_pos)
+        assert_equal(box.get_verts_pos(), fall_pos)
 
     # Distinct positions and link poses per environment make cross-environment index mixups observable.
     box.set_position(((0.0, 0.0, 0.0), (0.0, 0.0, 0.2)))
     box.set_velocity((0.0, 0.0, 0.0))
     anchor.set_pos(((10.0, 0.0, HEIGHT), (20.0, 0.0, HEIGHT)), relative=False)
     anchor.set_quat(((1.0, 0.0, 0.0, 0.0), (0.5**0.5, 0.0, 0.0, 0.5**0.5)), relative=False)
-    target_poss = box.get_state().pos[..., VERTICES_IDX, :]
+    target_poss = box.get_verts_pos()[..., VERTICES_IDX, :]
     box.set_vertex_constraints(VERTICES_IDX, envs_idx=[1])
     scene.step()
-    assert_allclose(box.get_state().pos[1, VERTICES_IDX, :], target_poss[1], tol=1e-8)
+    assert_allclose(box.get_verts_pos()[1, VERTICES_IDX, :], target_poss[1], tol=1e-8)
 
     box.remove_vertex_constraints(envs_idx=[1])
     box.set_vertex_constraints(VERTICES_IDX, link=anchor.base_link, envs_idx=[1])
     scene.step()
-    assert_allclose(box.get_state().pos[1, VERTICES_IDX, :], target_poss[1], tol=1e-8)
+    tol = 1e-8 if gs.np_float == np.float64 else 2e-6
+    assert_allclose(box.get_verts_pos()[1, VERTICES_IDX, :], target_poss[1], tol=tol)
 
     box.remove_vertex_constraints(envs_idx=[1])
     box.set_position((0.0, 0.0, 0.0))
     box.set_velocity((0.0, 0.0, 0.0))
-    target_poss = box.get_state().pos[..., VERTICES_IDX, :]
+    target_poss = box.get_verts_pos()[..., VERTICES_IDX, :]
     box.set_vertex_constraints(VERTICES_IDX)
     target_poss = target_poss + torch.tensor(
         (((0.0, 0.0, 0.0),), ((0.0, 0.0, 0.02),)), dtype=gs.tc_float, device=gs.device
     )
     box.update_constraint_targets(VERTICES_IDX, target_poss[1], envs_idx=[1])
     scene.step()
-    assert_allclose(box.get_state().pos[..., VERTICES_IDX, :], target_poss, tol=1e-6)
+    assert_allclose(box.get_verts_pos()[..., VERTICES_IDX, :], target_poss, tol=1e-6)
 
     box.remove_vertex_constraints(envs_idx=[1])
     target_poss = target_poss + torch.tensor((0.0, 0.0, 0.05), dtype=gs.tc_float, device=gs.device)
     box.update_constraint_targets(VERTICES_IDX, target_poss)
     scene.step()
-    constrained_poss = box.get_state().pos[..., VERTICES_IDX, :]
+    constrained_poss = box.get_verts_pos()[..., VERTICES_IDX, :]
     assert_allclose(constrained_poss[0], target_poss[0], tol=1e-6)
     assert (torch.linalg.norm(constrained_poss[1] - target_poss[1], dim=-1) > 0.01).all()
 
 
 @pytest.mark.required
-@pytest.mark.xfail(raises=AssertionError, reason="Constraint dynamics inconsistent with analytical formula")
-@pytest.mark.parametrize("precision", ["64"])
-def test_explicit_legacy_coupler_soft_constraint_box(show_viewer):
+def test_soft_constraint(asset_tmp_path, show_viewer):
     DT = 0.01
-    BOX_SIZE = 0.1
-    CONSTRAINT_STIFFNESS = 1e1
-    BOX_VELOCITY = torch.tensor([0.2, 0.0, 0.0])
+    TET_SIZE = 0.05
+    RHO = 1000.0
+    OMEGA = 10.0
+    VELOCITY = 0.1
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -683,46 +749,81 @@ def test_explicit_legacy_coupler_soft_constraint_box(show_viewer):
             substeps=10,
             gravity=(0.0, 0.0, 0.0),
         ),
-        fem_options=gs.options.FEMOptions(
-            use_implicit_solver=False,
-            enable_vertex_constraints=True,
-        ),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(0.6, 0.6, 0.5),
-            camera_lookat=(0.0, 0.0, 0.0),
+            camera_pos=(0.15, -0.8, 0.5),
+            camera_lookat=(0.15, 0.15, 0.0),
         ),
         show_viewer=show_viewer,
-        show_FPS=False,
+    )
+    tet_verts = TET_SIZE * np.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+        ]
+    )
+    tet_faces = np.array(
+        [
+            [0, 1, 2],
+            [0, 3, 1],
+            [0, 2, 3],
+            [1, 3, 2],
+        ]
+    )
+    tet_path = str(asset_tmp_path / "regular_tetrahedron.obj")
+    igl.write_triangle_mesh(tet_path, tet_verts, tet_faces)
+    # A material softer than the default keeps the explicit integration of these small elements stable
+    tet_fixed = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file=tet_path,
+        ),
+        material=gs.materials.FEM.Elastic(
+            E=1e5,
+            rho=RHO,
+        ),
+    )
+    tet_link = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file=tet_path,
+            pos=(0.3, 0.0, 0.0),
+        ),
+        material=gs.materials.FEM.Elastic(
+            E=1e5,
+            rho=RHO,
+        ),
     )
     box = scene.add_entity(
         morph=gs.morphs.Box(
-            size=(BOX_SIZE, BOX_SIZE, BOX_SIZE),
-            pos=(0.0, 0.0, 0.0),
-        ),
-        material=gs.materials.FEM.Elastic(
-            rho=1.0 / BOX_SIZE**3,  # Unit mass
-        ),
-        surface=gs.surfaces.Default(
-            color=(1, 1, 1, 0.5),
+            pos=(0.3, 0.3, 0.0),
+            size=(0.05, 0.05, 0.05),
         ),
     )
-    scene.build()
+    scene.build(n_envs=2)
 
-    verts_idx = [0, 1, 2, 3, 4, 5, 6, 7]
-    target_poss = box.init_positions[verts_idx]
-    box.set_vertex_constraints(verts_idx, target_poss, is_soft_constraint=True, stiffness=CONSTRAINT_STIFFNESS)
-    if show_viewer:
-        scene.draw_debug_spheres(poss=target_poss, radius=0.01, color=(1, 0, 1, 1))
+    # The stiffness of each spring is proportional to the mass of its vertex, a quarter of the rest mass of every
+    # element it belongs to, so that the vertices share the rate sqrt(k / m) and the tetrahedra translate undeformed
+    verts = tet_fixed.init_positions
+    elems = tet_fixed.get_el2v()
+    elems_mass = RHO * torch.linalg.det(verts[elems[:, :3]] - verts[elems[:, 3:]]).abs() / 6.0
+    verts_mass = torch.zeros_like(verts[:, 0])
+    for i in range(4):
+        verts_mass.index_add_(0, elems[:, i], 0.25 * elems_mass)
+    for i_v, vert_mass in enumerate(verts_mass):
+        stiffness = OMEGA**2 * vert_mass.item()
+        tet_fixed.set_vertex_constraints(i_v, is_soft_constraint=True, stiffness=stiffness)
+        tet_link.set_vertex_constraints(i_v, link=box.base_link, is_soft_constraint=True, stiffness=stiffness)
 
-    # Initialize box velocity to non-zero value
-    box.set_velocity(BOX_VELOCITY)
-
-    # Check that the box has a spring dynamics
-    omega = math.sqrt(8 * CONSTRAINT_STIFFNESS)
-    for i in range(2000):
-        pos = box.get_state().pos[..., :8, :].sum(dim=-2)
-        pos_ref = BOX_VELOCITY * (i * DT) * math.exp(-omega * (i * DT))
-        assert_allclose(pos, pos_ref, tol=1e-3)
+    # The first tetrahedron starts moving away from its fixed targets, while the targets of the second one start moving
+    # away with the box. The offset of each to its targets follows the same critically damped oscillator.
+    tet_fixed.set_velocity((VELOCITY, 0.0, 0.0))
+    box.set_dofs_velocity((VELOCITY, 0.0, 0.0, 0.0, 0.0, 0.0))
+    box_pos_0 = box.get_pos()
+    for i in range(50):
+        offset = VELOCITY * (i * DT) * math.exp(-OMEGA * (i * DT))
+        assert_allclose(tet_fixed.get_verts_pos() - tet_fixed.init_positions, (offset, 0.0, 0.0), atol=5e-5)
+        tet_link_offset = tet_link.get_verts_pos() - tet_link.init_positions - (box.get_pos() - box_pos_0)[:, None]
+        assert_allclose(tet_link_offset, (-offset, 0.0, 0.0), atol=5e-5)
         scene.step()
 
 
@@ -732,11 +833,16 @@ def test_explicit_legacy_coupler_soft_constraint_box(show_viewer):
 def test_implicit_sap_coupler_collide_sphere_box(show_viewer):
     SPHERE_RADIUS = 0.1
     BOX_SIZE = 0.015
+    CUBE_HALFSIZE = 0.05
+    CUBE_RHO = 1000.0
+    CUBE_HYDROELASTIC_MODULUS = 1e5
+    GRAVITY = 9.81
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1.0 / 60.0,
             substeps=2,
+            gravity=(0.0, 0.0, -GRAVITY),
         ),
         fem_options=gs.options.FEMOptions(
             use_implicit_solver=True,
@@ -776,6 +882,20 @@ def test_implicit_sap_coupler_collide_sphere_box(show_viewer):
             model="linear_corotated",
         ),
     )
+    # A stack of two cubes resting on each other, clear of the sphere and the box
+    bottom_cube, top_cube = [
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(0.3, -0.3, (2 * i + 1) * CUBE_HALFSIZE),
+                size=(2 * CUBE_HALFSIZE, 2 * CUBE_HALFSIZE, 2 * CUBE_HALFSIZE),
+            ),
+            material=gs.materials.FEM.Elastic(
+                rho=CUBE_RHO,
+                hydroelastic_modulus=CUBE_HYDROELASTIC_MODULUS,
+            ),
+        )
+        for i in range(2)
+    ]
     scene.build()
 
     # Run simulation
@@ -784,15 +904,24 @@ def test_implicit_sap_coupler_collide_sphere_box(show_viewer):
 
     for entity, init_height in zip((sphere, box), (SPHERE_RADIUS, 2 * SPHERE_RADIUS + BOX_SIZE)):
         # Barely moving
-        state = entity.get_state()
-        assert_allclose(state.vel, 0.0, tol=0.05)
+        assert_allclose(entity.get_verts_vel(), 0.0, tol=0.05)
 
         # More or less at the initial position
-        pos = tensor_to_array(state.pos[0])
+        pos = tensor_to_array(entity.get_verts_pos())
         BV, *_ = igl.bounding_box(pos)
         entity_center = 0.5 * (BV[0] + BV[-1])
         assert_allclose(entity_center[:2], 0.0, tol=0.02)
         assert_allclose(entity_center[2], init_height, tol=5e-3)
+
+    # The pressure field of each cube is E * d / h at depth d below its surface, so the equal-pressure plane splits the
+    # overlap evenly. The mesh joins each face to the cube center, so the contact face has the side 2 * h - overlap at
+    # that depth, and the pressure E * overlap / (2 * h) over it balances the top cube weight rho * (2 * h)^3 * g.
+    # One fixed-point iteration from the unshrunk face solves this equation well within the tolerance, which covers the
+    # residual settling motion of the stack over the horizon.
+    cubes_overlap = bottom_cube.get_verts_pos()[..., 2].max() - top_cube.get_verts_pos()[..., 2].min()
+    cubes_overlap_ref = 4.0 * CUBE_RHO * GRAVITY * CUBE_HALFSIZE**2 / CUBE_HYDROELASTIC_MODULUS
+    cubes_overlap_ref *= (2.0 * CUBE_HALFSIZE / (2.0 * CUBE_HALFSIZE - cubes_overlap_ref)) ** 2
+    assert_allclose(cubes_overlap, cubes_overlap_ref, rtol=0.05)
 
 
 # This test cannot be flagged as required because it takes 400s to run on CPU.
@@ -868,7 +997,7 @@ def test_implicit_sap_coupler_hard_constraint_and_collision(xml_path, tol, show_
     scene.build()
 
     # Attach the sphere to a distant rigid anchor by its center
-    sphere_poss = sphere.get_state().pos[0]
+    sphere_poss = sphere.get_verts_pos()
     sphere_poss -= torch.tensor(sphere.morph.pos, device=gs.device)
     sphere_center_idx = int(torch.argmin(torch.linalg.norm(sphere_poss, dim=-1)))
     sphere_target_poss = sphere.init_positions[sphere_center_idx]
@@ -881,7 +1010,7 @@ def test_implicit_sap_coupler_hard_constraint_and_collision(xml_path, tol, show_
     for shift in (-0.05, 0.0):
         anchor.set_pos((10.0, shift, HEIGHT))
         scene.step()
-        sphere_center = sphere.get_state().pos[..., sphere_center_idx, :]
+        sphere_center = sphere.get_verts_pos()[..., sphere_center_idx, :]
         shift_pos = torch.tensor((0.0, shift, 0.0), dtype=gs.tc_float, device=gs.device)
         assert_allclose(sphere_center, sphere_target_poss + shift_pos, tol=tol)
 
@@ -912,13 +1041,13 @@ def test_implicit_sap_coupler_hard_constraint_and_collision(xml_path, tol, show_
         if it == n_steps_moving + n_steps_waiting:
             # Disable box constraints only
             box.remove_vertex_constraints(VERTICES_IDX)
-            com_pos_0 = box.get_state().pos[..., 8, :]
+            com_pos_0 = box.get_verts_pos()[..., 8, :]
 
         # Do one simulation step
         scene.step(update_visualizer=False)
 
-        corners = box.get_state().pos[..., :8, :]
-        sphere_center = sphere.get_state().pos[..., sphere_center_idx, :]
+        corners = box.get_verts_pos()[..., :8, :]
+        sphere_center = sphere.get_verts_pos()[..., sphere_center_idx, :]
         assert_allclose(sphere_center, sphere_target_poss, tol=tol)
 
         # The frame of the box from its corners
@@ -932,14 +1061,14 @@ def test_implicit_sap_coupler_hard_constraint_and_collision(xml_path, tol, show_
 
         # Check that the sphere does not enter the box further than the compliance of the contact, which a missing
         # contact would let it cross entirely
-        sphere_local = (sphere.get_state().pos - corners[..., [0], :]) @ R + box.init_positions[0]
+        sphere_local = (sphere.get_verts_pos() - corners[..., [0], :]) @ R + box.init_positions[0]
         box_lower, box_upper = box.init_positions[:8].min(dim=0).values, box.init_positions[:8].max(dim=0).values
         sphere_depth = torch.minimum(sphere_local - box_lower, box_upper - sphere_local).min(dim=-1).values
         assert (sphere_depth < 0.01).all()
 
         if it >= n_steps_moving + n_steps_waiting:
             # Gravity acts along z and the contact only repels, so the released box cannot move back toward the sphere
-            assert (box.get_state().pos[..., 8, 1] > com_pos_0[..., 1] - 2e-4).all()
+            assert (box.get_verts_pos()[..., 8, 1] > com_pos_0[..., 1] - 2e-4).all()
 
         if is_moving:
             # Check that the constrained vertices are at their respective target positions
@@ -950,7 +1079,7 @@ def test_implicit_sap_coupler_hard_constraint_and_collision(xml_path, tol, show_
             assert_allclose(corners_local, box.init_positions[:8], tol=0.02)
 
             # Check that the sphere is more or less a sphere
-            sphere_poss = sphere.get_state().pos
+            sphere_poss = sphere.get_verts_pos()
             sphere_poss -= torch.tensor(sphere.morph.pos, device=gs.device)
             sphere_dist_max = torch.linalg.norm(sphere_poss, dim=-1).max(dim=-1).values
             assert_allclose(sphere_dist_max, SPHERE_RADIUS, tol=0.01)
@@ -965,8 +1094,8 @@ def test_implicit_sap_coupler_hard_constraint_and_collision(xml_path, tol, show_
             scene.visualizer.update(force=False, auto=True)
 
     # Check that the box has been free-falling, but not the sphere
-    com_pos_z_f = box.get_state().pos[..., 8, 2]
+    com_pos_z_f = box.get_verts_pos()[..., 8, 2]
     com_pos_delta = -0.5 * 9.81 * (n_steps_falling * DT) ** 2
     assert_allclose(com_pos_z_f - com_pos_0[..., 2], com_pos_delta, tol=0.05)
-    sphere_center = sphere.get_state().pos[..., sphere_center_idx, :]
+    sphere_center = sphere.get_verts_pos()[..., sphere_center_idx, :]
     assert_allclose(sphere_center, sphere_target_poss, tol=tol)

@@ -22,21 +22,8 @@ import genesis.utils.geom as gu
 from genesis.engine.entities.rigid_entity.description import _balanced_variant_mapping
 from genesis.engine.entities.rigid_entity.rigid_entity import compute_forward_kinematics
 from genesis.engine.solvers.rigid.abd.forward_kinematics import func_update_geom_aabbs
-from genesis.utils.array_class import (
-    ColliderInfo,
-    ColliderState,
-    ColliderStaticConfig,
-    ConstraintState,
-    DiffContactInput,
-    DynInfo,
-    DynState,
-    GJKScratch,
-    GJKState,
-    GeomsInitAABB,
-    MPRScratch,
-    MPRState,
-    RigidInfo,
-)
+from genesis.engine.solvers.rigid.constraint.data import ConstraintState
+from genesis.engine.solvers.rigid.data import DynInfo, DynState, GeomsInitAABB, RigidInfo
 from genesis.utils.data import ConfigItem, DataItem, iter_data, opt_in
 from genesis.utils.misc import (
     assign_indexed_tensor,
@@ -47,7 +34,7 @@ from genesis.utils.misc import (
     tensor_to_array,
     unique_rows,
 )
-from genesis.utils.sdf import SDF
+from genesis.utils.sdf import SDF, SDFInfo
 
 from . import gjk, mpr, support_field
 from .broadphase import func_broad_phase
@@ -61,6 +48,8 @@ from .contact import (
     kernel_collider_clear,
     kernel_masked_collider_clear,
 )
+from .data import ColliderConfig, ColliderInfo, ColliderState, DiffContactInput, GJKInfo, GJKScratch, GJKState
+from .mpr import MPRInfo, MPRScratch, MPRState
 from .narrowphase import (
     func_fill_diff_contact_input_plane,
     func_narrow_phase_any_vs_terrain,
@@ -71,6 +60,7 @@ from .narrowphase import (
     func_narrowphase_contact0,
     func_narrowphase_multicontact,
 )
+from .support_field import SupportFieldInfo
 
 if TYPE_CHECKING:
     from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
@@ -93,7 +83,7 @@ class Collider:
         self._prune_max_contacts_per_link_pair = 32
         self._prune_max_contacts_floor = 512
 
-        self._init_static_config()
+        self._init_config()
         self._use_split_narrowphase = (
             self.collider_config.has_non_box_plane_convex_convex
             and gs.backend != gs.cpu
@@ -121,15 +111,15 @@ class Collider:
                 opt_in(GJKScratch.main, workers=self._solver._B)
 
         if self.collider_config.has_nonconvex_nonterrain:
-            opt_in(ColliderInfo.sdf)
+            opt_in(SDFInfo)
         if self.collider_config.has_terrain or self.collider_config.has_non_box_plane_convex_convex:
-            opt_in(ColliderInfo.support_field)
+            opt_in(SupportFieldInfo)
 
-        # Each narrowphase sub-component builds its part of the collider info (see ColliderInfo)
+        # Each narrowphase sub-component builds its own info
         self.sdf = SDF(rigid_solver)
         self.mpr = mpr.MPR(rigid_solver)
         self.gjk = gjk.GJK(rigid_solver)
-        self._support_field = support_field.SupportField(rigid_solver)
+        self.support_field = support_field.SupportField(rigid_solver)
 
         self._init_collision_fields()
 
@@ -171,6 +161,10 @@ class Collider:
             (self, "collider_config"),
             (self.gjk, "gjk_config"),
             (self, "collider_info"),
+            (self.mpr, "mpr_info"),
+            (self.gjk, "gjk_info"),
+            (self.support_field, "support_field_info"),
+            (self.sdf, "sdf_info"),
             (self, "collider_state"),
             *[(self.mpr, name) for name in ("mpr_state", "contact0_mpr_state", "multicontact_mpr_state")],
             *[(self.gjk, name) for name in ("gjk_state", "contact0_gjk_state", "multicontact_gjk_state")],
@@ -178,7 +172,7 @@ class Collider:
         for owner, name in structs:
             yield from iter_data(owner, name)
 
-    def _init_static_config(self) -> None:
+    def _init_config(self) -> None:
         # The contact patch (polygon clipping over the touching faces) skips perturbation whenever it ran (see
         # multi_contact_flag). It defaults on under MuJoCo compatibility with GJK because the reference engine builds
         # its manifolds that way inside its GJK/EPA and runs its perturbation scheme only in its legacy fallback
@@ -260,7 +254,7 @@ class Collider:
             links_pair_n_contacts = np.bincount(links_pair_idx, weights=np.where(is_multi_point_pair, 3, 1))
             has_prunable_contacts = bool(links_pair_n_contacts.max() >= 3)
 
-        self.collider_config = ColliderStaticConfig(
+        self.collider_config = ColliderConfig(
             gpu_cores=get_gpu_core_count(),
             has_terrain=has_terrain,
             # Outside performance mode the convex narrowphase and the contact sort it gates are always compiled in, the
@@ -363,6 +357,10 @@ class Collider:
                 mc_tolerance=self._mc_tolerance,
                 diff_pos_tolerance=self._diff_pos_tolerance,
                 diff_normal_tolerance=self._diff_normal_tolerance,
+                # FIXME: Adjust these values based on the case study.
+                diff_contact_eps_boundary=1e-2,
+                diff_contact_eps_distance=1e-2,
+                diff_contact_eps_affine=1e-2,
                 contact_pruning_tolerance=self._solver._options.contact_pruning_tolerance or 0.0,
                 prune_deep_penetration_ratio=self._prune_deep_penetration_ratio,
             ),
@@ -878,11 +876,15 @@ class Collider:
             envs_idx, self.collider_state, self._solver.rigid_config, self.collider_config, cache_only
         )
 
-    def clear(self, envs_idx=None):
+    def clear(self, envs_idx=None, *, reset_warm_start: bool = True):
         """Remove the contacts of the environments 'envs_idx' (None for all of them), with their forces.
 
         A hibernated entity keeps the contacts it rests on, with the forces of the last solve it took part in, for as
         long as it sleeps. The contact force of every link is then the sum of the forces of the contacts it keeps.
+
+        `reset_warm_start` also resets the warm start of the detection, its contact cache and its first-step flag. A
+        reset of the scene to its initial state asks for it, while the restore of a saved state ('set_state') keeps
+        the warm start the state holds, so that the restored environments step on exactly as they did when saved.
         """
         self._contact_data_cache.clear()
         # A kernel wipes the live contacts alone, while views over the contact buffers would wipe every slot of them
@@ -900,6 +902,7 @@ class Collider:
             self._solver.rigid_info,
             self._solver.rigid_config,
             self.collider_config,
+            reset_warm_start,
         )
 
     def detection(self) -> None:
@@ -922,6 +925,10 @@ class Collider:
             self._solver.dyn_info,
             self._solver.rigid_info,
             self.collider_info,
+            self.mpr.mpr_info,
+            self.gjk.gjk_info,
+            self.support_field.support_field_info,
+            self.sdf.sdf_info,
             self._solver.rigid_config,
             self.collider_config,
             self.gjk.gjk_config,
@@ -1137,6 +1144,8 @@ class Collider:
             self._solver.dyn_info,
             self._solver.rigid_info,
             self.collider_info,
+            self.mpr.mpr_info,
+            self.gjk.gjk_info,
             self._solver.rigid_config,
             self.collider_config,
             self._solver._errno,
@@ -1159,6 +1168,10 @@ def func_detection(
     dyn_info: DynInfo,
     rigid_info: RigidInfo,
     collider_info: ColliderInfo,
+    mpr_info: MPRInfo,
+    gjk_info: GJKInfo,
+    support_field_info: SupportFieldInfo,
+    sdf_info: SDFInfo,
     rigid_config: qd.template(),
     collider_config: qd.template(),
     gjk_config: qd.template(),
@@ -1197,6 +1210,9 @@ def func_detection(
                 dyn_info,
                 rigid_info,
                 collider_info,
+                mpr_info,
+                gjk_info,
+                support_field_info,
                 rigid_config,
                 collider_config,
                 errno,
@@ -1210,6 +1226,9 @@ def func_detection(
                 dyn_info,
                 rigid_info,
                 collider_info,
+                mpr_info,
+                gjk_info,
+                support_field_info,
                 rigid_config,
                 collider_config,
                 gjk_config,
@@ -1226,6 +1245,9 @@ def func_detection(
                 dyn_info=dyn_info,
                 rigid_info=rigid_info,
                 collider_info=collider_info,
+                mpr_info=mpr_info,
+                gjk_info=gjk_info,
+                support_field_info=support_field_info,
                 rigid_config=rigid_config,
                 collider_config=collider_config,
                 gjk_config=gjk_config,
@@ -1252,6 +1274,8 @@ def func_detection(
                 dyn_info,
                 rigid_info,
                 collider_info,
+                mpr_info,
+                support_field_info,
                 rigid_config,
                 collider_config,
                 errno,
@@ -1264,6 +1288,7 @@ def func_detection(
                 dyn_info,
                 rigid_info,
                 collider_info,
+                sdf_info,
                 rigid_config,
                 collider_config,
                 errno,
@@ -1294,6 +1319,10 @@ def kernel_detection(
     dyn_info: DynInfo,
     rigid_info: RigidInfo,
     collider_info: ColliderInfo,
+    mpr_info: MPRInfo,
+    gjk_info: GJKInfo,
+    support_field_info: SupportFieldInfo,
+    sdf_info: SDFInfo,
     rigid_config: qd.template(),
     collider_config: qd.template(),
     gjk_config: qd.template(),
@@ -1318,6 +1347,10 @@ def kernel_detection(
         dyn_info=dyn_info,
         rigid_info=rigid_info,
         collider_info=collider_info,
+        mpr_info=mpr_info,
+        gjk_info=gjk_info,
+        support_field_info=support_field_info,
+        sdf_info=sdf_info,
         rigid_config=rigid_config,
         collider_config=collider_config,
         gjk_config=gjk_config,
@@ -1344,6 +1377,10 @@ def kernel_detection_without_graph(
     dyn_info: DynInfo,
     rigid_info: RigidInfo,
     collider_info: ColliderInfo,
+    mpr_info: MPRInfo,
+    gjk_info: GJKInfo,
+    support_field_info: SupportFieldInfo,
+    sdf_info: SDFInfo,
     rigid_config: qd.template(),
     collider_config: qd.template(),
     gjk_config: qd.template(),
@@ -1368,6 +1405,10 @@ def kernel_detection_without_graph(
         dyn_info=dyn_info,
         rigid_info=rigid_info,
         collider_info=collider_info,
+        mpr_info=mpr_info,
+        gjk_info=gjk_info,
+        support_field_info=support_field_info,
+        sdf_info=sdf_info,
         rigid_config=rigid_config,
         collider_config=collider_config,
         gjk_config=gjk_config,

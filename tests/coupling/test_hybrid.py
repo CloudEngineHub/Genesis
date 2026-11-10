@@ -5,7 +5,7 @@ import torch
 import genesis as gs
 from genesis.utils.misc import tensor_to_array
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
 
 
@@ -41,6 +41,13 @@ def test_rigid_mpm_muscle(show_viewer):
     scene.add_entity(
         morph=gs.morphs.Plane(),
     )
+    cube = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.85, 0.1, 0.1),
+            size=(0.1, 0.1, 0.1),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
     robot = scene.add_entity(
         morph=gs.morphs.URDF(
             file="urdf/simple/two_link_arm.urdf",
@@ -73,17 +80,21 @@ def test_rigid_mpm_muscle(show_viewer):
             friction=0.5,
         ),
     )
-    scene.build()
+    scene.build(n_envs=2)
 
     scene.reset()
+    # The soft part of the robot follows its links regardless of the activeness of the particles of another entity
+    cube.set_particles_active(gs.INACTIVE, envs_idx=[1])
     for i in range(150):
         robot.control_dofs_velocity(np.array([2.0 * np.sin(2 * np.pi * i * 0.006)] * robot.n_dofs))
         scene.step()
 
     ball_pos_delta = ball.get_pos() - torch.tensor(BALL_POS_INIT, dtype=gs.tc_float, device=gs.device)
     assert_allclose(ball_pos_delta[..., 0], 0.0, tol=1e-2)
-    assert ((0.02 < ball_pos_delta[1]) & (ball_pos_delta[1] < 0.05)).all()
+    assert ((0.02 < ball_pos_delta[..., 1]) & (ball_pos_delta[..., 1] < 0.05)).all()
     assert_allclose(ball_pos_delta[..., 2], 0.0, tol=1e-3)
+    soft_pos = robot.part_soft.get_particles_pos()
+    assert_allclose(soft_pos[0], soft_pos[1], tol=gs.EPS)
 
 
 @pytest.mark.required
@@ -101,6 +112,7 @@ def test_rigid_mpm_legacy_coupling(substeps, tol, show_viewer):
             substeps=substeps,
         ),
         mpm_options=gs.options.MPMOptions(
+            enable_CPIC=True,
             lower_bound=(-0.5, -1.0, 0.0),
             upper_bound=(0.5, 1.0, 1),
         ),
@@ -143,7 +155,7 @@ def test_rigid_mpm_legacy_coupling(substeps, tol, show_viewer):
         ),
     )
 
-    scene.build()
+    scene.build(n_envs=2)
 
     horizon = horizon_substeps // substeps
     for i in range(horizon):
@@ -151,13 +163,18 @@ def test_rigid_mpm_legacy_coupling(substeps, tol, show_viewer):
 
     # Check that the sand moved the box along the negative Y direction
     pos = tensor_to_array(obj_rigid.get_pos())
-    assert pos[1] + 0.25 < 0.0
+    assert (pos[..., 1] + 0.25 < 0.0).all()
+
+    # Resetting one environment leaves the other one as it was
+    sand_pos = tensor_to_array(obj_sand.get_particles_pos())
+    scene.reset(envs_idx=[1])
+    assert_equal(obj_rigid.get_pos()[0], pos[0])
+    assert_equal(obj_sand.get_particles_pos()[0], sand_pos[0])
 
     # A rollout after a reset starts free of the coupling wrench the previous one left
-    scene.reset()
     for i in range(horizon):
         scene.step()
-    assert_allclose(obj_rigid.get_pos(), pos, tol=tol)
+    assert_allclose(obj_rigid.get_pos()[1], pos[1], tol=tol)
 
 
 @pytest.mark.required
@@ -296,15 +313,16 @@ def test_deformable_parallel(show_viewer):
 
     assert_allclose(cloth.get_particles_vel(), 0.0, atol=1e-5)
     assert_allclose(mpm_cube.get_particles_vel(), 0.0, atol=2e-4)
-    assert_allclose(entity_fem._solver.get_state(0).vel, 0, atol=1e-3)
+    assert_allclose(entity_fem.get_verts_vel(), 0, atol=1e-3)
     assert_allclose(water.get_particles_vel(), 0.0, atol=5e-2)
 
 
 @pytest.mark.required
-def test_fem_outside_mpm_grid(precision, show_viewer, tol):
+def test_fem_mpm_coupling(precision, show_viewer, tol):
     GRAVITY = -9.81
     DT = 2e-3
-    N_STEPS = 10
+    N_STEPS_FREE_FALL = 10
+    N_STEPS = 100
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -322,10 +340,10 @@ def test_fem_outside_mpm_grid(precision, show_viewer, tol):
         ),
         show_viewer=show_viewer,
     )
-    scene.add_entity(
+    block = scene.add_entity(
         morph=gs.morphs.Box(
-            pos=(0.0, 0.0, 0.1),
-            size=(0.05, 0.05, 0.05),
+            pos=(0.0, 0.0, 0.0675),
+            size=(0.1, 0.1, 0.035),
         ),
         material=gs.materials.MPM.Elastic(),
     )
@@ -334,6 +352,15 @@ def test_fem_outside_mpm_grid(precision, show_viewer, tol):
     # lambda = E * nu / ((1 + nu) * (1 - 2 * nu)) and mu = E / (2 * (1 + nu)). The rest shape of a body accumulates
     # a velocity noise of the order of t * E * eps / (rho * h) after a time t, with eps the machine epsilon, which must
     # stay under the tolerance. Meanwhile, single precision takes a softer material.
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.12),
+            size=(0.05, 0.05, 0.05),
+        ),
+        material=gs.materials.FEM.Elastic(
+            E=1e6 if precision == "64" else 1e5,
+        ),
+    )
     fem = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.4, 0.0, 0.5),
@@ -345,11 +372,20 @@ def test_fem_outside_mpm_grid(precision, show_viewer, tol):
     )
     scene.build(n_envs=2)
 
-    for _ in range(N_STEPS):
+    for _ in range(N_STEPS_FREE_FALL):
         scene.step()
 
     # An unstressed body far from the grid falls freely, every vertex at the same velocity
-    assert_allclose(fem.get_state().vel, (0.0, 0.0, GRAVITY * DT * N_STEPS), tol=tol)
+    assert_allclose(fem.get_verts_vel(), (0.0, 0.0, GRAVITY * DT * N_STEPS_FREE_FALL), tol=tol)
+
+    for _ in range(N_STEPS - N_STEPS_FREE_FALL):
+        scene.step()
+
+    # The box dropped on the block comes to rest on top of it. Its surface stands off the topmost particles by less
+    # than one grid cell, the reach of the coupling.
+    assert_allclose(box.get_verts_vel(), 0.0, atol=5e-3)
+    gap = box.get_verts_pos()[..., 2].min(dim=-1).values - block.get_particles_pos()[..., 2].max(dim=-1).values
+    assert ((gap > 0.0) & (gap < scene.mpm_solver.dx)).all()
 
 
 @pytest.mark.parametrize(
@@ -567,13 +603,13 @@ def test_sap_fem_vs_robot(show_viewer):
         scene.step()
 
     # Check that the sphere did not move, and is slightly squished on top of the ground plane
-    state = sphere.get_state()
-    center = state.pos.mean(axis=(0, 1))
+    sphere_verts_pos = sphere.get_verts_pos()
+    center = sphere_verts_pos.mean(axis=0)
     assert_allclose(center[:2], 0.0, tol=0.01)
     assert center[2] < PLANE_HEIGHT + SPHERE_RADIUS - 0.02
     # FIXME: The SAP solve stops before converging on resting contacts, so the sphere sinks into the ground and
     # oscillates. The bound covers that error until the solve converges.
-    assert_allclose(state.pos[..., 2].min(), PLANE_HEIGHT, atol=2e-3)
+    assert_allclose(sphere_verts_pos[..., 2].min(), PLANE_HEIGHT, atol=2e-3)
 
     # Check that the ant is laying on top of the sphere
     robot_pos = robot.get_pos()

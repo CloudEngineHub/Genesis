@@ -2,9 +2,21 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.engine.bvh import func_build_bvh
+from genesis.engine.bvh import BVHState, BVHTreeState, func_build_bvh
 from genesis.engine.solvers.rigid.abd.forward_kinematics import func_update_all_verts
-from genesis.utils.array_class import BVHState, BVHTreeState, DynInfo, DynState, RaycastResult
+from genesis.engine.solvers.rigid.data import DynInfo, DynState
+from genesis.utils.data import ENVS, Data, DataKind, field
+
+
+class RaycastResult(Data, kind=DataKind.SCRATCH, shape=(ENVS,)):
+    """
+    The nearest hit of a ray cast against the rigid geoms in each environment: its distance, geom, point and normal.
+    """
+
+    distance: qd.Tensor = field(float)
+    geom_idx: qd.Tensor = field(int)
+    hit_point: qd.Tensor = field((float, 3))
+    normal: qd.Tensor = field((float, 3))
 
 
 # FIXME: get_triangle_vertices/bvh_ray_cast/update_aabbs duplicate their visual counterparts below. The two paths
@@ -109,7 +121,7 @@ def bvh_ray_cast(
                 if hit_distance >= 0.0 and hit_distance < closest_distance:
                     closest_distance = hit_distance
                     hit_face = i_f
-                    hit_normal = triangle_face_normal(v0, v1, v2)
+                    hit_normal = triangle_face_normal(v0, v1, v2, eps)
             else:  # Internal node
                 # Push children onto stack
                 if stack_idx < STACK_SIZE - 2:
@@ -314,9 +326,13 @@ def closest_point_on_triangle(
 
 
 @qd.func
-def triangle_face_normal(v0: qd.types.vector(3), v1: qd.types.vector(3), v2: qd.types.vector(3)) -> qd.types.vector(3):
-    """Outward unit normal of the triangle (v0, v1, v2) under right-hand winding."""
-    return (v1 - v0).cross(v2 - v0).normalized()
+def triangle_face_normal(v0: qd.types.vector(3), v1: qd.types.vector(3), v2: qd.types.vector(3), eps: float):
+    """
+    Return the outward unit normal of the triangle (v0, v1, v2) under right-hand winding.
+
+    The norm of the normal is floored at `eps`, which keeps a degenerate triangle finite (see 'qd_normalize').
+    """
+    return gu.qd_normalize((v1 - v0).cross(v2 - v0), eps)
 
 
 @qd.func
@@ -437,7 +453,7 @@ def bvh_ray_cast_visual(
                 if hit_distance >= 0.0 and hit_distance < closest_distance:
                     closest_distance = hit_distance
                     hit_face = i_f
-                    hit_normal = triangle_face_normal(v0, v1, v2)
+                    hit_normal = triangle_face_normal(v0, v1, v2, eps)
             else:
                 if stack_idx < STACK_SIZE - 2:
                     node_stack[stack_idx] = i_left

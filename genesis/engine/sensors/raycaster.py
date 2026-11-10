@@ -6,13 +6,11 @@ import numpy as np
 import torch
 
 import genesis as gs
-from genesis.engine.bvh import get_bvh_config, get_bvh_data, is_rank_sort
+from genesis.engine.bvh import BVHConfig, BVHState, get_bvh_config, get_bvh_data, is_rank_sort
 from genesis.engine.solvers.rigid.abd.forward_kinematics import kernel_update_all_verts
 from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
 from genesis.engine.state_change import StateChange, Subscriber
-from genesis.options.sensors import Raycaster as RaycasterOptions
-from genesis.options.sensors import RaycastPattern
-from genesis.utils.array_class import BVHState, BVHStaticConfig
+from genesis.options.sensors import RaycastPattern, Raycaster as RaycasterOptions
 from genesis.utils.geom import normalize, transform_by_quat, transform_by_trans_quat
 from genesis.utils.misc import concat_with_tensor, make_tensor_field, qd_to_numpy, qd_to_torch
 from genesis.utils.raycast_qd import (
@@ -31,14 +29,13 @@ from .base_sensor import (
     KinematicSensorMetadataMixin,
     KinematicSensorMixin,
     SharedSensorContext,
-    SimpleSensorMetadata,
     SimpleSensor,
+    SimpleSensorMetadata,
 )
 
 if TYPE_CHECKING:
     from genesis.engine.solvers.kinematic_solver import KinematicSolver
     from genesis.ext.pyrender.mesh import Mesh
-    from genesis.utils.ring_buffer import TensorRingBuffer
 
     from .sensor_manager import SensorManager
 
@@ -52,7 +49,7 @@ class BVHContext:
     # else the fixed number of distinct geometries of a static entry (see is_grouping_fixed).
     bvh_state: BVHState | None = None
     # The config of a build of every tree of the set (see bvh_rank_config)
-    bvh_config: BVHStaticConfig | None = None
+    bvh_config: BVHConfig | None = None
     # The number of trees built, one per environment or one per distinct geometry (see env_bvh_idx)
     n_trees: int = 0
     # None for a collision BVH (faces_info / verts_info, no per-face mask), else an int8 (n_vfaces,) tensor selecting
@@ -84,7 +81,7 @@ class BVHContext:
     is_env_uniform: bool = False
     # The config of a build of few trees of a static entry, sorting by rank while a build of all its trees sorts by
     # radix (see is_rank_sort). None when one sort serves every number of trees built.
-    bvh_rank_config: BVHStaticConfig | None = None
+    bvh_rank_config: BVHConfig | None = None
     # (B,) BVH tree slot each env casts against: identity for per-env trees, all-zero for one shared tree, group ids
     # for a grouped static BVH (see RaycastContext.update).
     env_bvh_idx: torch.Tensor | None = None

@@ -6,27 +6,21 @@ from typing import TYPE_CHECKING
 import torch
 
 import genesis as gs
+from genesis.engine.solvers.base_solver import BackwardErrorCode
 from genesis.grad.bridge import LaunchRecorder, Operation, RolloutGraph
 from genesis.options.morphs import Morph
 from genesis.options.solvers import IPCCouplerOptions, LegacyCouplerOptions, SAPCouplerOptions
 from genesis.repr_base import RBC
-from genesis.utils.array_class import ErrorCode
 from genesis.utils.data import ArrayItem, DataItem, DataKind, iter_data
 from genesis.utils.misc import indices_to_mask, qd_destroy_data, qd_to_numpy, qd_to_torch
 from genesis.utils.tools import StepTimer
 
 from .couplers import IPCCoupler, LegacyCoupler, SAPCoupler
+from .couplers.rigid_mpm_hybrid import kernel_update_hybrid_soft_part
 from .entities import HybridEntity
 from .sensors import SensorManager
-from .solvers import (
-    FEMSolver,
-    KinematicSolver,
-    MPMSolver,
-    PBDSolver,
-    RigidSolver,
-    SPHSolver,
-)
-from .solvers.base_solver import GravityMixin, Solver, TimeBasedMixin, merge_errno
+from .solvers import FEMSolver, KinematicSolver, MPMSolver, PBDSolver, RigidSolver, SPHSolver
+from .solvers.base_solver import GravityMixin, SimulatorState, Solver, TimeBasedMixin, kernel_set_time, merge_errno
 from .state_change import StateChange, Subscriber
 from .states.solvers import SimState, SimulatorCheckpoint, SolverCheckpoint
 
@@ -34,10 +28,6 @@ if TYPE_CHECKING:
     from genesis.engine.entities.base_entity import Entity, EntityDescription
     from genesis.engine.scene import Scene
     from genesis.options.scene import SceneOptions
-
-
-# The kinds of the state a step or a substep starts from, from which its backward pass replays it
-STATE_KINDS = frozenset((DataKind.STATE,))
 
 
 def restore_checkpoints(solvers_checkpoints: Iterable[tuple["Solver", SolverCheckpoint]]) -> None:
@@ -76,6 +66,7 @@ class Simulator(RBC):
         self._requires_grad: bool = self.options.requires_grad
 
         self._cur_substep_global = 0
+        self.sim_state: SimulatorState | None = None
 
         # Autograd graph of the rollout (see genesis.grad.bridge), which a reset starts anew (see 'is_forward_ready' for
         # the steps a backward pass forbids)
@@ -123,6 +114,8 @@ class Simulator(RBC):
         )
 
         self._active_solvers: list["Solver"] = gs.List()
+        # The hybrid entities whose soft part follows its rigid links, updated after the coupling of every substep
+        self._hybrid_entities: list[HybridEntity] = []
 
         # coupler
         if isinstance(options.coupler, SAPCouplerOptions):
@@ -229,6 +222,7 @@ class Simulator(RBC):
 
         # Counted per environment to support per-env reset, as steps rather than seconds to avoid drifting over time.
         self._steps = torch.zeros((self._B,), dtype=gs.tc_int, device=gs.device)
+        self.sim_state = SimulatorState(sizes=dict(envs=self._B))
 
         # solvers
         # IPCCoupler needs full substep flow for pre/post coupling phases
@@ -260,6 +254,8 @@ class Simulator(RBC):
         for entity in self._entities:
             if isinstance(entity, HybridEntity):
                 entity.build()
+                if entity.part_soft_info is not None:
+                    self._hybrid_entities.append(entity)
 
         # A change of the model invalidates every operation of the rollout (see 'RolloutGraph.invalidate'), while a
         # change of the state is a call the graph records (see 'mutates'). The state of a solver tracking no gradient
@@ -298,9 +294,8 @@ class Simulator(RBC):
                     qd_destroy_data(array)
 
     def reset(self, state: SimState, envs_idx=None):
-        for solver, solver_state in zip(self._solvers, state):
-            if solver.n_entities > 0:
-                solver.set_state(0, solver_state, envs_idx)
+        for solver in self._active_solvers:
+            solver.set_state(state.solvers[type(solver).__name__], envs_idx)
 
         if envs_idx is None:
             self._steps.zero_()
@@ -462,13 +457,16 @@ class Simulator(RBC):
         boundary_checkpoints = list(zip(differentiable_solvers, checkpoints))
         substeps_checkpoints = [boundary_checkpoints]
         self._cur_substep_global = substep_start
+        # The replay runs at the time of the step, which the clocks counted once it started
+        self._steps.copy_(steps_start)
+        self._steps += 1
         restore_checkpoints(boundary_checkpoints)
         for _ in range(self._substeps - 1):
             self.substep(self.cur_substep_local)
             self._cur_substep_global += 1
             substeps_checkpoints.append(
                 [
-                    (solver, solver.save_checkpoint(STATE_KINDS, boundary_only=True))
+                    (solver, solver.save_checkpoint(boundary_only=True))
                     for solver in differentiable_solvers
                     if not solver.has_frames
                 ]
@@ -496,10 +494,32 @@ class Simulator(RBC):
         self._steps.copy_(steps_start)
 
     def substep(self, f):
+        # The kernels read the time of each environment from the simulator state, which keeps their launch context
+        # cacheable
+        i_substep = self._cur_substep_global % self._substeps
+        kernel_set_time(i_substep, self._steps, self.sim_state, self._substeps, self._substep_dt)
         self._coupler.preprocess(f)
         self.substep_pre_coupling(f)
         self._coupler.couple(f)
         self.substep_post_coupling(f)
+        # The soft parts of the hybrid entities follow their rigid links once the soft particles left the grid
+        for entity in self._hybrid_entities:
+            soft_solver, rigid_solver = entity.solver_soft, entity.solver_rigid
+            kernel_update_hybrid_soft_part(
+                f,
+                entity.part_soft.particle_start,
+                soft_solver.substep_dt,
+                soft_solver.dt,
+                rigid_solver.dt,
+                entity.material.damping,
+                entity.material.soft_dv_coef,
+                entity.part_soft_info,
+                entity.part_soft_init_positions,
+                soft_solver.mpm_state,
+                rigid_solver.dyn_state.links,
+                soft_solver.mpm_info,
+                rigid_solver.dyn_info.geoms,
+            )
 
     # -------------- pre coupling --------------
     def substep_pre_coupling(self, f):
@@ -515,15 +535,10 @@ class Simulator(RBC):
     # --------------------------------------- io -----------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def get_state(self):
-        state = SimState(
-            scene=self.scene,
-            s_global=self.cur_step_global,
-            f_local=self.cur_substep_local,
-            solvers=self._solvers,
-        )
-
-        return state
+    def get_state(self) -> SimState:
+        """Return the state the simulation stands in, for 'reset' to restore (see 'Solver.get_state')."""
+        solvers_state = {type(solver).__name__: solver.get_state() for solver in self._active_solvers}
+        return SimState(self.scene, self.cur_step_global, solvers_state)
 
     def set_gravity(self, gravity, envs_idx=None):
         for solver in self._solvers:
@@ -655,9 +670,7 @@ class StepOperation(Operation):
 
     def forward(self) -> tuple[torch.Tensor, ...]:
         self._checkpoints = [
-            solver.save_checkpoint(STATE_KINDS, boundary_only=True)
-            for solver in self._sim._active_solvers
-            if solver.requires_grad
+            solver.save_checkpoint(boundary_only=True) for solver in self._sim._active_solvers if solver.requires_grad
         ]
         self._sim._step()
         return ()
@@ -681,7 +694,7 @@ class StepOperation(Operation):
             ]
             if grads:
                 envs_finite = torch.stack([grad.isfinite().all(dim=tuple(range(1, grad.ndim))) for grad in grads])
-                solver.flag_errno(ErrorCode.INVALID_GRAD_NAN, ~envs_finite.all(dim=0))
+                solver.flag_errno(BackwardErrorCode.INVALID_GRAD_NAN, ~envs_finite.all(dim=0))
             solver.update_errno()
             solver.check_errno(
                 blocking=False, context=f"Backward pass of step {self._substep_start // self._sim._substeps}"
