@@ -23,6 +23,7 @@ from genesis.utils.misc import (
     sanitize_index,
 )
 from genesis.utils.tools import StepTimer
+from genesis.utils.warnings import warn_once
 
 from .couplers import IPCCoupler, LegacyCoupler, SAPCoupler
 from .couplers.rigid_mpm_hybrid import RigidMPMHybrid
@@ -616,6 +617,11 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
         return self._para_level
 
     @property
+    def _B(self) -> int:
+        warn_once(self, "'Simulator._B' is deprecated. Please use 'Simulator.n_envs_' instead.")
+        return self.n_envs_
+
+    @property
     def rigid_only(self) -> bool:
         """Whether the rigid solver alone advances the physics, which lets a step skip the coupling."""
         return self._rigid_only
@@ -703,6 +709,14 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
     def cur_substep_global(self):
         """The current substep of the simulation."""
         return self._cur_substep_global
+
+    @property
+    def cur_substep_local(self) -> int:
+        """The current substep within the step."""
+        warn_once(
+            self, "'Simulator.cur_substep_local' is deprecated. Please use 'cur_substep_global % substeps' instead."
+        )
+        return self._cur_substep_global % self._substeps
 
     @property
     def step_timer(self) -> StepTimer:
