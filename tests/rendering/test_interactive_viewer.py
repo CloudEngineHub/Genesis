@@ -393,6 +393,20 @@ def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot)
         frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
     assert len(frames) == 2
 
+    # The frames of the links show once toggled on, and leave once toggled off
+    rgbs = []
+    for n_releases in (3, 4, 5):
+        if n_releases > 3:
+            pyrender_viewer.dispatch_event("on_key_release", Key.L, 0)
+            wait_for_viewer_events(pyrender_viewer, lambda: n_key_releases == n_releases)
+        rgb, *_ = pyrender_viewer.render_offscreen(
+            pyrender_viewer._camera_node, pyrender_viewer._renderer, rgb=True, depth=False, seg=False, normal=False
+        )
+        rgbs.append(rgb)
+    rgb_frames_off, rgb_frames_on, rgb_frames_toggled_off = rgbs
+    assert (rgb_frames_on != rgb_frames_off).any()
+    assert_equal(rgb_frames_toggled_off, rgb_frames_off)
+
     # Skip the rest of the test if necessary.
     # Similarly, 'glBlitFramebuffer(..., GL_DEPTH_BUFFER_BIT, GL_NEAREST)' involved in offscreen rendering of depth map
     # with interactive viewer enabled takes ages on old CPU-based Mesa rendering driver (~15000s).
@@ -473,13 +487,15 @@ def test_mouse_interaction_plugin(
         morph=gs.morphs.Plane(),
     )
     box = scene.add_entity(
-        morph=gs.morphs.Box(
-            pos=(0.0, 0.0, BOX_LENGTH / 2),
-            size=(BOX_LENGTH, BOX_LENGTH, BOX_LENGTH),
-        ),
-        material=gs.materials.Rigid(
+        spec=gs.entities.Rigid(
+            morph=gs.morphs.Box(
+                pos=(0.0, 0.0, BOX_LENGTH / 2),
+                size=(BOX_LENGTH, BOX_LENGTH, BOX_LENGTH),
+            ),
+            material=gs.materials.Rigid(
+                rho=MASS / (BOX_LENGTH**3),
+            ),
             use_visual_raycasting=True,
-            rho=MASS / (BOX_LENGTH**3),
         ),
     )
     # One lane stacks a collision-only box under a visual-only one, so the two cast modes land on different entities.
@@ -492,27 +508,28 @@ def test_mouse_interaction_plugin(
         ),
     )
     target = scene.add_entity(
-        morph=gs.morphs.Box(
-            pos=(0.0, STACK_LANE_Y, TARGET_Z),
-            size=(TARGET_SIZE,) * 3,
-            fixed=True,
-            collision=False,
-        ),
-        material=gs.materials.Rigid(
+        spec=gs.entities.Rigid(
+            morph=gs.morphs.Box(
+                pos=(0.0, STACK_LANE_Y, TARGET_Z),
+                size=(TARGET_SIZE,) * 3,
+                fixed=True,
+                collision=False,
+            ),
             use_visual_raycasting=True,
         ),
     )
     # A kinematic entity carries visual meshes only, in a separate solver from the rigid entities above.
     kinematic = scene.add_entity(
-        morph=gs.morphs.Box(
-            pos=(0.0, KINEMATIC_LANE_Y, BOX_LENGTH / 2),
-            size=(BOX_LENGTH,) * 3,
-        ),
-        material=gs.materials.Kinematic(
+        spec=gs.entities.Kinematic(
+            morph=gs.morphs.Box(
+                pos=(0.0, KINEMATIC_LANE_Y, BOX_LENGTH / 2),
+                size=(BOX_LENGTH,) * 3,
+            ),
+            material=gs.materials.Kinematic(),
             use_visual_raycasting=True,
         ),
     )
-    # Without the opt-in material, an entity stays unpickable.
+    # Without the opt-in, an entity stays unpickable.
     scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.0, OPTOUT_LANE_Y, TARGET_Z),
