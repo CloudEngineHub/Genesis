@@ -1,4 +1,8 @@
 #version 330 core
+
+// See the invariance of the position in mesh.vert
+invariant gl_Position;
+
 layout (triangles) in;
 layout (triangle_strip, max_vertices=6) out;
 
@@ -27,6 +31,10 @@ out vec2 uv_1;
 #ifdef COLOR_0_LOC
 in vec4 v_color_multiplier[];
 out vec4 color_multiplier;
+#endif
+#ifdef INST_TINT_LOC
+flat in vec4 v_tint[];
+flat out vec4 tint;
 #endif
 
 void emit_vertex(int i, bool reversed) {
@@ -64,6 +72,10 @@ void emit_vertex(int i, bool reversed) {
 
 #ifdef COLOR_0_LOC
     color_multiplier = v_color_multiplier[i];
+#endif
+
+#ifdef INST_TINT_LOC
+    tint = v_tint[i];
 #endif
 
     EmitVertex();

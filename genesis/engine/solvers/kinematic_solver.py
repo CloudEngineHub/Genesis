@@ -1195,19 +1195,29 @@ class KinematicSolver(Solver):
         n_tgts = self._options.IK_max_targets
         if n_links > n_tgts:
             gs.raise_exception(f"Cannot solve for {n_links} targets. Raise 'IK_max_targets' above {n_tgts}.")
+        # A damping of 1e-5 already gives Gauss-Newton steps to 1e-10 relative, |J| being of order 1 through its
+        # rotation rows, so a smaller one converges no faster and only loses stability near singular configurations.
+        # See PR genesis-world#3857 for measurements and details.
+        if damping < 1e-5:
+            gs.raise_exception(
+                f"'damping' must be at least 1e-5, got {damping}. A smaller damping converges no faster and makes the "
+                "steps unstable near singular configurations."
+            )
 
-        # The damped normal matrix of inverse kinematics is quadratic in RigidOptions.IK_max_targets, so the scratch is
-        # allocated by the first solve and a scene that never solves inverse kinematics allocates none of it
+        # The scratch of inverse kinematics grows with RigidOptions.IK_max_targets, so it is allocated by the first solve
+        # and a scene that never solves inverse kinematics allocates none of it
         if self._ik_scratch is None:
             entities = self.entities
+            entity_dofs = max([entity.n_dofs for entity in entities], default=0)
             self._ik_scratch = IKScratch(
                 sizes=dict(
                     envs=self.n_envs_,
                     entity_qs=max([entity.n_qs for entity in entities], default=0),
-                    entity_dofs=max([entity.n_dofs for entity in entities], default=0),
+                    entity_dofs=entity_dofs,
                     entity_links=max([entity.n_links for entity in entities], default=0),
                     entity_joints=max([entity.n_joints for entity in entities], default=0),
                     ik_targets=n_tgts,
+                    ik_normal=min(6 * n_tgts, entity_dofs),
                 ),
                 # The initial configuration of an environment is read as a whole
                 env_first={IKScratch.targets.init_qpos: True},
@@ -1260,6 +1270,7 @@ class KinematicSolver(Solver):
             q_start,
             link_start,
             joint_start,
+            seed,
             self.dyn_state,
             ik_state,
             ik_fk,
@@ -1272,14 +1283,13 @@ class KinematicSolver(Solver):
             n_links,
             len(dofs_idx),
             len(envs_idx),
-            custom_init_qpos,
             max_samples,
             max_solver_iters,
             damping,
             pos_tol,
             rot_tol,
             max_step_size,
-            seed,
+            custom_init_qpos,
             respect_joint_limit,
         )
 
@@ -1437,8 +1447,10 @@ class KinematicScopedRenderContext(ScopedRenderContext[KinematicSolver]):
             invalidated_by={solver: (StateChange.GEOMETRY,)},
         )
         self._is_link_frames_shown = solver.options.vis.link_frames and solver.n_links > 0
-        # The shapes of the visual geoms
+        # The shapes of the visual geoms, and the link of each of their meshes, which a solver coloring its links reads
+        # (see 'RigidVisOptions.islands').
         self._shapes: tuple[Shape, ...] = ()
+        self._shapes_links_idx: dict[Shape, torch.Tensor] = {}
         if not vgeoms:
             return
         data = self._data
@@ -1622,6 +1634,7 @@ class KinematicScopedRenderContext(ScopedRenderContext[KinematicSolver]):
                         invalidated_by=vgeoms_invalidated_by,
                     )
                 )
+                self._shapes_links_idx[shapes[-1]] = torch.tensor(vgeom.link.idx, dtype=gs.tc_int, device=gs.device)
         if geometries:
             vgeoms_cols = slice(0, self._n_drawn_vgeoms)
             shapes.insert(
@@ -1638,6 +1651,11 @@ class KinematicScopedRenderContext(ScopedRenderContext[KinematicSolver]):
                     ),
                     invalidated_by=vgeoms_invalidated_by,
                 ),
+            )
+            self._shapes_links_idx[shapes[0]] = torch.tensor(
+                [vgeom.link.idx for vgeom in self._slots_vgeom[: self._n_drawn_vgeoms]],
+                dtype=gs.tc_int,
+                device=gs.device,
             )
         self._shapes = tuple(shapes)
 

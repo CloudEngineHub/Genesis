@@ -19,7 +19,7 @@ from genesis.engine.solvers.rigid.abd.misc import (
 )
 from genesis.engine.solvers.rigid.collider.data import ColliderState
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, LinksState, RigidErrorCode, RigidInfo
-from genesis.grad.bridge import no_grad
+from genesis.grad.bridge import no_grad, replayed_by
 from genesis.utils.data import DataItem, eoa, iter_data
 from genesis.utils.misc import (
     assign_indexed_tensor,
@@ -282,21 +282,24 @@ class ConstraintSolver:
         self.constraint_state.island.links_island_idx.fill(-1)
         if self._solver._use_hibernation:
             self.constraint_state.island.hibernated_next_link.fill(-1)
-            # A single-island scene keeps one island holding the links of its one tree, which the sleep and wake paths
-            # read: the list is written once here, and the partition build leaves it (see func_build_single_island).
-            if self._solver.rigid_config.is_single_island:
-                links_idx = np.flatnonzero(qd_to_numpy(self._solver.rigid_info.links_tree_idx) == 0)
-                link_id = qd_to_numpy(self.constraint_state.island.link_id)
+        # A single-island scene keeps one island holding the links of its one tree. The labels of these links, and under
+        # hibernation the list of the links of the island that the sleep and wake paths read, are written once here.
+        # The partition build leaves them (see func_build_single_island). The reads are copies, since a view of an array
+        # on CPU is read-only.
+        if self._solver.rigid_config.is_single_island:
+            links_idx = np.flatnonzero(qd_to_numpy(self._solver.rigid_info.links_tree_idx) == 0)
+            links_island_idx = qd_to_numpy(self.constraint_state.island.links_island_idx, copy=True)
+            links_island_idx[links_idx] = 0
+            self.constraint_state.island.links_island_idx.from_numpy(links_island_idx)
+            if self._solver._use_hibernation:
+                link_id = qd_to_numpy(self.constraint_state.island.link_id, copy=True)
                 link_id[: len(links_idx)] = links_idx[:, None]
                 self.constraint_state.island.link_id.from_numpy(link_id)
-                links_island_idx = qd_to_numpy(self.constraint_state.island.links_island_idx)
-                links_island_idx[links_idx] = 0
-                self.constraint_state.island.links_island_idx.from_numpy(links_island_idx)
                 for link_slice in (
                     self.constraint_state.island.link_slices.n,
                     self.constraint_state.island.link_slices.curr,
                 ):
-                    link_slice_np = qd_to_numpy(link_slice)
+                    link_slice_np = qd_to_numpy(link_slice, copy=True)
                     link_slice_np[0] = len(links_idx)
                     link_slice.from_numpy(link_slice_np)
 
@@ -5593,8 +5596,10 @@ def func_solve_init(
     constraint_state: ConstraintState,
     rigid_info: RigidInfo,
     rigid_config: qd.template(),
+    keep_qacc: qd.template(),
     write_L: bool,
 ):
+    # keep_qacc starts the solve from qacc as it stands, the solution a replay restores (see func_solve_body_replay).
     # write_L is the one thing the two solve arms ask differently of this init, at runtime so that the kernel compiles
     # once for both: the monolith reads L back from nt_H in its incremental iterations, so its seed persists the
     # factor there, while the decomposed graph maintains the assembled Hessian in nt_H and re-factors every iteration.
@@ -5609,7 +5614,9 @@ def func_solve_init(
         ):
             constraint_state.cone_latch[i_cone, i_b] = -1.0
 
-    if qd.static(rigid_config.enable_mujoco_compatibility):
+    if qd.static(keep_qacc):
+        initialize_Ma(constraint_state.Ma, constraint_state.qacc, rigid_info, rigid_config)
+    elif qd.static(rigid_config.enable_mujoco_compatibility):
         # Compute cost for warmstart state (i.e. acceleration at previous timestep)
         initialize_Ma(constraint_state.Ma_ws, constraint_state.qacc_ws, rigid_info, rigid_config)
 
@@ -5888,6 +5895,17 @@ def _get_geometry_hash(dyn_state, constraint_state, dyn_info, rigid_info, rigid_
     return hash((constraint_state.jac.shape, rigid_config, _n_iterations))
 
 
+def func_solve_body_replay(dyn_state, constraint_state, dyn_info, rigid_info, rigid_config, _n_iterations):
+    """
+    Rebuild the solve at the solution it found, which the replay of a step restores, without searching for it.
+
+    The init factors the Hessian there, which is all the backward pass of the solve reads.
+    """
+    func_solve_init(dyn_state, constraint_state, rigid_info, rigid_config, keep_qacc=True, write_L=True)
+
+
+# The replay of a step restores the solution of the solve rather than searching for it again (see replayed_by)
+@replayed_by(func_solve_body_replay, outputs=("constraint_state.qacc",))
 @qd.perf_dispatch(
     get_geometry_hash=_get_geometry_hash,
     first_warmup=1,
@@ -5943,7 +5961,7 @@ def func_solve_body_monolith(dyn_state, constraint_state, dyn_info, rigid_info, 
     # consumes, then the solve kernel runs. Keeping the init inside the entrypoint (rather than in resolve, before the
     # dispatch) is what lets each arm declare its own init behavior - the dispatcher may run a different arm on the next
     # step during autotuning.
-    func_solve_init(dyn_state, constraint_state, rigid_info, rigid_config, write_L=True)
+    func_solve_init(dyn_state, constraint_state, rigid_info, rigid_config, keep_qacc=False, write_L=True)
     _kernel_solve_monolith(dyn_state, constraint_state, rigid_info, rigid_config)
 
 
