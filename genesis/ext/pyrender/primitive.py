@@ -10,7 +10,7 @@ from OpenGL.GL import *
 
 from .constants import FLOAT_SZ, GLTF, UINT_SZ, BufFlags
 from .material import Material, MetallicRoughnessMaterial
-from .utils import format_color_array
+from .utils import format_color_array, transform_box
 
 
 @nb.jit(nopython=True, cache=True)
@@ -312,12 +312,7 @@ class Primitive(object):
             if self._bounds_0 is None:
                 self._bounds_0 = _compute_bounds(self.positions)
             if self.poses is not None:
-                if len(self.poses) == 1:
-                    self._bounds = self._bounds_0 + self.poses[:, :3, 3]
-                else:
-                    self._bounds = self._bounds_0 + np.stack(
-                        (np.min(self.poses[:, :3, 3], axis=0), np.max(self.poses[:, :3, 3], axis=0)), axis=0
-                    )
+                self._bounds = transform_box(self._bounds_0, self.poses)
             else:
                 self._bounds = self._bounds_0
         return self._bounds
@@ -351,7 +346,12 @@ class Primitive(object):
     @property
     def is_transparent(self):
         """bool : If True, the mesh is partially-transparent."""
-        return self._compute_transparency()
+        return self.material.is_transparent or self._compute_transparency()
+
+    @property
+    def has_translucent_color(self):
+        """bool : If True, the color factor or the vertex colors are partially transparent, the textures aside."""
+        return self.material.has_translucent_color or self._compute_transparency()
 
     def get_buffer_id(self, buffer_name):
         if self._vaid is None:
@@ -572,9 +572,7 @@ class Primitive(object):
         glBindVertexArray(0)
 
     def _compute_transparency(self):
-        """Compute whether or not this object is transparent."""
-        if self.material.is_transparent:
-            return True
+        """Compute whether or not the vertex colors are partially transparent."""
         if self._is_transparent is None:
             self._is_transparent = False
             if self.color_0 is not None:

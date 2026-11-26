@@ -90,15 +90,10 @@ def test_render_api(show_viewer, renderer_type, renderer):
         if normal:
             normal_arrs.append(tensor_to_array(normal_arr).astype(np.float32))
 
-    try:
-        assert_equal(np.diff(rgb_arrs, axis=0), 0.0)
-        assert_equal(np.diff(seg_arrs, axis=0), 0.0)
-        assert_equal(np.diff(normal_arrs, axis=0), 0.0)
-        assert_equal(np.diff(depth_arrs, axis=0), 0.0)
-    except AssertionError:
-        if sys.platform == "darwin" and scene.visualizer.is_software:
-            pytest.xfail("Flaky on MacOS with Apple Software Renderer.")
-        raise
+    assert_equal(np.diff(rgb_arrs, axis=0), 0.0)
+    assert_equal(np.diff(seg_arrs, axis=0), 0.0)
+    assert_equal(np.diff(normal_arrs, axis=0), 0.0)
+    assert_equal(np.diff(depth_arrs, axis=0), 0.0)
 
     if IS_BATCHRENDER:
         # An output already rendered in the step comes back along with one rendered for the first time
@@ -890,13 +885,6 @@ def test_deterministic(tmp_path, renderer_type, renderer, show_viewer, tol):
     )
     scene.build(n_envs=3, env_spacing=(2.0, 2.0))
 
-    # Apple Software Renderer is fully deterministic: successive captures do not match exactly
-    if sys.platform == "darwin" and scene.visualizer.is_software:
-        tol_env = tol_step = 1.0
-    else:
-        tol_env = 0.002
-        tol_step = gs.EPS
-
     cam.start_recording(save_to_filename=(tmp_path / "video.mp4"))
     for _ in range(7):
         dofs_lower_bound, dofs_upper_bound = robot.get_dofs_limit()
@@ -930,26 +918,17 @@ def test_deterministic(tmp_path, renderer_type, renderer, show_viewer, tol):
                     )
                 rgb_array = tensor_to_array(rgb_array).astype(np.float32)
 
-                rgb_std = rgb_array.reshape((-1, 3)).std(axis=0).max()
-                try:
-                    assert rgb_std > 20.0
-                except AssertionError:
-                    if rgb_std < gs.EPS:
-                        if sys.platform == "darwin" and scene.visualizer.is_software:
-                            pytest.xfail(
-                                "Flaky on MacOS with Apple Software Renderer. Nothing but the background was rendered."
-                            )
-                    raise
+                assert rgb_array.reshape((-1, 3)).std(axis=0).max() > 20.0
                 if env_rgb_array is None:
                     env_rgb_array = rgb_array
                 else:
                     rgb_env_diff = np.abs(env_rgb_array - rgb_array)
-                    assert rgb_env_diff.mean() < tol_env, "Per-env renders do not match"
+                    assert rgb_env_diff.mean() < 0.002, "Per-env renders do not match"
 
             steps_rgb_arrays.append(env_rgb_array)
 
         rgb_step_diff = np.abs(np.diff(steps_rgb_arrays, axis=0))
-        assert rgb_step_diff.mean() < tol_step, "Per-step renders do not match"
+        assert rgb_step_diff.mean() < gs.EPS, "Per-step renders do not match"
 
     cam.stop_recording()
 
@@ -2054,6 +2033,39 @@ def test_rasterizer_sensor_env_spacing_invariance(renderer, context_mode):
 
 @pytest.mark.required
 @pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_rasterizer_draws_geometry_turned_about_distant_origin(renderer, n_envs, offset_box_obj):
+    scene = gs.Scene(
+        renderer=renderer,
+        show_viewer=False,
+    )
+    # The box stands 1 m from the origin of its mesh, so a quarter turn about the vertical axis moves it onto the y
+    # axis. The camera frames it there, far from where it would stand unturned.
+    scene.add_entity(
+        gs.morphs.Mesh(
+            file=offset_box_obj,
+            euler=(0.0, 0.0, 90.0),
+            fixed=True,
+        ),
+        surface=gs.surfaces.Default(
+            color=(1.0, 0.0, 0.0),
+        ),
+    )
+    sensor = scene.add_sensor(
+        RasterizerCameraOptions(
+            res=(64, 64),
+            pos=(0.6, 1.0, 0.8),
+            lookat=(0.0, 1.0, 0.0),
+            fov=40.0,
+        )
+    )
+    scene.build(n_envs=n_envs)
+
+    assert (sensor.read().rgb[..., 28:36, 28:36, 0] > 100).all()
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
 def test_video_recording_lifecycle(tmp_path, monkeypatch, renderer, show_viewer):
     DT = 0.01
     # One frame every other step, so that a span of N_STEPS resolves 2 frames and the paused span below skips 2
@@ -2162,8 +2174,20 @@ def test_video_recording_lifecycle(tmp_path, monkeypatch, renderer, show_viewer)
 
 @pytest.mark.required
 @pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
-def test_transparent_surfaces_show_what_lies_behind_them(renderer, show_viewer):
-    ALPHA = 0.5
+@pytest.mark.parametrize(
+    "alpha_source, n_envs", [("color", 2), ("image_texture", 2), ("dynamic_texture", 0), ("dynamic_texture", 2)]
+)
+@pytest.mark.parametrize("red_alpha_u8", [0, 128])
+def test_transparent_surfaces_show_what_lies_behind_them(
+    alpha_source, n_envs, red_alpha_u8, translucent_box_obj, renderer, show_viewer
+):
+    # Alphas that 8-bit texels store exactly, so that every source gives the same opacity
+    RED = (1.0, 0.0, 0.0, red_alpha_u8 / 255)
+    BLUE = (0.0, 0.0, 1.0, 128 / 255)
+    # The dynamic texture of the blue box shows an opaque image in environment 0 when there are several, which the
+    # translucent image of environment 1 must leave as it is
+    blues_color = [BLUE] if alpha_source != "dynamic_texture" or n_envs == 0 else [(0.0, 0.0, 1.0, 1.0), BLUE]
+    blues_alpha = np.array([color[3] for color in blues_color])[:, None]
     RES = 64
     # Wholly inside the field of view, high enough above the pair to project clear of the patch sampled below. Geometry
     # straddling the frustum boundary is misrasterized by software rendering backends, so it stays clear of the edge.
@@ -2177,6 +2201,8 @@ def test_transparent_surfaces_show_what_lies_behind_them(renderer, show_viewer):
         ),
         vis_options=gs.options.VisOptions(
             shadow=False,
+            # One image per environment, each holding its own pair of boxes
+            split_envs=True,
             # Black leaves each surface worth exactly its own contribution, so the composite below needs no offset
             background_color=(0.0, 0.0, 0.0),
         ),
@@ -2187,46 +2213,75 @@ def test_transparent_surfaces_show_what_lies_behind_them(renderer, show_viewer):
         renderer=renderer,
         show_viewer=show_viewer,
     )
+    # The red box of a dynamic texture shows its variant from build, and the blue one an opaque variant until its
+    # translucent image is written between two renders.
+    if alpha_source == "color":
+        surfaces = [
+            gs.surfaces.Default(
+                color=color,
+            )
+            for color in (RED, BLUE)
+        ]
+    elif alpha_source == "image_texture":
+        surfaces = [
+            gs.surfaces.Default(
+                diffuse_texture=gs.textures.ImageTexture(
+                    image_array=np.array([[color]]),
+                ),
+            )
+            for color in (RED, BLUE)
+        ]
+    else:
+        surfaces = [
+            gs.surfaces.Default(
+                diffuse_texture=gs.textures.DynamicTexture(
+                    resolution=(4, 4),
+                    variants=(gs.textures.ColorTexture(color=color),),
+                    is_batched=is_batched,
+                ),
+            )
+            for color, is_batched in ((RED, False), (BLUE[:3], True))
+        ]
     # Same size and lined up along the axis the camera sits on, so that the nearer one covers the farther one
     red = scene.add_entity(
-        gs.morphs.Box(
+        gs.morphs.Mesh(
             pos=(0.6, 0.0, 0.5),
-            size=(0.2, 0.2, 0.2),
+            file=translucent_box_obj,
+            scale=0.5,
         ),
-        surface=gs.surfaces.Default(
-            color=(1.0, 0.0, 0.0, ALPHA),
-        ),
+        surface=surfaces[0],
     )
     blue = scene.add_entity(
-        gs.morphs.Box(
+        gs.morphs.Mesh(
             pos=(-0.6, 0.0, 0.5),
-            size=(0.2, 0.2, 0.2),
+            file=translucent_box_obj,
+            scale=0.5,
         ),
-        surface=gs.surfaces.Default(
-            color=(0.0, 0.0, 1.0, ALPHA),
-        ),
+        surface=surfaces[1],
     )
     cam = scene.add_camera(
         res=(RES, RES),
         pos=(2.5, 0.0, 0.5),
         lookat=(0.0, 0.0, 0.5),
     )
-    scene.build()
+    scene.build(n_envs=n_envs)
 
     def centre_patch(pos_red, pos_blue):
         red.set_pos(pos_red)
         blue.set_pos(pos_blue)
         scene.step()
         rgb, *_ = cam.render()
-        return tensor_to_array(rgb)[CENTRE, CENTRE].reshape(-1, 3).mean(axis=0)
+        return tensor_to_array(rgb)[..., CENTRE, CENTRE, :].mean(axis=(-3, -2))
 
     # Where the two overlap, the near surface composites over whatever the far one left, so the pair is worth the near
     # one plus what survives of the far one. A far surface painted before the near one keeps that contribution; painted
     # afterwards it fails the depth test and vanishes, leaving the near box alone.
     patch_red = centre_patch((0.6, 0.0, 0.5), PARKED)
+    if alpha_source == "dynamic_texture":
+        blue.set_texture(blues_color)
     patch_blue = centre_patch(PARKED, (-0.6, 0.0, 0.5))
     patch_pair = centre_patch((0.6, 0.0, 0.5), (-0.6, 0.0, 0.5))
-    assert_allclose(patch_pair, patch_red + (1.0 - ALPHA) * patch_blue, atol=1.0)
+    assert_allclose(patch_pair, patch_red + (1.0 - RED[3]) * patch_blue, atol=1.0)
 
     # Rendering the same scene again gives the same image, whichever order two surfaces at the same depth end up in
     rgb, *_ = cam.render()
@@ -2235,11 +2290,11 @@ def test_transparent_surfaces_show_what_lies_behind_them(renderer, show_viewer):
     # Bringing the blue box in front of the red one swaps which of the two composites over the other
     patch_blue_ahead = centre_patch(PARKED, (1.2, 0.0, 0.5))
     patch_pair_swapped = centre_patch((0.6, 0.0, 0.5), (1.2, 0.0, 0.5))
-    assert_allclose(patch_pair_swapped, patch_blue_ahead + (1.0 - ALPHA) * patch_red, atol=1.0)
+    assert_allclose(patch_pair_swapped, patch_blue_ahead + (1.0 - blues_alpha) * patch_red, atol=1.0)
 
     # Crossing the camera over to the other side reverses which one is in front just the same
     cam.set_pose(pos=(-2.5, 0.0, 0.5), lookat=(0.0, 0.0, 0.5))
     patch_red_across = centre_patch((0.6, 0.0, 0.5), PARKED)
     patch_blue_across = centre_patch(PARKED, (-0.6, 0.0, 0.5))
     patch_pair_across = centre_patch((0.6, 0.0, 0.5), (-0.6, 0.0, 0.5))
-    assert_allclose(patch_pair_across, patch_blue_across + (1.0 - ALPHA) * patch_red_across, atol=1.0)
+    assert_allclose(patch_pair_across, patch_blue_across + (1.0 - blues_alpha) * patch_red_across, atol=1.0)
