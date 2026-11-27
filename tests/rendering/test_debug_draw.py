@@ -3,11 +3,12 @@ import sys
 
 import numpy as np
 import pytest
+import torch
 
 import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
-from genesis.engine.render_context import Points
+from genesis.engine.render_context import LABELS_HUE_STEP, Points
 from genesis.engine.solvers.rigid.rigid_solver import HIBERNATION_TINT
 from genesis.utils.misc import qd_to_torch
 
@@ -98,6 +99,15 @@ def test_draw_debug(renderer, show_viewer):
     rgb_array, *_ = cam.render(rgb=True, depth=False, segmentation=False, colorize_seg=False, normal=False)
     assert_allclose(np.std(rgb_array.reshape((-1, 3)), axis=0), 0.0, tol=gs.EPS)
 
+    # Points hold no normals, and face the camera in the image of the normals as they are shaded
+    points_obj = scene.draw_debug_points(poss=0.05 * np.random.rand(100, 3), colors=(1.0, 0.0, 0.0, 1.0))
+    scene.visualizer.update()
+    *_, normal_array = cam.render(rgb=False, depth=False, segmentation=False, colorize_seg=False, normal=True)
+    cam_dir = np.array((3.5, 0.5, 2.5)) / np.linalg.norm((3.5, 0.5, 2.5))
+    assert np.isclose(normal_array, (0.5 * cam_dir + 0.5) * 255.0, atol=3.0).all(axis=-1).any()
+    scene.clear_debug_object(points_obj)
+    scene.visualizer.update()
+
     # A mesh is drawn at the scale of its transform, and placed again at the scale of the new one
     boxes_T = gu.trans_to_T(np.array(((0.0, 0.0, 0.5), (0.0, 0.0, 0.5))))
     boxes_T[:, :3, :3] *= np.array((2.0, 4.0))[:, None, None]
@@ -119,10 +129,6 @@ def test_draw_debug(renderer, show_viewer):
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason=SKIP_NO_VIEWER)
 def test_sensors_draw_debug(n_envs, renderer_type, renderer, png_snapshot):
     scene = gs.Scene(
-        vis_options=gs.options.VisOptions(
-            # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
-            shadow=(renderer_type != RENDERER_TYPE.RASTERIZER),
-        ),
         viewer_options=gs.options.ViewerOptions(
             # Force screen-independent low-quality resolution when running unit tests for consistency
             res=(320, 320),
@@ -213,7 +219,8 @@ def test_sensors_draw_debug(n_envs, renderer_type, renderer, png_snapshot):
             debug_ray_hit_color=(0.5, 1.0, 1.0, 1.0),
         )
     )
-    # Behind the camera, so that moving it changes nothing in view
+    # Behind the camera, so that turning it changes nothing in view. A half turn about the vertical axis maps the box
+    # onto itself, which keeps the bounds of the scene that the shadows are fitted to.
     kinematic_box = scene.add_entity(
         gs.morphs.Box(
             size=(0.1, 0.1, 0.1),
@@ -256,7 +263,7 @@ def test_sensors_draw_debug(n_envs, renderer_type, renderer, png_snapshot):
         pink_pixel_counts.append(((PINK_LOWER <= rgb_shown) & (rgb_shown <= PINK_UPPER)).all(axis=-1).sum())
     assert pink_pixel_counts[0] < pink_pixel_counts[1]
     assert_equal(rgb_shown, rgb_arr)
-    kinematic_box.set_pos((2.4, 2.4, 2.4))
+    kinematic_box.set_quat((0.0, 0.0, 0.0, 1.0))
     rgb_arr_kept, *_ = pyrender_viewer.render_offscreen(
         pyrender_viewer._camera_node, pyrender_viewer._renderer, rgb=True, depth=False, seg=False, normal=False
     )
@@ -276,10 +283,6 @@ def test_sensors_draw_debug(n_envs, renderer_type, renderer, png_snapshot):
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason=SKIP_NO_VIEWER)
 def test_draw_debug_frustum_and_trajectory(n_envs, renderer_type, renderer, png_snapshot):
     scene = gs.Scene(
-        vis_options=gs.options.VisOptions(
-            # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
-            shadow=(renderer_type != RENDERER_TYPE.RASTERIZER),
-        ),
         viewer_options=gs.options.ViewerOptions(
             # Force screen-independent low-quality resolution when running unit tests for consistency
             res=(480, 320),
@@ -414,7 +417,7 @@ def test_islands_and_hibernation_colors(n_envs, renderer, show_viewer):
     links_idxc = {key[1]: idxc for idxc, key in scene.segmentation_idx_dict.items() if idxc > 0}
 
     def get_links_color(cam):
-        rgb, _, seg, _ = cam.render(rgb=True, segmentation=True, force_render=True)
+        rgb, _, seg, _ = cam.render(rgb=True, segmentation=True)
         rgb = rgb.reshape((max(n_envs, 1), RES[1], RES[0], 3))
         seg = seg.reshape((max(n_envs, 1), RES[1], RES[0]))
         # The median over the pixels of a link leaves its antialiased edges out
@@ -524,7 +527,7 @@ def test_islands_colors_single_tree(renderer, show_viewer):
     box_idxc = next(idxc for idxc, key in scene.segmentation_idx_dict.items() if idxc > 0 and key[1] == 1)
 
     def get_box_chroma():
-        rgb, _, seg, _ = cam.render(rgb=True, segmentation=True, force_render=True)
+        rgb, _, seg, _ = cam.render(rgb=True, segmentation=True)
         rgb = rgb.reshape((2, RES[1], RES[0], 3))
         seg = seg.reshape((2, RES[1], RES[0]))
         colors = np.array([np.median(rgb_env[seg_env == box_idxc], axis=0) for rgb_env, seg_env in zip(rgb, seg)])
@@ -541,3 +544,69 @@ def test_islands_colors_single_tree(renderer, show_viewer):
     assert qd_to_torch(scene.rigid_solver.dyn_state.links.is_hibernated)[1:].all()
     chroma_asleep = get_box_chroma()
     assert (np.abs(chroma_asleep - 1.0 / 3.0).max(axis=-1) < np.abs(chroma_awake - 1.0 / 3.0).max(axis=-1)).all()
+
+
+@pytest.mark.required
+def test_muscle_groups_colors(renderer):
+    RES = (160, 120)
+    MUSCLE_COLOR = (0.5, 0.5, 0.5)
+
+    scene = gs.Scene(
+        vis_options=gs.options.VisOptions(
+            # Ambient light alone shades every particle with its exact color, which is read back pixel by pixel
+            ambient_light=(1.0, 1.0, 1.0),
+            lights=[],
+            debug=True,
+            split_envs=True,
+        ),
+        renderer=renderer,
+        show_viewer=False,
+    )
+    muscle = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.15),
+            size=(0.2, 0.2, 0.2),
+        ),
+        material=gs.materials.MPM.Muscle(
+            sampler="regular",
+            n_groups=2,
+        ),
+        surface=gs.surfaces.Default(
+            color=MUSCLE_COLOR,
+        ),
+    )
+    cam = scene.add_camera(
+        res=RES,
+        pos=(0.0, -0.8, 0.15),
+        lookat=(0.0, 0.0, 0.15),
+        fov=40,
+        debug=True,
+    )
+    scene.build(n_envs=2)
+
+    # The camera looks along +y, so that the left half of the image shows the particles on the side of negative x
+    is_particle_right = muscle.get_particles_pos()[0, :, 0] > 0.0
+    groups_rgb = 255.0 * mu.hsv_to_rgb(np.array([0.0, LABELS_HUE_STEP]), saturation=0.8, value=0.95)
+
+    def get_sides_color():
+        rgb, _, seg, _ = cam.render(rgb=True, segmentation=True)
+        rgb = rgb.reshape((2, RES[1], RES[0], 3))
+        seg = seg.reshape((2, RES[1], RES[0]))
+        is_muscle = seg == next(idxc for idxc, key in scene.segmentation_idx_dict.items() if key == muscle.idx)
+        # The median over the pixels of each side leaves the antialiased edges and the middle column out
+        return np.array(
+            [
+                [
+                    np.median(rgb_env[:, cols][is_muscle_env[:, cols]], axis=0)
+                    for cols in (slice(0, 70), slice(90, None))
+                ]
+                for rgb_env, is_muscle_env in zip(rgb, is_muscle)
+            ]
+        )
+
+    # A single muscle group draws the muscle in the color of its surface
+    assert_allclose(get_sides_color(), 255.0 * np.array(MUSCLE_COLOR), atol=5.0)
+    # Several groups draw each side in the color of its group in every environment, following the groups at runtime
+    for groups_side in ((0, 1), (1, 0)):
+        muscle.set_muscle_group(torch.where(is_particle_right, groups_side[1], groups_side[0]))
+        assert_allclose(get_sides_color(), np.broadcast_to(groups_rgb[list(groups_side)], (2, 2, 3)), atol=5.0)

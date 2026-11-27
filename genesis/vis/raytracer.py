@@ -41,7 +41,6 @@ class EnvironmentSphere:
         self.file_path = os.path.join(gs.utils.get_assets_dir(), file_path)
 
     def add_to_render(self, renderer):
-        self._renderer = renderer
         if self.surface is None:
             return
         env_sphere = mu.load_trimesh(self.file_path)
@@ -51,14 +50,10 @@ class EnvironmentSphere:
         env_uvs = env_sphere.visual.uv
         env_uvs[:, 1] = 1.0 - env_uvs[:, 1]
         env_transform = gu.trans_quat_to_T(np.array(self.pos), np.array(self.quat))
-        # self.verts = env_vertices
 
         renderer.add_surface(self.name, self.surface)
         renderer.add_rigid(self.name, env_vertices, env_faces, env_normals, env_uvs)
         renderer.update_rigid(self.name, env_transform)
-
-    def update_pose(self, transform):
-        self._renderer.update_rigid(self.name, transform)
 
 
 class ShapeLight:
@@ -253,12 +248,6 @@ class Raytracer(BuildableMixin):
         )
 
         self.visualizer.update_cameras()
-
-        # state_limit = 0
-        # for camera in self._cameras:
-        #     state_limit_cam = int(camera.res[0] * camera.res[1] * self.spp)
-        #     state_limit = max(state_limit, state_limit_cam)
-        # state_limit = min(state_limit, self.state_limit)
 
         self.env_sphere.add_to_render(self)
         for light in self.lights:
@@ -526,8 +515,12 @@ class Raytracer(BuildableMixin):
 
     def add_camera(self, camera):
         camera_name = str(camera.uid)
+        if camera.model == "fisheye":
+            gs.raise_exception(
+                "The RayTracer renders pinhole cameras alone. Render a fisheye camera with the Rasterizer."
+            )
 
-        if camera.lens is not None:
+        if isinstance(camera.lens, gs.options.ThinLens):
             luisa_focal_len, luisa_aperture = _get_luisa_thin_lens(camera.fov, camera.res, camera.lens)
             self._cameras[camera_name] = LuisaRenderPy.ThinLensCamera(
                 name=camera_name,
@@ -557,7 +550,7 @@ class Raytracer(BuildableMixin):
         camera_name = str(camera.uid)
         camera_transform = camera.transform
 
-        if camera.lens is not None:
+        if isinstance(camera.lens, gs.options.ThinLens):
             luisa_focal_len, luisa_aperture = _get_luisa_thin_lens(camera.fov, camera.res, camera.lens)
             self._cameras[camera_name].update(
                 pose=self.get_transform(camera_transform),
@@ -577,8 +570,8 @@ class Raytracer(BuildableMixin):
         self._t = -1
 
     @gs.assert_built
-    def update_scene(self, force_render: bool = False):
-        if not force_render and self._t >= self.scene.sim.cur_step_global:
+    def update_scene(self):
+        if self._t >= self.scene.sim.cur_step_global:
             if self.camera_updated:
                 self._scene.update_scene(time=self._t)
                 self.camera_updated = False
@@ -588,7 +581,7 @@ class Raytracer(BuildableMixin):
         self._t = self.scene.sim.cur_step_global
 
         # update variables not used in simulation
-        self.visualizer.update_cameras(force_render)
+        self.visualizer.update_cameras()
 
         # Every rendered environment is drawn, laid out on the environment grid
         for shape in self.sim.render_context.get_shapes(self.rendered_envs_idx, debug=False):

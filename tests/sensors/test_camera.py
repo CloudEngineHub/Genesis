@@ -263,9 +263,6 @@ def test_rasterizer_batched(show_viewer, png_snapshot):
     )
     scene.build(n_envs=2)
 
-    # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
-    camera._shared_metadata.context.shadow = False
-
     sphere.set_pos([[0.0, 0.0, 2.0], [1.0, 0.5, 0.3]])
     scene.step()
 
@@ -322,9 +319,6 @@ def test_rasterizer_attached_batched(show_viewer, png_snapshot, tol):
     )
 
     scene.build(n_envs=2)
-
-    # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
-    camera._shared_metadata.context.shadow = False
 
     sphere.set_pos([[0.0, 0.0, 1.0], [0.2, 0.0, 0.5]])
     # 45° around Z for env 0, 30° around X for env 1
@@ -708,7 +702,7 @@ def test_raytracer_attached_without_offset_T():
     assert sensor_data.rgb.float().std() > 1.0, "Sensor camera RGB std too low, image may be blank"
 
     scene_camera.move_to_attach()
-    scene_rgb, *_ = scene_camera.render(rgb=True, force_render=True)
+    scene_rgb, *_ = scene_camera.render(rgb=True)
     scene_rgb = tensor_to_array(scene_rgb, dtype=np.int32)
     sensor_rgb = tensor_to_array(sensor_data.rgb, dtype=np.int32)
 
@@ -795,10 +789,6 @@ def test_lookat_entity(show_viewer, png_snapshot):
         cameras.append(camera)
 
     scene.build()
-
-    # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
-    for camera in cameras:
-        camera._shared_metadata.context.shadow = False
 
     # Snapshot check for every camera
     for camera in cameras:

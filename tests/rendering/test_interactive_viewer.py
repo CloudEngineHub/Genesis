@@ -326,10 +326,6 @@ def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot)
 
     # Create a scene
     scene = gs.Scene(
-        vis_options=gs.options.VisOptions(
-            # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
-            shadow=(renderer_type != RENDERER_TYPE.RASTERIZER),
-        ),
         viewer_options=gs.options.ViewerOptions(
             # Force screen-independent low-quality resolution when running unit tests for consistency.
             # Still, it must be large enough since rendering text involved alpha blending, which is platform-dependent.
@@ -395,7 +391,7 @@ def test_key_press(renderer_type, tmp_path, monkeypatch, renderer, png_snapshot)
     wait_for_viewer_events(pyrender_viewer, lambda: pyrender_viewer._last_recorded_t == scene.sim.cur_step_global)
     width, height = pyrender_viewer.viewport_size
     pyrender_viewer.dispatch_event("on_resize", width + 2, height)
-    wait_for_viewer_events(pyrender_viewer, lambda: not pyrender_viewer.viewer_flags["record"])
+    wait_for_viewer_events(pyrender_viewer, lambda: not pyrender_viewer.is_recording)
     pyrender_viewer.dispatch_event("on_resize", width, height)
     with av.open(VIDEO_FILENAME) as container:
         assert sum(1 for _ in container.decode(video=0)) == 1

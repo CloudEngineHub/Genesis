@@ -2,21 +2,33 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
+import numpy as np
+
 from pydantic import Field, StrictBool, model_validator
 
 import genesis as gs
 from genesis.datatypes import List
-from genesis.typing import IArrayType, PositiveFloat, PositiveInt, PositiveVec2IType, UnitIntervalVec3Type, Vec3FType
+from genesis.typing import (
+    IArrayType,
+    Matrix3x3Type,
+    PositiveFloat,
+    PositiveInt,
+    PositiveVec2IType,
+    UnitIntervalVec3Type,
+    ValidFloat,
+    Vec3FType,
+    Vec4FType,
+)
 from genesis.utils.serialization import ignore_invalid_load
 
 from .options import Options
 
 
 if TYPE_CHECKING:
-    LightType = Mapping[str, Any] | "DirectionalLight" | "PointLight" | "AmbientLight"
+    LightType = Mapping[str, Any] | "DirectionalLight" | "PointLight" | "SpotLight"
     LightArray = Sequence[LightType]
 else:
-    LightType = Annotated["DirectionalLight | PointLight | AmbientLight", Field(discriminator="type")]
+    LightType = Annotated["DirectionalLight | PointLight | SpotLight", Field(discriminator="type")]
     LightArray = Annotated[List[LightType], Field(strict=False)]
 
 
@@ -117,6 +129,19 @@ class ViewerOptions(Options):
 
 
 class DirectionalLight(Options):
+    """
+    Light coming from infinitely far away along one direction, like the sun, for the rasterizer.
+
+    Parameters
+    ----------
+    dir : tuple of float, shape (3,)
+        The direction the light travels in.
+    color : tuple of float, shape (3,)
+        The color of the light.
+    intensity : float
+        The brightness of the light, the same everywhere in the scene.
+    """
+
     type: Literal["directional"] = "directional"
     dir: Vec3FType
     color: UnitIntervalVec3Type
@@ -124,16 +149,51 @@ class DirectionalLight(Options):
 
 
 class PointLight(Options):
+    """
+    Light shining in every direction from one point, like a bulb, for the rasterizer.
+
+    Parameters
+    ----------
+    pos : tuple of float, shape (3,)
+        The position of the light.
+    color : tuple of float, shape (3,)
+        The color of the light.
+    intensity : float
+        The brightness of the light, which falls with the square of the distance to the light.
+    """
+
     type: Literal["point"] = "point"
     pos: Vec3FType
     color: UnitIntervalVec3Type
     intensity: float
 
 
-class AmbientLight(Options):
-    type: Literal["ambient"] = "ambient"
+class SpotLight(Options):
+    """
+    Light shining within a cone from one point, like a torch or a stage spot, for the rasterizer.
+
+    Parameters
+    ----------
+    pos : tuple of float, shape (3,)
+        The position of the light.
+    dir : tuple of float, shape (3,)
+        The direction of the axis of the cone.
+    color : tuple of float, shape (3,)
+        The color of the light.
+    intensity : float
+        The brightness of the light along the axis of the cone, which falls with the square of the distance to the
+        light.
+    cutoff : float, optional
+        The angle in degrees between the axis of the cone and its edge, in (0, 90). The light is the brightest along
+        the axis and fades out towards the edge. Defaults to 45.
+    """
+
+    type: Literal["spot"] = "spot"
+    pos: Vec3FType
+    dir: Vec3FType
     color: UnitIntervalVec3Type
     intensity: float
+    cutoff: Annotated[ValidFloat, Field(gt=0.0, lt=90.0)] = 45.0
 
 
 class ThinLens(Options):
@@ -157,6 +217,56 @@ class ThinLens(Options):
     aperture: PositiveFloat = 2.8
     focal_len: PositiveFloat = 0.05
     focus_dist: PositiveFloat | None = None
+
+
+class FisheyeLens(Options):
+    """
+    The calibrated lens of a fisheye camera, following the Kannala-Brandt model of the fisheye module of OpenCV.
+
+    A ray making an angle theta with the line of sight reaches the image at the distance
+    theta * (1 + k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8) from the principal point, in units of the focal
+    lengths. The model holds beyond a right angle, so that a camera may see more than the half space in front of it.
+    The calibration of a camera with OpenCV gives both parameters, for the resolution it was calibrated at.
+
+    Parameters
+    ----------
+    intrinsics : array_like, shape (3, 3)
+        The camera matrix: the focal lengths fx and fy on its diagonal and the principal point (cx, cy) in its last
+        column, in pixels from the top-left corner of the image, the rows going down.
+    distortion : array_like, shape (4,), optional
+        The distortion coefficients (k1, k2, k3, k4). Defaults to zeros, an equidistant projection.
+    """
+
+    intrinsics: Matrix3x3Type
+    distortion: Vec4FType = (0.0, 0.0, 0.0, 0.0)
+
+    @classmethod
+    def equidistant(cls, res, fov) -> "FisheyeLens":
+        """Return the lens of an equidistant fisheye, the circle inscribed in its image spanning its field of view.
+
+        Parameters
+        ----------
+        res : tuple of int, shape (2,)
+            The resolution of the camera, as (width, height).
+        fov : float
+            The angle that the circle inscribed in the image spans, in degrees, in (0, 360].
+        """
+        if not 0.0 < fov <= 360.0:
+            gs.raise_exception(f"The field of view of an equidistant fisheye must lie in (0, 360] degrees, got {fov}.")
+        f = 0.5 * min(res) / np.deg2rad(0.5 * fov)
+        return cls(intrinsics=((f, 0.0, 0.5 * res[0]), (0.0, f, 0.5 * res[1]), (0.0, 0.0, 1.0)))
+
+    @model_validator(mode="after")
+    def _validate_intrinsics(self):
+        (fx, skew, _), (zero_10, fy, _), last_row = self.intrinsics
+        if fx <= 0.0 or fy <= 0.0:
+            gs.raise_exception(f"The focal lengths of a fisheye lens must be positive, got fx={fx} and fy={fy}.")
+        if not np.allclose((skew, zero_10, *last_row), (0.0, 0.0, 0.0, 0.0, 1.0), atol=gs.EPS):
+            gs.raise_exception(
+                "The camera matrix of a fisheye lens holds the focal lengths on its diagonal, the principal point in "
+                f"its last column, and (0, 0, 1) in its last row, got {self.intrinsics}."
+            )
+        return self
 
 
 class EntityVisOptions(Options):
@@ -210,7 +320,8 @@ class VisOptions(Options):
     shadow : bool
         Whether to render shadow. Defaults to True.
     plane_reflection : bool
-        Whether to render plane reflection. Defaults to False.
+        Whether a plane mirrors the scene in the rasterizer, as much as the reflectance of its surface gives and blurred
+        by its roughness. It costs one more render of the scene per frame of each camera. Defaults to False.
     split_envs : bool
         Whether the cameras render each environment in its own world, split from the others, or all the environments
         as if they shared one scene, laid out side by side as the interactive viewer shows them. Split, a camera returns
@@ -225,7 +336,7 @@ class VisOptions(Options):
     ambient_light : tuple of float, shape (3,)
         The color of the scene's ambient light.
     visualize_mpm_boundary : bool
-        Deprecated: use ``MPMOptions(vis=ParticleVisOptions(boundary=True))``. Whether to draw the boundary of
+        Deprecated: use ``MPMOptions(vis=MPMVisOptions(boundary=True))``. Whether to draw the boundary of
         the MPM solver.
     visualize_sph_boundary : bool
         Deprecated: use ``SPHOptions(vis=ParticleVisOptions(boundary=True))``. Whether to draw the boundary of
@@ -244,8 +355,8 @@ class VisOptions(Options):
         Deprecated: use ``RigidOptions(vis=RigidVisOptions(contact_force_scale=...))``. The length of the arrow of a
         contact force per newton, in meters.
     n_support_neighbors : int
-        Deprecated: use ``n_support_neighbors`` of ``ParticleVisOptions``, the ``vis`` options of the MPM and PBD
-        solvers.
+        Deprecated: use ``n_support_neighbors`` of ``MPMVisOptions`` or ``PBDVisOptions``, the ``vis`` options of the
+        MPM and PBD solvers.
     rendered_envs_idx : list, optional
         Indices of the environments that will be rendered. If not provided, all the environments will be considered.
         Defaults to None.
@@ -302,10 +413,14 @@ class VisOptions(Options):
             ("show_link_frame", "'RigidOptions(vis=RigidVisOptions(link_frames={}))'"),
             ("link_frame_size", "'RigidOptions(vis=RigidVisOptions(link_frame_size={}))'"),
             ("contact_force_scale", "'RigidOptions(vis=RigidVisOptions(contact_force_scale={}))'"),
-            ("visualize_mpm_boundary", "'MPMOptions(vis=ParticleVisOptions(boundary={}))'"),
+            ("visualize_mpm_boundary", "'MPMOptions(vis=MPMVisOptions(boundary={}))'"),
             ("visualize_sph_boundary", "'SPHOptions(vis=ParticleVisOptions(boundary={}))'"),
             ("visualize_pbd_boundary", "'PBDOptions(vis=PBDVisOptions(boundary={}))'"),
-            ("n_support_neighbors", "'MPMOptions(vis=ParticleVisOptions(n_support_neighbors={}))'"),
+            (
+                "n_support_neighbors",
+                "'MPMOptions(vis=MPMVisOptions(n_support_neighbors={0}))' or "
+                "'PBDOptions(vis=PBDVisOptions(n_support_neighbors={0}))'",
+            ),
         ):
             value = data.get(name)
             if value is not None:

@@ -12,11 +12,11 @@ if TYPE_CHECKING:
     from genesis.engine.entities.base_entity import Entity
 
 
-_SAMPLER_PATTERN = re.compile(r"pbs(-[1-9]\d*)?|random|regular")
+SAMPLER_PATTERN = re.compile(r"pbs(-[1-9]\d*)?|random|regular")
 
 
 def _validate_sampler(v: str) -> str:
-    if not isinstance(v, str) or not _SAMPLER_PATTERN.fullmatch(v):
+    if not isinstance(v, str) or not SAMPLER_PATTERN.fullmatch(v):
         raise PydanticCustomError(
             "invalid_sampler",
             "Input should be 'pbs', 'pbs-<res>' with a positive resolution, 'random', or 'regular'",
@@ -37,8 +37,7 @@ class Material[EntityT: "Entity"](Options):
     This class should *not* be instantiated directly.
     """
 
-    # Frozen, so that a material is configuration the entities holding it share, and materials of equal options compare
-    # and hash equal (see 'MPMSolver', which compiles one branch of its kernels per distinct material)
+    # Frozen, so that entities share a material as configuration and materials of equal options compare and hash equal
     model_config = ConfigDict(frozen=True)
 
     structure: ClassVar[STRUCTURE]

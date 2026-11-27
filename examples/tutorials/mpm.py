@@ -12,7 +12,7 @@ scene = gs.Scene(
     mpm_options=gs.options.MPMOptions(
         lower_bound=(-0.5, -1.0, 0.0),
         upper_bound=(0.5, 1.0, 1),
-        vis=gs.options.ParticleVisOptions(
+        vis=gs.options.MPMVisOptions(
             boundary=True,
         ),
     ),
@@ -45,9 +45,6 @@ obj_sand = scene.add_entity(
             size=(0.3, 0.3, 0.3),
         ),
         material=gs.materials.MPM.Liquid(),
-        surface=gs.surfaces.Default(
-            color=(0.3, 0.3, 1.0),
-        ),
         vis=gs.options.EntityVisOptions(
             debug=True,
         ),

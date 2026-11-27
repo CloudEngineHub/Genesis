@@ -1,34 +1,113 @@
-"""PBR renderer for Python.
-
-Author: Matthew Matl
-"""
+"""The renderer of the rasterizer, which draws a scene with OpenGL."""
 
 import os
 import sys
+from typing import NamedTuple
 
 import numpy as np
 
-import PIL
+from OpenGL.GL import (
+    GL_BLEND,
+    GL_CLAMP_TO_EDGE,
+    GL_COLOR_ATTACHMENT0,
+    GL_COLOR_BUFFER_BIT,
+    GL_CULL_FACE,
+    GL_DEPTH_ATTACHMENT,
+    GL_DEPTH_BUFFER_BIT,
+    GL_DEPTH_COMPONENT24,
+    GL_DEPTH_TEST,
+    GL_DRAW_FRAMEBUFFER,
+    GL_DST_COLOR,
+    GL_FALSE,
+    GL_FILL,
+    GL_FLOAT,
+    GL_FRAMEBUFFER,
+    GL_FRONT_AND_BACK,
+    GL_FUNC_ADD,
+    GL_GREATER,
+    GL_HALF_FLOAT,
+    GL_LESS,
+    GL_LINEAR,
+    GL_LINEAR_MIPMAP_LINEAR,
+    GL_MAX_CUBE_MAP_TEXTURE_SIZE,
+    GL_MAX_RENDERBUFFER_SIZE,
+    GL_MAX_SAMPLES,
+    GL_MIN,
+    GL_MULTISAMPLE,
+    GL_NEAREST,
+    GL_NONE,
+    GL_ONE,
+    GL_POINTS,
+    GL_READ_FRAMEBUFFER,
+    GL_RENDERBUFFER,
+    GL_RGBA,
+    GL_TEXTURE0,
+    GL_TEXTURE_2D,
+    GL_TEXTURE_2D_ARRAY,
+    GL_TEXTURE_CUBE_MAP,
+    GL_TEXTURE_CUBE_MAP_SEAMLESS,
+    GL_TEXTURE_MAG_FILTER,
+    GL_TEXTURE_MIN_FILTER,
+    GL_TRIANGLES,
+    GL_TRUE,
+    GL_UNSIGNED_BYTE,
+    GL_UNSIGNED_INT,
+    GL_ZERO,
+    glActiveTexture,
+    glBindFramebuffer,
+    glBindRenderbuffer,
+    glBindTexture,
+    glBindVertexArray,
+    glBlendEquation,
+    glBlendEquationSeparate,
+    glBlendFuncSeparate,
+    glBlitFramebuffer,
+    glClear,
+    glClearColor,
+    glDeleteFramebuffers,
+    glDeleteRenderbuffers,
+    glDeleteVertexArrays,
+    glDepthFunc,
+    glDepthMask,
+    glDepthRange,
+    glDisable,
+    glDrawArrays,
+    glDrawBuffer,
+    glEnable,
+    glFramebufferRenderbuffer,
+    glGenFramebuffers,
+    glGenRenderbuffers,
+    glGenVertexArrays,
+    glGenerateMipmap,
+    glGetIntegerv,
+    glPolygonMode,
+    glReadBuffer,
+    glRenderbufferStorage,
+    glRenderbufferStorageMultisample,
+    glTexParameteri,
+    glViewport,
+)
+from PIL import Image
 import pyglet
-from OpenGL.GL import *
 
+import genesis.utils.geom as gu
+
+from .camera import FisheyeCamera
 from .constants import (
-    DEFAULT_Z_FAR,
-    DEFAULT_Z_NEAR,
-    GLTF,
-    MAX_N_LIGHTS,
     BufFlags,
+    LightType,
     ProgramFlags,
     RenderFlags,
     TexFlags,
     TextAlign,
+    ViewFlags,
+    TexChannels,
 )
 from .font import FontCache
-from .jit_render import is_env_pass
-from .light import DirectionalLight, PointLight, SpotLight
-from .material import MetallicRoughnessMaterial, SpecularGlossinessMaterial
-from .shader_program import NormalShaderCache, ShaderProgramCache
-from .texture import Texture
+from .jit_render import CUBE_MAP_FACES_ROT, is_env_pass
+from .sampler import Sampler
+from .shader_program import ShaderProgramCache
+from .texture import CubeMapTexture, Texture
 from .utils import format_color_vector
 
 
@@ -36,25 +115,29 @@ MARKER_XRAY_DIM_FACTOR = 0.3
 MARKER_XRAY_ALPHA = 0.4
 
 
-class Renderer(object):
-    """Class for handling all rendering operations on a scene.
+class _FisheyeLayout(NamedTuple):
+    """The faces of the cube map that the image of a fisheye camera reaches, their size, and the angles it images."""
 
-    Note
-    ----
-    This renderer relies on the existence of an OpenGL context and
-    does not create one on its own.
+    camera: FisheyeCamera
+    is_face_drawn: np.ndarray
+    face_size: int
+    angle_range: tuple[float, float]
+
+
+class Renderer:
+    """The passes drawing a scene into the current OpenGL context, which its owner creates.
 
     Parameters
     ----------
     viewport_width : int
-        Width of the viewport in pixels.
+        The width of the viewport, in pixels.
     viewport_height : int
-        Width of the viewport height in pixels.
-    point_size : float, optional
-        Size of points in pixels. Defaults to 1.0.
+        The height of the viewport, in pixels.
+    jit : JITRenderer
+        The compiled passes of the scene, shared by every renderer of the scene.
     """
 
-    def __init__(self, viewport_width, viewport_height, jit, point_size=1.0):
+    def __init__(self, viewport_width, viewport_height, jit):
         self.dpscale = 1
 
         # Scaling needed on retina displays for old pyglet releases
@@ -63,7 +146,6 @@ class Renderer(object):
 
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
-        self.point_size = point_size
 
         # Optional framebuffer for offscreen renders
         self._main_fb = None
@@ -74,20 +156,27 @@ class Renderer(object):
         self._main_db_ms = None
         self._main_fb_dims = (None, None)
         self._shadow_fb = None
+        self._transmittance_fb = None
         self._floor_fb = None
-        self._latest_znear = DEFAULT_Z_NEAR
-        self._latest_zfar = DEFAULT_Z_FAR
 
         # Shader Program Cache
         self._program_cache = ShaderProgramCache()
-        self._normal_program_cache = NormalShaderCache()
         self._font_cache = FontCache()
-        self._texture_alloc_idx = 0
 
         self._floor_texture_color = None
         self._floor_texture_depth = None
 
         self.jit = jit
+
+        # The cube map that a fisheye camera resamples, its faces drawn by a renderer of their own, and the faces that
+        # its image reaches with their size (see '_fisheye_pass'). The rotation from the frame of the camera to that of
+        # the face that a face renderer draws.
+        self._face_renderer = None
+        self._face_rot = None
+        self._fisheye_color_cube = None
+        self._fisheye_depth_cube = None
+        self._fisheye_fb = None
+        self._fisheye_vao = None
 
     @property
     def viewport_width(self):
@@ -97,6 +186,7 @@ class Renderer(object):
     @viewport_width.setter
     def viewport_width(self, value):
         self._viewport_width = self.dpscale * value
+        self._fisheye_layout = None
 
     @property
     def viewport_height(self):
@@ -106,39 +196,31 @@ class Renderer(object):
     @viewport_height.setter
     def viewport_height(self, value):
         self._viewport_height = self.dpscale * value
+        self._fisheye_layout = None
 
-    @property
-    def point_size(self):
-        """float : The size of screen-space points, in pixels."""
-        return self._point_size
-
-    @point_size.setter
-    def point_size(self, value):
-        self._point_size = float(value)
-
-    def render(self, scene, flags, seg_node_map=None, *, is_first_pass=True, force_skip_shadows=False, env_idx=None):
-        """Render a scene with the given set of flags.
+    def render(self, scene, flags, seg_node_map=None, *, is_first_pass=True, env_idx=None):
+        """Run the passes of a render, from the main camera of a scene.
 
         Parameters
         ----------
-        scene : :class:`Scene`
-            A scene to render.
+        scene : Scene
+            The scene to render.
         flags : int
-            A specification from :class:`.RenderFlags`.
-        seg_node_map : dict
-            A map from :class:`.Node` objects to (3,) colors for each.
-            If specified along with flags set to :attr:`.RenderFlags.SEG`,
-            the color image will be a segmentation image.
+            The flags of the render (see RenderFlags).
+        seg_node_map : dict, optional
+            The color of each node in a segmentation image, read when the flags ask for one. Defaults to None.
+        is_first_pass : bool, optional
+            Whether the render is the first one of a frame, which brings the GL context up to date with the scene.
+            Defaults to True.
+        env_idx : int, optional
+            The environment to render, all of them when None. Defaults to None.
 
         Returns
         -------
-        color_im : (h, w, 3) uint8 or (h, w, 4) uint8
-            If :attr:`RenderFlags.OFFSCREEN` is set, the color buffer. This is
-            normally an RGB buffer, but if :attr:`.RenderFlags.RGBA` is set,
-            the buffer will be a full RGBA buffer.
-        depth_im : (h, w) float32
-            If :attr:`RenderFlags.OFFSCREEN` is set, the depth buffer
-            in linear units.
+        images : tuple or None
+            For an offscreen render, the color or segmentation image and the depth image, those the flags ask for, each
+            stacked over the environments when they are rendered one by one. An empty tuple while the shadow textures
+            are not ready, and None for a render to the window.
         """
         # A pass with the environments drawn side by side moves every environment-instanced primitive by its
         # environment offset (see 'JITRenderer.env_offset_buffer'). A pass rendering the environments one at a time
@@ -147,211 +229,244 @@ class Renderer(object):
 
         # Update context with meshes and textures
         if is_first_pass:
-            self.jit.update_context(scene, flags)
+            self.jit.update_context(flags)
             for texture in scene.updated_textures:
                 texture.upload_layers()
             scene.updated_textures.clear()
-            self.jit.update(scene)
-            all_ready = self.jit.set_lighting(scene, is_grid)
+            self.jit.update()
+            is_lighting_ready = self.jit.set_lighting(is_grid)
 
-            # Flush queued buffer updates AFTER jit.update(scene) so that new
-            # nodes created by set_primitive -> _add_to_context already have
-            # their GPU buffers allocated and can receive the data.
+            # The queued buffer updates are flushed once the primitives that 'update' adds to the context hold their
+            # buffers
             self.jit.flush_buffer()
 
-            if not all_ready:
-                # Shadow textures not yet initialized - skip this frame to avoid
-                # flickering. The caller should display the previous frame.
+            # A frame rendered before every shadow texture is in the context would flicker, so the caller keeps showing
+            # the previous one
+            if not is_lighting_ready:
                 return ()
 
-        if flags & RenderFlags.SEG or flags & RenderFlags.DEPTH_ONLY or flags & RenderFlags.FLAT:
+        if flags & RenderFlags.SEG or flags & RenderFlags.DEPTH_ONLY or flags & RenderFlags.NORMAL:
             flags &= ~RenderFlags.REFLECTIVE_FLOOR
+
+        # The normals are drawn by a pass of their own, which the flags tell apart from the others (see 'forward_pass'
+        # in jit_render.py)
+        normal_flags = flags & (RenderFlags.VERTEX_NORMALS | RenderFlags.FACE_NORMALS)
+        flags &= ~normal_flags
 
         if env_idx is not None:
             envs_idx = (env_idx,)
-            use_env_idx = False
+            is_env_stacked = False
         elif flags & RenderFlags.ENV_SEPARATE and flags & RenderFlags.OFFSCREEN and scene.n_envs > 1:
             envs_idx = range(scene.n_envs)
-            use_env_idx = True
+            is_env_stacked = True
         else:
             envs_idx = (-1,)
-            use_env_idx = False
+            is_env_stacked = False
 
         retval_list = None
-        for env_idx in envs_idx:
-            # Render necessary shadow maps
-            if not (force_skip_shadows or flags & RenderFlags.SEG or flags & RenderFlags.DEPTH_ONLY):
-                for ln in scene.light_nodes:
-                    take_pass = False
-                    if isinstance(ln.light, DirectionalLight) and flags & RenderFlags.SHADOWS_DIRECTIONAL:
-                        take_pass = True
-                    elif isinstance(ln.light, SpotLight) and flags & RenderFlags.SHADOWS_SPOT:
-                        take_pass = True
-                    elif isinstance(ln.light, PointLight) and flags & RenderFlags.SHADOWS_POINT:
-                        take_pass = True
-                    # The shadow texture lives on the light, so one map serves every renderer of the scene (the
-                    # viewer window and each camera): it is rendered again once the scene changed or another
-                    # environment is drawn. The pass draws every opaque mesh in fill mode whatever the flags, so the
-                    # key is the scene revision and the environment alone.
-                    if take_pass and ln.light.shadow_map_revision != (scene.revision, env_idx):
-                        if isinstance(ln.light, PointLight):
-                            self._point_shadow_mapping_pass(scene, ln, flags, env_idx=env_idx)
-                        else:
-                            self._shadow_mapping_pass(scene, ln, flags, env_idx=env_idx)
+        for i_e in envs_idx:
+            # The shadow texture lives on the light, so one map serves every renderer of the scene (the viewer window
+            # and each camera): it is rendered again once the scene changed or another environment is drawn. The pass
+            # draws every opaque mesh in fill mode whatever the flags, so the key is the scene revision and the
+            # environment alone.
+            if not flags & (RenderFlags.SEG | RenderFlags.DEPTH_ONLY | RenderFlags.NORMAL):
+                for light_node in scene.light_nodes:
+                    light = light_node.light
+                    if flags & light.shadow_flag and light.shadow_map_revision != (scene.revision, i_e):
+                        self._shadow_mapping_pass(light_node, flags, env_idx=i_e)
                         glBindFramebuffer(GL_FRAMEBUFFER, 0)
-                        ln.light.shadow_map_revision = (scene.revision, env_idx)
+                        light.shadow_map_revision = (scene.revision, i_e)
 
-            if flags & RenderFlags.REFLECTIVE_FLOOR:
-                self._floor_pass(scene, flags, env_idx=env_idx)
+            if isinstance(scene.main_camera_node.camera, FisheyeCamera):
+                self._fisheye_pass(scene, flags, seg_node_map, env_idx=i_e)
+            else:
+                if flags & RenderFlags.REFLECTIVE_FLOOR:
+                    self._floor_pass(scene, flags, env_idx=i_e)
+                self._forward_pass(scene, flags, seg_node_map=seg_node_map, env_idx=i_e)
 
-            retval = self._forward_pass(scene, flags, seg_node_map=seg_node_map, env_idx=env_idx)
-            if retval is not None:
+            if flags & RenderFlags.OFFSCREEN:
+                retval = self._read_main_framebuffer(scene, flags)
                 if retval_list is None:
                     retval_list = tuple([val] for val in retval)
                 else:
                     for idx, val in enumerate(retval):
                         retval_list[idx].append(val)
 
-            # Render normal visualization on screen only if requested, ie after reading frame buffer and without
-            # cleaning first.
-            if flags & (RenderFlags.VERTEX_NORMALS | RenderFlags.FACE_NORMALS):
-                self._normal_pass(scene, flags, env_idx=env_idx)
-
-        # Update camera settings for retrieving depth buffers
-        self._latest_znear = scene.main_camera_node.camera.znear
-        self._latest_zfar = scene.main_camera_node.camera.zfar
+            # The normals are drawn over the image after it is read, so they show on screen alone
+            if normal_flags:
+                self._normal_pass(scene, (flags & ~RenderFlags.REFLECTIVE_FLOOR) | normal_flags, env_idx=i_e)
 
         if retval_list is None:
             return
 
-        if use_env_idx:
+        if is_env_stacked:
             retval_list = tuple(np.stack(val_list, axis=0) for val_list in retval_list)
         else:
             retval_list = tuple(val_list[0] for val_list in retval_list)
         return retval_list
 
-    def render_text(
-        self, text, x, y, font_name="OpenSans-Regular", font_pt=40, color=None, scale=1.0, align=TextAlign.BOTTOM_LEFT
+    def render_images(
+        self,
+        scene,
+        flags,
+        camera_node=None,
+        *,
+        rgb=True,
+        depth=False,
+        seg_node_map=None,
+        normal=False,
+        shadow=False,
+        plane_reflection=False,
+        split_envs=False,
+        env_idx=None,
+        debug_view=False,
     ):
-        """Render text into the current viewport.
-
-        Note
-        ----
-        This cannot be done into an offscreen buffer.
+        """Render the images asked for, from a camera of a scene.
 
         Parameters
         ----------
-        text : str
-            The text to render.
+        scene : Scene
+            The scene to render.
+        flags : int
+            The flags of the render (see RenderFlags), on top of those that the other arguments set.
+        camera_node : Node, optional
+            The node of the camera to render from. Defaults to the main camera of the scene.
+        rgb : bool, optional
+            Whether to render the color image. Defaults to True.
+        depth : bool, optional
+            Whether to render the depth image. Defaults to False.
+        seg_node_map : dict, optional
+            The color of each node in a segmentation image, rendered in place of the color image when given. Defaults
+            to None.
+        normal : bool, optional
+            Whether to render the image of the normals of the surfaces. Defaults to False.
+        shadow : bool, optional
+            Whether the lights cast shadows. Defaults to False.
+        plane_reflection : bool, optional
+            Whether the floor reflects the scene. Defaults to False.
+        split_envs : bool, optional
+            Whether the environments are rendered one by one, rather than side by side in one image. Defaults to False.
+        env_idx : int, optional
+            The environment to render, all of them when None. Defaults to None.
+        debug_view : bool, optional
+            Whether to draw the markers, seen through what hides them, and the debug representation of the entities.
+            Defaults to False.
+
+        Returns
+        -------
+        images : tuple
+            The color or segmentation image, the depth image and the normal image, those rendered offscreen alone and
+            in this order.
+        """
+        # The camera of the render stands for the main camera of the scene while the render runs
+        saved_camera_node = scene.main_camera_node
+        if camera_node is not None:
+            scene.main_camera_node = camera_node
+        try:
+            flags |= RenderFlags.MARKER_XRAY if debug_view else RenderFlags.SKIP_MARKERS
+            if shadow:
+                flags |= RenderFlags.SHADOWS_ALL
+            if plane_reflection:
+                flags |= RenderFlags.REFLECTIVE_FLOOR
+            if split_envs:
+                flags |= RenderFlags.ENV_SEPARATE
+            self.jit.view = ViewFlags.DEBUG if debug_view else ViewFlags.NORMAL
+            if seg_node_map is not None:
+                flags |= RenderFlags.SEG
+            if depth:
+                flags |= RenderFlags.RET_DEPTH
+                if not (rgb or seg_node_map is not None):
+                    flags |= RenderFlags.DEPTH_ONLY
+
+            images = ()
+            is_first_pass = True
+            if rgb or depth or seg_node_map is not None:
+                images = self.render(scene, flags, seg_node_map, env_idx=env_idx)
+                is_first_pass = False
+            if normal:
+                normal_flags = RenderFlags.NORMAL | RenderFlags.OFFSCREEN
+                normal_flags |= flags & (RenderFlags.ENV_SEPARATE | RenderFlags.SKIP_MARKERS)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                normal_image, *_ = self.render(scene, normal_flags, is_first_pass=is_first_pass, env_idx=env_idx)
+                images = (*images, normal_image)
+        finally:
+            scene.main_camera_node = saved_camera_node
+        return images
+
+    def render_text(self, lines, x, y, font_name, font_pt, color, align=TextAlign.TOP_LEFT):
+        """Draw lines of text over the current viewport, one below the other.
+
+        Parameters
+        ----------
+        lines : list of str
+            The lines of text, in ASCII.
         x : int
-            Horizontal pixel location of text.
+            The horizontal position of the text, in pixels from the left.
         y : int
-            Vertical pixel location of text.
+            The vertical position of the text, in pixels from the bottom.
         font_name : str
-            Name of font, from the ``pyrender/fonts`` folder, or
-            a path to a ``.ttf`` file.
+            The name of the font, a file of the 'fonts' folder without its extension.
         font_pt : int
-            Height of the text, in font points.
+            The height of the text, in pixels.
         color : (4,) float
-            The color of the text. Default is black.
-        scale : int
-            Scaling factor for text.
-        align : int
-            One of the :class:`TextAlign` options which specifies where the
-            ``x`` and ``y`` parameters lie on the text. For example,
-            :attr:`TextAlign.BOTTOM_LEFT` means that ``x`` and ``y`` indicate
-            the position of the bottom-left corner of the textbox.
+            The RGBA color of the text.
+        align : TextAlign, optional
+            The corner of the first line that the position gives. Defaults to the top-left corner.
         """
         x *= self.dpscale
         y *= self.dpscale
         font_pt *= self.dpscale
 
-        if color is None:
-            color = np.array([0.0, 0.0, 0.0, 1.0])
-        else:
-            color = format_color_vector(color, 4)
-
-        # Set up viewport for render
         self._configure_forward_pass_viewport(0)
-
-        # Load font
         font = self._font_cache.get_font(font_name, font_pt)
         if not font._in_context():
             font._add_to_context()
-
-        # Load program
         program = self._get_text_program()
         program._bind()
 
-        # Set uniforms
-        p = np.eye(4)
-        p[0, 0] = 2.0 / self.viewport_width
-        p[0, 3] = -1.0
-        p[1, 1] = 2.0 / self.viewport_height
-        p[1, 3] = -1.0
-        program.set_uniform("projection", p)
-        program.set_uniform("text_color", color)
-
-        # Draw text
-        font.render_string(text, x, y, scale, align)
-
-    def render_texts(self, texts, x, y, font_name="UbuntuMono-Regular", font_pt=40, color=None, scale=1.0):
-        x *= self.dpscale
-        y *= self.dpscale
-        font_pt *= self.dpscale
-
-        if color is None:
-            color = np.array([0.0, 0.0, 0.0, 1.0])
-        else:
-            color = format_color_vector(color, 4)
-
-        # Set up viewport for render
-        self._configure_forward_pass_viewport(0)
-
-        # Load font
-        font = self._font_cache.get_font(font_name, font_pt)
-        if not font._in_context():
-            font._add_to_context()
-
-        # Load program
-        program = self._get_text_program()
-        program._bind()
-
-        # Set uniforms
-        p = np.eye(4)
-        p[0, 0] = 2.0 / self.viewport_width
-        p[0, 3] = -1.0
-        p[1, 1] = 2.0 / self.viewport_height
-        p[1, 3] = -1.0
-        program.set_uniform("projection", p)
-        program.set_uniform("text_color", color)
-
-        # Draw text
-        for i, text in enumerate(texts):
-            font.render_string(text, x, int(y - i * font_pt * 1.1), scale, TextAlign.TOP_LEFT)
+        # The projection maps the pixels of the viewport to normalized device coordinates
+        projection = np.eye(4)
+        projection[0, 0] = 2.0 / self.viewport_width
+        projection[0, 3] = -1.0
+        projection[1, 1] = 2.0 / self.viewport_height
+        projection[1, 3] = -1.0
+        program.set_uniform("projection", projection)
+        program.set_uniform("text_color", format_color_vector(color, 4))
+        for i_line, line in enumerate(lines):
+            font.render_string(line, x, int(y - i_line * font_pt * 1.1), align)
 
     def delete(self):
         """Free all allocated OpenGL resources."""
         # Free shaders
         self._program_cache.clear()
-        self._normal_program_cache.clear()
 
         # Free fonts
         self._font_cache.clear()
 
-        self._texture_alloc_idx = 0
-
         self._delete_main_framebuffer()
         self._delete_shadow_framebuffer()
         self._delete_floor_framebuffer()
+        self._delete_fisheye_textures()
+        if self._fisheye_fb is not None:
+            glDeleteFramebuffers(1, [self._fisheye_fb])
+            glDeleteVertexArrays(1, [self._fisheye_vao])
+            self._fisheye_fb = None
+            self._fisheye_vao = None
 
     ###########################################################################
     # Rendering passes
     ###########################################################################
 
-    def _floor_pass(self, scene, flags, seg_node_map=None, env_idx=-1):
-        self._configure_floor_pass_viewport(flags)
-        glClearColor(0.0, 0.0, 0.0, 1.0)
+    def _floor_pass(self, scene, flags, env_idx=-1):
+        self._configure_floor_framebuffer()
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self._floor_fb)
+        glViewport(0, 0, self.viewport_width, self.viewport_height)
+        glEnable(GL_DEPTH_TEST)
+        glDepthMask(GL_TRUE)
+        glDepthFunc(GL_LESS)
+        glDepthRange(0.0, 1.0)
+        # The alpha of the mirror image marks where it holds mirrored geometry (see floor_tex in mesh.frag)
+        glClearColor(0.0, 0.0, 0.0, 0.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         V, P = self._get_camera_matrices(scene, env_idx)
@@ -371,6 +486,11 @@ class Renderer(object):
             env_idx=env_idx,
         )
 
+        # A rough floor samples a coarser level of the mirror image, which blurs it
+        glBindTexture(GL_TEXTURE_2D, self._floor_texture_color._texid)
+        glGenerateMipmap(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
     def _forward_pass(self, scene, flags, seg_node_map=None, env_idx=-1):
         # Set up viewport for render
         self._configure_forward_pass_viewport(flags)
@@ -378,8 +498,6 @@ class Renderer(object):
         # Clear it
         if flags & RenderFlags.SEG:
             glClearColor(0.0, 0.0, 0.0, 1.0)
-            if seg_node_map is None:
-                seg_node_map = {}
         else:
             glClearColor(*scene.bg_color)
 
@@ -396,46 +514,15 @@ class Renderer(object):
 
         floor_tex = self._floor_texture_color._texid if flags & RenderFlags.REFLECTIVE_FLOOR else 0
         screen_size = np.array([self.viewport_width, self.viewport_height], np.float32)
-
-        common_kwargs = dict(env_idx=env_idx)
+        color_list = None
         if flags & RenderFlags.SEG:
-            color_list = np.zeros((len(self.jit.node_list), 3), np.float32)
+            # A primitive missing from the map takes a color below -1, which the pass draws nothing for
+            color_list = np.full((len(self.jit.node_list), 3), -2.0, np.float32)
             for i, node in enumerate(self.jit.node_list):
-                if node not in seg_node_map:
-                    color_list[i, :] = -2.0
-                else:
+                if node in seg_node_map:
                     color_list[i] = seg_node_map[node] / 255.0
-            common_kwargs["color_list"] = color_list
-        else:
-            common_kwargs["floor_tex"] = floor_tex
 
         if flags & (RenderFlags.SEG | RenderFlags.DEPTH_ONLY | RenderFlags.SKIP_MARKERS):
-            # No markers contribute to the output in these modes — single pass.
-            self.jit.forward_pass(self, V, P, cam_pos, flags, ProgramFlags.USE_MATERIAL, screen_size, **common_kwargs)
-        else:
-            # Draw non-marker geometry first so the depth buffer only contains
-            # real geometry when the x-ray pass runs. This way the GL_GREATER
-            # depth test in _marker_xray_pass cannot see marker-on-marker
-            # occlusion (e.g. dark rings at joints of chained debug cylinders)
-            # — it only ghosts markers occluded by real objects.
-            self.jit.forward_pass(
-                self,
-                V,
-                P,
-                cam_pos,
-                flags | RenderFlags.SKIP_MARKERS,
-                ProgramFlags.USE_MATERIAL,
-                screen_size,
-                **common_kwargs,
-            )
-
-            # Render occluded markers as darkened ghosts for depth cues — must
-            # happen before markers themselves are drawn so the depth buffer
-            # used for the GL_GREATER test is free of marker depths.
-            if flags & RenderFlags.MARKER_XRAY:
-                self._marker_xray_pass(V, P, cam_pos, flags, screen_size, env_idx)
-
-            # Now draw opaque markers on top
             self.jit.forward_pass(
                 self,
                 V,
@@ -444,32 +531,48 @@ class Renderer(object):
                 flags,
                 ProgramFlags.USE_MATERIAL,
                 screen_size,
-                markers_only=True,
-                **common_kwargs,
+                color_list,
+                floor_tex=floor_tex,
+                env_idx=env_idx,
             )
-
-        # If doing offscreen render, copy result from framebuffer and return
-        if flags & RenderFlags.OFFSCREEN:
-            return self._read_main_framebuffer(scene, flags)
+        else:
+            # The markers are drawn last, so that the depth buffer holds the rest of the scene alone when the X-ray pass
+            # tests it, which ghosts the markers that real objects hide and none that another marker hides (dark rings
+            # at the joints of chained debug cylinders otherwise)
+            for markers_only in (False, True):
+                if markers_only and flags & RenderFlags.MARKER_XRAY:
+                    self._marker_xray_pass(V, P, cam_pos, flags, screen_size, env_idx)
+                self.jit.forward_pass(
+                    self,
+                    V,
+                    P,
+                    cam_pos,
+                    flags if markers_only else flags | RenderFlags.SKIP_MARKERS,
+                    ProgramFlags.USE_MATERIAL,
+                    screen_size,
+                    floor_tex=floor_tex,
+                    env_idx=env_idx,
+                    markers_only=markers_only,
+                )
 
     def _marker_xray_pass(self, V, P, cam_pos, flags, screen_size, env_idx):
         """Render markers behind geometry with darkened transparency (X-ray effect)."""
-        marker_mask = self.jit.render_flags[:, 6].astype(bool)
-        if not np.any(marker_mask):
+        marker_mask = self.jit.is_marker
+        if not marker_mask.any():
             return
 
         # Save and dim marker colors, force alpha blending
-        saved_pbr_mat = self.jit.pbr_mat[marker_mask].copy()
-        saved_blend_flags = self.jit.render_flags[marker_mask, 0].copy()
-        self.jit.pbr_mat[marker_mask, 0:3] *= MARKER_XRAY_DIM_FACTOR
-        self.jit.pbr_mat[marker_mask, 3] = MARKER_XRAY_ALPHA
-        self.jit.render_flags[marker_mask, 0] = 1
+        saved_base_color_factor = self.jit.base_color_factor[marker_mask].copy()
+        saved_is_blended = self.jit.is_blended[marker_mask].copy()
+        self.jit.base_color_factor[marker_mask, :3] *= MARKER_XRAY_DIM_FACTOR
+        self.jit.base_color_factor[marker_mask, 3] = MARKER_XRAY_ALPHA
+        self.jit.is_blended[marker_mask] = True
 
         # Draw only occluded fragments, without touching the depth buffer.
         glDepthFunc(GL_GREATER)
         glDepthMask(GL_FALSE)
 
-        xray_flags = flags & ~(RenderFlags.SHADOWS_DIRECTIONAL | RenderFlags.SHADOWS_SPOT | RenderFlags.SHADOWS_POINT)
+        xray_flags = flags & ~RenderFlags.SHADOWS_ALL
         self.jit.forward_pass(
             self, V, P, cam_pos, xray_flags, ProgramFlags.USE_MATERIAL, screen_size, env_idx=env_idx, markers_only=True
         )
@@ -477,211 +580,185 @@ class Renderer(object):
         # Restore GL state and marker data
         glDepthFunc(GL_LESS)
         glDepthMask(GL_TRUE)
-        self.jit.pbr_mat[marker_mask] = saved_pbr_mat
-        self.jit.render_flags[marker_mask, 0] = saved_blend_flags
+        self.jit.base_color_factor[marker_mask] = saved_base_color_factor
+        self.jit.is_blended[marker_mask] = saved_is_blended
 
-    def _point_shadow_mapping_pass(self, scene, light_node, flags, env_idx=-1):
+    def _shadow_mapping_pass(self, light_node, flags, env_idx=-1):
         light = light_node.light
-        position = scene.get_pose(light_node)[:3, 3]
-        camera = light._get_shadow_camera(scene.scale)
-        projection = camera.get_projection_matrix()
-        view = light._get_view_matrices(position)
-        light_matrix = projection @ view
+        if self._shadow_fb is None:
+            self._shadow_fb = glGenFramebuffers(1)
+        glBindFramebuffer(GL_FRAMEBUFFER, self._shadow_fb)
+        light.shadow_texture._bind_as_depth_attachment()
+        glDrawBuffer(GL_NONE)
+        glReadBuffer(GL_NONE)
+        glClear(GL_DEPTH_BUFFER_BIT)
+        glViewport(0, 0, light.shadow_texture.width, light.shadow_texture.height)
+        glEnable(GL_DEPTH_TEST)
+        glDepthMask(GL_TRUE)
+        glDepthFunc(GL_LESS)
+        glDepthRange(0.0, 1.0)
+        glDisable(GL_CULL_FACE)
+        glDisable(GL_BLEND)
+        self.jit.shadow_mapping_pass(self, light_node, flags, env_idx=env_idx)
 
-        self._configure_point_shadow_mapping_viewport(light, flags)
+        # Render what transparent surfaces let through of the light into its transmittance map (see mesh_depth.frag)
+        if self._transmittance_fb is None:
+            self._transmittance_fb = glGenFramebuffers(1)
+        glBindFramebuffer(GL_FRAMEBUFFER, self._transmittance_fb)
+        light.transmittance_texture._bind_as_color_attachment()
+        glDrawBuffer(GL_COLOR_ATTACHMENT0)
+        glViewport(0, 0, light.transmittance_texture.width, light.transmittance_texture.height)
+        # White lets the light through untinted, behind a transparent surface at the far end of the depth range
+        glClearColor(1.0, 1.0, 1.0, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT)
+        if not self.jit.is_transparent.any():
+            return
 
-        self.jit.point_shadow_mapping_pass(
-            self, light_matrix, position, flags, ProgramFlags.POINT_SHADOW, env_idx=env_idx
-        )
-
-    def _shadow_mapping_pass(self, scene, light_node, flags, env_idx=-1):
-        light = light_node.light
-
-        # Set up viewport for render
-        self._configure_shadow_mapping_viewport(light, flags)
-
-        # Set up camera matrices
-        V, P = self._get_light_cam_matrices(scene, light_node, flags)
-
-        self.jit.shadow_mapping_pass(self, V, P, flags, ProgramFlags.NONE, env_idx=env_idx)
+        # The colors multiply over the transparent surfaces that a ray of the light crosses, whatever their order, and
+        # the alpha keeps the depth of the nearest one
+        glDisable(GL_DEPTH_TEST)
+        glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_ONE, GL_ONE)
+        glBlendEquationSeparate(GL_FUNC_ADD, GL_MIN)
+        self.jit.shadow_mapping_pass(self, light_node, flags, env_idx=env_idx, is_transmittance=True)
+        glBlendEquation(GL_FUNC_ADD)
+        glDisable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
 
     def _normal_pass(self, scene, flags, env_idx=-1):
-        # Set up viewport for render
         self._configure_forward_pass_viewport(flags)
-        program = None
-
-        # Set up camera matrices
         V, P = self._get_camera_matrices(scene, env_idx)
+        cam_pos = self._get_camera_pose(scene, env_idx)[:3, 3]
+        screen_size = np.array([self.viewport_width, self.viewport_height], np.float32)
+        program_flags = ProgramFlags.NONE
+        if flags & RenderFlags.VERTEX_NORMALS:
+            program_flags |= ProgramFlags.VERTEX_NORMALS
+        if flags & RenderFlags.FACE_NORMALS:
+            program_flags |= ProgramFlags.FACE_NORMALS
+        self.jit.forward_pass(self, V, P, cam_pos, flags, program_flags, screen_size, env_idx=env_idx)
 
-        # Now, render each object in sorted order
-        for node in scene.sorted_mesh_nodes(env_idx):
-            mesh = node.mesh
+    def _fisheye_pass(self, scene, flags, seg_node_map, env_idx=-1):
+        """Draw the image of a fisheye camera, resampled from a cube map of what it sees all around it.
 
-            # Skip the mesh if it's not visible
-            if not mesh.is_visible:
-                continue
-
-            for primitive in mesh.primitives:
-                # Skip objects that don't have normals
-                if not primitive.buf_flags & BufFlags.NORMAL:
-                    continue
-
-                # First, get and bind the appropriate program
-                pf = ProgramFlags.NONE
-                if flags & RenderFlags.VERTEX_NORMALS:
-                    pf = pf | ProgramFlags.VERTEX_NORMALS
-                if flags & RenderFlags.FACE_NORMALS:
-                    pf = pf | ProgramFlags.FACE_NORMALS
-                program = self._get_primitive_program(primitive, flags, pf)
-                program._bind()
-
-                # Set the camera uniforms
-                program.set_uniform("V", V)
-                program.set_uniform("P", P)
-                program.set_uniform("env_offset_scale", 0.0 if is_env_pass(flags) else 1.0)
-                program.set_uniform("normal_magnitude", 0.05 * primitive.scale)
-                program.set_uniform("normal_color", np.array((0.1, 0.1, 1.0, 1.0)))
-
-                # Finally, bind and draw the primitive
-                self._bind_and_draw_primitive(
-                    primitive=primitive,
-                    pose=scene.get_pose(node),
-                    program=program,
-                    flags=RenderFlags.DEPTH_ONLY,
-                    env_idx=env_idx,
-                )
-                self._reset_active_textures()
-
-        # Unbind the shader and flush the output
-        if program is not None:
-            program._unbind()
-        glFlush()
-
-    ###########################################################################
-    # Handlers for binding uniforms and drawing primitives
-    ###########################################################################
-
-    def _bind_and_draw_primitive(self, primitive, pose, program, flags, env_idx):
-        # Set model pose matrix
-        program.set_uniform("M", pose)
-
-        # Bind mesh buffers
-        primitive._bind()
-
-        # Bind mesh material
-        if not (flags & RenderFlags.DEPTH_ONLY or flags & RenderFlags.SEG):
-            material = primitive.material
-
-            # Bind textures
-            tf = material.tex_flags
-            if tf & TexFlags.NORMAL:
-                self._bind_texture(material.normalTexture, "material.normal_texture", program)
-            if tf & TexFlags.OCCLUSION:
-                self._bind_texture(material.occlusionTexture, "material.occlusion_texture", program)
-            if tf & TexFlags.EMISSIVE:
-                self._bind_texture(material.emissiveTexture, "material.emissive_texture", program)
-            if tf & TexFlags.BASE_COLOR:
-                self._bind_texture(material.baseColorTexture, "material.base_color_texture", program)
-            if tf & TexFlags.METALLIC_ROUGHNESS:
-                self._bind_texture(material.metallicRoughnessTexture, "material.metallic_roughness_texture", program)
-            if tf & TexFlags.DIFFUSE:
-                self._bind_texture(material.diffuseTexture, "material.diffuse_texture", program)
-            if tf & TexFlags.SPECULAR_GLOSSINESS:
-                self._bind_texture(material.specularGlossinessTexture, "material.specular_glossiness_texture", program)
-
-            # Bind other uniforms
-            b = "material.{}"
-            program.set_uniform(b.format("emissive_factor"), material.emissiveFactor)
-            if isinstance(material, MetallicRoughnessMaterial):
-                program.set_uniform(b.format("base_color_factor"), material.baseColorFactor)
-                program.set_uniform(b.format("metallic_factor"), material.metallicFactor)
-                program.set_uniform(b.format("roughness_factor"), material.roughnessFactor)
-            elif isinstance(material, SpecularGlossinessMaterial):
-                program.set_uniform(b.format("diffuse_factor"), material.diffuseFactor)
-                program.set_uniform(b.format("specular_factor"), material.specularFactor)
-                program.set_uniform(b.format("glossiness_factor"), material.glossinessFactor)
-
-            # Set blending options
-            if material.alphaMode == "BLEND":
-                glEnable(GL_BLEND)
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-            else:
-                glDisable(GL_BLEND)
-
-            # Set wireframe mode
-            wf = material.wireframe
-            if flags & RenderFlags.FLIP_WIREFRAME:
-                wf = not wf
-            if wf or flags & RenderFlags.ALL_WIREFRAME:
-                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
-            else:
-                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-
-            # Set culling mode
-            if material.doubleSided or flags & RenderFlags.SKIP_CULL_FACES:
-                glDisable(GL_CULL_FACE)
-            else:
-                glEnable(GL_CULL_FACE)
-                glCullFace(GL_BACK)
-        else:
-            glEnable(GL_CULL_FACE)
-            glCullFace(GL_BACK)
-            glDisable(GL_BLEND)
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-
-        # Set point size if needed
-        glDisable(GL_PROGRAM_POINT_SIZE)
-        if primitive.mode == GLTF.POINTS:
-            glEnable(GL_PROGRAM_POINT_SIZE)
-            glPointSize(self.point_size)
-
-        # Render mesh
-        n_instances = 1
-        if primitive.poses is not None:
-            n_instances = len(primitive.poses)
-
-        if not primitive.is_env_instanced or env_idx == -1:
-            if primitive.indices is not None:
-                glDrawElementsInstanced(
-                    primitive.mode, primitive.indices.size, GL_UNSIGNED_INT, ctypes.c_void_p(0), n_instances
-                )
-            else:
-                glDrawArraysInstanced(primitive.mode, 0, len(primitive.positions), n_instances)
-        else:
-            if primitive.indices is not None:
-                glDrawElementsInstancedBaseInstance(
-                    primitive.mode, primitive.indices.size, GL_UNSIGNED_INT, ctypes.c_void_p(0), 1, env_idx
-                )
-            else:
-                glDrawArraysInstancedBaseInstance(primitive.mode, 0, len(primitive.positions), 1, env_idx)
-
-        # Unbind mesh buffers
-        primitive._unbind()
-
-    ###########################################################################
-    # Context Management
-    ###########################################################################
-
-    ###########################################################################
-    # Texture Management
-    ###########################################################################
-
-    def _bind_texture(self, texture, uniform_name, program):
-        """Bind a texture to an active texture unit and return
-        the texture unit index that was used.
+        The faces of the cube map are rendered as square perspective images a right angle wide, each pass of a pinhole
+        camera running for them. Only the faces that the image reaches are rendered.
         """
-        tex_id = self._get_next_active_texture()
-        glActiveTexture(GL_TEXTURE0 + tex_id)
-        texture._bind()
-        program.set_uniform(uniform_name, tex_id)
+        camera = scene.main_camera_node.camera
+        # The intrinsics count the pixels of the viewport, which the display scale multiplies
+        intrinsics = self.dpscale * np.array(camera.intrinsics)
+        # The layout follows the camera, whose lens is fixed, and the viewport, whose setters reset it
+        if self._fisheye_layout is None or self._fisheye_layout.camera is not camera:
+            # The faces that the rays of the pixels reach, along the axes of the frame of the camera. A face gives the
+            # centre of the image as many texels per radian as the image has pixels, its texels growing denser away
+            # from its centre where the lens spreads the image more.
+            v, u = np.meshgrid(
+                np.arange(self.viewport_height) + 0.5, np.arange(self.viewport_width) + 0.5, indexing="ij"
+            )
+            rays, rays_angle = gu.fisheye_pixels_to_rays(np.stack((u, v), axis=-1), intrinsics, camera.distortion)
+            rays = rays[np.isfinite(rays_angle)] * np.array((1.0, -1.0, -1.0))
+            rays_axis = np.argmax(np.abs(rays), axis=-1)
+            rays_face = 2 * rays_axis + (np.take_along_axis(rays, rays_axis[:, None], axis=-1)[:, 0] < 0.0)
+            is_face_drawn = np.zeros(6, dtype=np.bool_)
+            is_face_drawn[rays_face] = True
+            max_face_size = min(glGetIntegerv(GL_MAX_CUBE_MAP_TEXTURE_SIZE), glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE))
+            face_size = self.dpscale * int(np.ceil(2.0 * intrinsics[:2].max() / self.dpscale))
+            face_size = min(face_size, max_face_size - max_face_size % self.dpscale)
+            if self._fisheye_color_cube is None or self._fisheye_color_cube.width != face_size:
+                self._delete_fisheye_textures()
+                # The programs of the passes are those of this renderer, which the compiled passes record (see
+                # 'JITRenderer.load_programs') and which outlive the face renderer
+                self._face_renderer = Renderer(face_size // self.dpscale, face_size // self.dpscale, self.jit)
+                self._face_renderer._program_cache = self._program_cache
+                self._fisheye_color_cube = CubeMapTexture(
+                    face_size,
+                    TexChannels.RGBA,
+                    GL_UNSIGNED_BYTE,
+                    Sampler(mag_filter=GL_LINEAR, min_filter=GL_LINEAR_MIPMAP_LINEAR),
+                )
+                self._fisheye_depth_cube = CubeMapTexture(
+                    face_size, TexChannels.DEPTH, GL_UNSIGNED_INT, Sampler(mag_filter=GL_NEAREST, min_filter=GL_NEAREST)
+                )
+                for cube in (self._fisheye_color_cube, self._fisheye_depth_cube):
+                    cube._add_to_context()
+            angle_range = gu.fisheye_angle_range(camera.distortion)
+            self._fisheye_layout = _FisheyeLayout(camera, is_face_drawn, face_size, angle_range)
+        if self._fisheye_fb is None:
+            self._fisheye_fb = glGenFramebuffers(1)
+            self._fisheye_vao = glGenVertexArrays(1)
 
-    def _get_next_active_texture(self):
-        val = self._texture_alloc_idx
-        self._texture_alloc_idx += 1
-        return val
+        # Each face is drawn by a pass of a pinhole camera, then copied into the cube map along with its depth. A face
+        # that the image never reaches holds the background.
+        face_renderer = self._face_renderer
+        face_size = self._fisheye_layout.face_size
+        clear_color = (0.0, 0.0, 0.0, 1.0) if flags & RenderFlags.SEG else scene.bg_color
+        for i_face, is_face_drawn in enumerate(self._fisheye_layout.is_face_drawn):
+            if is_face_drawn:
+                face_renderer._face_rot = CUBE_MAP_FACES_ROT[i_face]
+                if flags & RenderFlags.REFLECTIVE_FLOOR:
+                    face_renderer._floor_pass(scene, flags, env_idx=env_idx)
+                face_flags = flags | RenderFlags.OFFSCREEN | RenderFlags.RET_DEPTH
+                face_renderer._forward_pass(scene, face_flags, seg_node_map=seg_node_map, env_idx=env_idx)
+                face_renderer._resolve_main_framebuffer(face_flags)
+            glBindFramebuffer(GL_FRAMEBUFFER, self._fisheye_fb)
+            self._fisheye_color_cube._bind_as_color_attachment(i_face)
+            self._fisheye_depth_cube._bind_as_depth_attachment(i_face)
+            if is_face_drawn:
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, face_renderer._main_fb)
+                glBlitFramebuffer(
+                    0,
+                    0,
+                    face_size,
+                    face_size,
+                    0,
+                    0,
+                    face_size,
+                    face_size,
+                    GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT,
+                    GL_NEAREST,
+                )
+            else:
+                glClearColor(*clear_color)
+                glDepthMask(GL_TRUE)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-    def _reset_active_textures(self):
-        self._texture_alloc_idx = 0
+        # A color image is filtered over the texels that a pixel covers, while the segmentation and the normals keep the
+        # value of a single texel
+        glBindTexture(GL_TEXTURE_CUBE_MAP, self._fisheye_color_cube._texid)
+        if flags & (RenderFlags.SEG | RenderFlags.DEPTH_ONLY | RenderFlags.NORMAL):
+            min_filter = mag_filter = GL_NEAREST
+        else:
+            glGenerateMipmap(GL_TEXTURE_CUBE_MAP)
+            min_filter, mag_filter = GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, min_filter)
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, mag_filter)
+
+        self._configure_forward_pass_viewport(flags)
+        glClearColor(*clear_color)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glDisable(GL_BLEND)
+        glDisable(GL_CULL_FACE)
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+        # The filtering reads across the edges of the faces, which a cube map without seams joins
+        glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS)
+        program = self._program_cache.get_program(vertex_shader="fisheye.vert", fragment_shader="fisheye.frag")
+        if not program._in_context():
+            program._add_to_context()
+        program._bind()
+        for i_unit, cube in enumerate((self._fisheye_color_cube, self._fisheye_depth_cube)):
+            glActiveTexture(GL_TEXTURE0 + i_unit)
+            glBindTexture(GL_TEXTURE_CUBE_MAP, cube._texid)
+        program.set_uniform("color_cube", 0)
+        program.set_uniform("depth_cube", 1)
+        program.set_uniform("intrinsics", intrinsics)
+        program.set_uniform("distortion", camera.distortion)
+        depth_range = (camera.znear, camera.zfar, camera.face_zfar, self.viewport_height)
+        program.set_uniform("depth_range", depth_range)
+        program.set_uniform("face_size", face_size)
+        program.set_uniform("angle_range", (*self._fisheye_layout.angle_range, 0.0, 0.0))
+        glBindVertexArray(self._fisheye_vao)
+        glDrawArrays(GL_TRIANGLES, 0, 3)
+        glBindVertexArray(0)
+        glActiveTexture(GL_TEXTURE0)
+        program._unbind()
 
     ###########################################################################
     # Camera Matrix Management
@@ -689,35 +766,23 @@ class Renderer(object):
 
     def _get_camera_matrices(self, scene, env_idx):
         main_camera_node = scene.main_camera_node
-        if main_camera_node is None:
-            raise ValueError("Cannot render scene without a camera")
+        assert main_camera_node is not None
         P = main_camera_node.camera.get_projection_matrix(width=self.viewport_width, height=self.viewport_height)
         pose = self._get_camera_pose(scene, env_idx)
-        V = np.linalg.inv(pose)  # V maps from world to camera
+        # The view matrix maps the world frame to the camera frame, then to that of a face of the cube map of a fisheye
+        # camera when one is drawn (see '_fisheye_pass')
+        V = np.linalg.inv(pose)
+        if self._face_rot is not None:
+            V[:3] = self._face_rot @ V[:3]
         return V, P
 
     def _get_camera_pose(self, scene, env_idx):
-        cam_pos = scene.get_pose(scene.main_camera_node)
-        if len(cam_pos.shape) == 3:
-            if cam_pos.shape[0] != 1:
-                assert env_idx != -1, "We have a multiple camera pose scene, we should be rendering per env"
-                cam_pos = cam_pos[env_idx]
-            else:
-                cam_pos = cam_pos[0]
-        return cam_pos
-
-    def _get_light_cam_matrices(self, scene, light_node, flags):
-        light = light_node.light
-        pose = scene.get_pose(light_node)
-        camera = light._get_shadow_camera(scene.scale)
-        P = camera.get_projection_matrix()
-        if isinstance(light, DirectionalLight):
-            direction = -pose[:3, 2]
-            c = scene.centroid
-            loc = c - direction * scene.scale
-            pose[:3, 3] = loc
-        V = np.linalg.inv(pose)  # V maps from world to camera
-        return V, P
+        cam_pose = scene.get_pose(scene.main_camera_node)
+        if cam_pose.ndim == 3:
+            # A camera posed in each environment renders them one at a time
+            assert len(cam_pose) == 1 or env_idx != -1
+            cam_pose = cam_pose[env_idx if len(cam_pose) > 1 else 0]
+        return cam_pose
 
     ###########################################################################
     # Shader Program Management
@@ -731,26 +796,6 @@ class Renderer(object):
 
         return program
 
-    def _compute_max_n_lights(self, flags):
-        max_n_lights = [MAX_N_LIGHTS, MAX_N_LIGHTS, MAX_N_LIGHTS]
-        # n_tex_units = glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS)
-
-        # Reserved texture units: 6
-        #   Normal Map
-        #   Occlusion Map
-        #   Emissive Map
-        #   Base Color or Diffuse Map
-        #   MR or SG Map
-        #   Environment cubemap
-
-        # n_reserved_textures = 6
-        # n_available_textures = n_tex_units - n_reserved_textures
-
-        # if flags & RenderFlags.SHADOWS_DIRECTIONAL and n_available_textures < max_n_lights[0]:
-        #     max_n_lights[0] = n_available_textures
-
-        return max_n_lights
-
     def _get_primitive_program(self, primitive, flags, program_flags):
         vertex_shader = None
         fragment_shader = None
@@ -759,30 +804,39 @@ class Renderer(object):
 
         if program_flags & ProgramFlags.POINT_SHADOW:
             vertex_shader = "point_shadow.vert"
-            fragment_shader = "point_shadow.frag"
+            fragment_shader = "mesh_depth.frag"
             geometry_shader = "point_shadow.geom"
+            defines["POINT_SHADOW"] = 1
         elif (
             program_flags & ProgramFlags.USE_MATERIAL
             and not flags & RenderFlags.DEPTH_ONLY
-            and not flags & RenderFlags.FLAT
+            and not flags & RenderFlags.NORMAL
             and not flags & RenderFlags.SEG
         ):
             vertex_shader = "mesh.vert"
             fragment_shader = "mesh.frag"
+            # The floor alone samples the mirror image of the scene (see REFLECTIVE_FLOOR in mesh.frag)
+            if flags & RenderFlags.REFLECTIVE_FLOOR and primitive.is_floor:
+                defines["REFLECTIVE_FLOOR"] = 1
             if primitive.double_sided:
                 geometry_shader = "mesh_double_sided.geom"
                 defines["DOUBLE_SIDED"] = 1
-        elif program_flags & (ProgramFlags.VERTEX_NORMALS | ProgramFlags.FACE_NORMALS):
+        # A primitive without normals is left out of the pass drawing them, and takes the program of a depth pass
+        elif (
+            program_flags & (ProgramFlags.VERTEX_NORMALS | ProgramFlags.FACE_NORMALS)
+            and primitive.buf_flags & BufFlags.NORMAL
+        ):
             vertex_shader = "vertex_normals.vert"
-            if primitive.mode == GLTF.POINTS:
+            if primitive.mode == GL_POINTS:
                 geometry_shader = "vertex_normals_pc.geom"
             else:
                 geometry_shader = "vertex_normals.geom"
             fragment_shader = "vertex_normals.frag"
-        elif flags & RenderFlags.FLAT:
-            vertex_shader = "flat.vert"
-            fragment_shader = "flat.frag"
+        elif flags & RenderFlags.NORMAL:
+            vertex_shader = "mesh_normal.vert"
+            fragment_shader = "mesh_normal.frag"
             if primitive.double_sided:
+                geometry_shader = "mesh_normal_double_sided.geom"
                 defines["DOUBLE_SIDED"] = 1
         elif flags & RenderFlags.SEG:
             vertex_shader = "segmentation.vert"
@@ -793,6 +847,26 @@ class Renderer(object):
         else:
             vertex_shader = "mesh_depth.vert"
             fragment_shader = "mesh_depth.frag"
+            if program_flags & ProgramFlags.SHADOW:
+                defines["SHADOW"] = 1
+
+        # A transparent surface casts a shadow as dark as it is opaque, for every kind of light (see mesh_depth.frag).
+        # The layer that a texture array shows may change after the program is built, so a texture array always
+        # samples its alpha.
+        material = primitive.material
+        base_color_defines = {}
+        if material.tex_flags & TexFlags.BASE_COLOR:
+            base_color_defines["HAS_BASE_COLOR_TEX"] = 1
+            if material.base_color_texture.tex_type == GL_TEXTURE_2D_ARRAY:
+                base_color_defines["BASE_COLOR_TEX_ARRAY"] = 1
+                if material.base_color_texture.data_format == GL_HALF_FLOAT:
+                    base_color_defines["BASE_COLOR_TEX_LINEAR"] = 1
+        if program_flags & (ProgramFlags.SHADOW | ProgramFlags.POINT_SHADOW):
+            if primitive.is_transparent or "BASE_COLOR_TEX_ARRAY" in base_color_defines:
+                defines["TRANSPARENT_SHADOW"] = 1
+                defines.update(base_color_defines)
+                if program_flags & ProgramFlags.TRANSMITTANCE:
+                    defines["TRANSMITTANCE"] = 1
 
         # Set up vertex buffer DEFINES
         bf = primitive.buf_flags
@@ -800,23 +874,11 @@ class Renderer(object):
         if bf & BufFlags.NORMAL:
             defines["NORMAL_LOC"] = buf_idx
             buf_idx += 1
-        if bf & BufFlags.TANGENT:
-            defines["TANGENT_LOC"] = buf_idx
-            buf_idx += 1
         if bf & BufFlags.TEXCOORD_0:
             defines["TEXCOORD_0_LOC"] = buf_idx
             buf_idx += 1
-        if bf & BufFlags.TEXCOORD_1:
-            defines["TEXCOORD_1_LOC"] = buf_idx
-            buf_idx += 1
         if bf & BufFlags.COLOR_0:
             defines["COLOR_0_LOC"] = buf_idx
-            buf_idx += 1
-        if bf & BufFlags.JOINTS_0:
-            defines["JOINTS_0_LOC"] = buf_idx
-            buf_idx += 1
-        if bf & BufFlags.WEIGHTS_0:
-            defines["WEIGHTS_0_LOC"] = buf_idx
             buf_idx += 1
         defines["INST_M_LOC"] = buf_idx
         defines["INST_ENV_OFFSET_LOC"] = buf_idx + 4
@@ -830,10 +892,14 @@ class Renderer(object):
             defines["SPOT_LIGHT_SHADOWS"] = 1
         if flags & RenderFlags.SHADOWS_POINT:
             defines["POINT_LIGHT_SHADOWS"] = 1
-        max_n_lights = self._compute_max_n_lights(flags)
-        defines["MAX_DIRECTIONAL_LIGHTS"] = max_n_lights[0]
-        defines["MAX_SPOT_LIGHTS"] = max_n_lights[1]
-        defines["MAX_POINT_LIGHTS"] = max_n_lights[2]
+        # The light arrays hold the lights of the scene, with one slot at least, so that the samplers of their shadow
+        # and transmittance maps fit in the texture units of every driver along with those of the material
+        for name, light_type in (
+            ("MAX_DIRECTIONAL_LIGHTS", LightType.DIRECTIONAL),
+            ("MAX_POINT_LIGHTS", LightType.POINT),
+            ("MAX_SPOT_LIGHTS", LightType.SPOT),
+        ):
+            defines[name] = max(np.count_nonzero(self.jit.lights_type == light_type), 1)
 
         # Set up vertex normal defines
         if program_flags & ProgramFlags.VERTEX_NORMALS:
@@ -846,28 +912,15 @@ class Renderer(object):
             tf = primitive.material.tex_flags
             if tf & TexFlags.NORMAL:
                 defines["HAS_NORMAL_TEX"] = 1
-            if tf & TexFlags.OCCLUSION:
-                defines["HAS_OCCLUSION_TEX"] = 1
             if tf & TexFlags.EMISSIVE:
                 defines["HAS_EMISSIVE_TEX"] = 1
-                if primitive.material.emissiveTexture.tex_type == GL_TEXTURE_2D_ARRAY:
+                if primitive.material.emissive_texture.tex_type == GL_TEXTURE_2D_ARRAY:
                     defines["EMISSIVE_TEX_ARRAY"] = 1
-            if tf & TexFlags.BASE_COLOR:
-                defines["HAS_BASE_COLOR_TEX"] = 1
-                if primitive.material.baseColorTexture.tex_type == GL_TEXTURE_2D_ARRAY:
-                    defines["BASE_COLOR_TEX_ARRAY"] = 1
-                    if primitive.material.baseColorTexture.data_format == GL_HALF_FLOAT:
-                        defines["BASE_COLOR_TEX_LINEAR"] = 1
+            defines.update(base_color_defines)
             if tf & TexFlags.METALLIC_ROUGHNESS:
                 defines["HAS_METALLIC_ROUGHNESS_TEX"] = 1
-            if tf & TexFlags.DIFFUSE:
-                defines["HAS_DIFFUSE_TEX"] = 1
-            if tf & TexFlags.SPECULAR_GLOSSINESS:
-                defines["HAS_SPECULAR_GLOSSINESS_TEX"] = 1
-            if isinstance(primitive.material, MetallicRoughnessMaterial):
-                defines["USE_METALLIC_MATERIAL"] = 1
-            elif isinstance(primitive.material, SpecularGlossinessMaterial):
-                defines["USE_GLOSSY_MATERIAL"] = 1
+            if tf & TexFlags.OCCLUSION:
+                defines["HAS_OCCLUSION_TEX"] = 1
 
         program = self._program_cache.get_program(
             vertex_shader=vertex_shader,
@@ -902,47 +955,6 @@ class Renderer(object):
         glDepthFunc(GL_LESS)
         glDepthRange(0.0, 1.0)
 
-    def _configure_floor_pass_viewport(self, flags):
-        self._configure_floor_framebuffer()
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self._floor_fb)
-
-        glViewport(0, 0, self.viewport_width, self.viewport_height)
-        glEnable(GL_DEPTH_TEST)
-        glDepthMask(GL_TRUE)
-        glDepthFunc(GL_LESS)
-        glDepthRange(0.0, 1.0)
-
-    def _configure_point_shadow_mapping_viewport(self, light, flags):
-        self._configure_shadow_framebuffer()
-        glBindFramebuffer(GL_FRAMEBUFFER, self._shadow_fb)
-        light.shadow_texture._bind_as_depth_attachment()
-        glDrawBuffer(GL_NONE)
-        glReadBuffer(GL_NONE)
-
-        glClear(GL_DEPTH_BUFFER_BIT)
-        glViewport(0, 0, light.shadow_texture.width, light.shadow_texture.height)
-        glEnable(GL_DEPTH_TEST)
-        glDepthMask(GL_TRUE)
-        glDepthFunc(GL_LESS)
-        glDisable(GL_CULL_FACE)
-        glDisable(GL_BLEND)
-
-    def _configure_shadow_mapping_viewport(self, light, flags):
-        self._configure_shadow_framebuffer()
-        glBindFramebuffer(GL_FRAMEBUFFER, self._shadow_fb)
-        light.shadow_texture._bind_as_depth_attachment()
-        glDrawBuffer(GL_NONE)
-        glReadBuffer(GL_NONE)
-
-        glClear(GL_DEPTH_BUFFER_BIT)
-        glViewport(0, 0, light.shadow_texture.width, light.shadow_texture.height)
-        glEnable(GL_DEPTH_TEST)
-        glDepthMask(GL_TRUE)
-        glDepthFunc(GL_LESS)
-        glDepthRange(0.0, 1.0)
-        glDisable(GL_CULL_FACE)
-        glDisable(GL_BLEND)
-
     ###########################################################################
     # Framebuffer Management
     ###########################################################################
@@ -950,12 +962,26 @@ class Renderer(object):
     def _configure_floor_framebuffer(self):
         if self._floor_texture_depth is None:
             self._floor_texture_depth = Texture(
-                width=self.viewport_width, height=self.viewport_height, source_channels="D", data_format=GL_FLOAT
+                width=self.viewport_width,
+                height=self.viewport_height,
+                source_channels=TexChannels.DEPTH,
+                data_format=GL_FLOAT,
             )
             self._floor_texture_depth._add_to_context()
         if self._floor_texture_color is None:
+            # The mirror image holds sRGB values within [0, 1], which 8 bits per channel store. A floating-point texture
+            # takes no filtering of its levels on some renderers, which would leave the floor without its reflection.
             self._floor_texture_color = Texture(
-                width=self.viewport_width, height=self.viewport_height, source_channels="RGB", data_format=GL_FLOAT
+                width=self.viewport_width,
+                height=self.viewport_height,
+                source_channels=TexChannels.RGBA,
+                data_format=GL_UNSIGNED_BYTE,
+                sampler=Sampler(
+                    mag_filter=GL_LINEAR,
+                    min_filter=GL_LINEAR_MIPMAP_LINEAR,
+                    wrap_s=GL_CLAMP_TO_EDGE,
+                    wrap_t=GL_CLAMP_TO_EDGE,
+                ),
             )
             self._floor_texture_color._add_to_context()
         if self._floor_fb is None:
@@ -977,22 +1003,29 @@ class Renderer(object):
             self._floor_texture_depth.delete()
             self._floor_texture_depth = None
 
-    def _configure_shadow_framebuffer(self):
-        if self._shadow_fb is None:
-            self._shadow_fb = glGenFramebuffers(1)
+    def _delete_fisheye_textures(self):
+        if self._face_renderer is not None:
+            self._face_renderer._delete_main_framebuffer()
+            self._face_renderer._delete_floor_framebuffer()
+            self._face_renderer = None
+        for cube in (self._fisheye_color_cube, self._fisheye_depth_cube):
+            if cube is not None:
+                cube.delete()
+        self._fisheye_color_cube = None
+        self._fisheye_depth_cube = None
+        self._fisheye_layout = None
 
     def _delete_shadow_framebuffer(self):
         if self._shadow_fb is not None:
             glDeleteFramebuffers(1, [self._shadow_fb])
             self._shadow_fb = None
+        if self._transmittance_fb is not None:
+            glDeleteFramebuffers(1, [self._transmittance_fb])
+            self._transmittance_fb = None
 
     def _configure_main_framebuffer(self):
         # If mismatch with prior framebuffer, delete it
-        if (
-            self._main_fb is not None
-            and self.viewport_width != self._main_fb_dims[0]
-            or self.viewport_height != self._main_fb_dims[1]
-        ):
+        if self._main_fb is not None and self._main_fb_dims != (self.viewport_width, self.viewport_height):
             self._delete_main_framebuffer()
 
         # If framebuffer doesn't exist, create it
@@ -1047,16 +1080,19 @@ class Renderer(object):
         self._main_db_ms = None
         self._main_fb_dims = (None, None)
 
-    def _read_main_framebuffer(self, scene, flags):
-        width, height = self._main_fb_dims
-
+    def _resolve_main_framebuffer(self, flags):
+        """Resolve the multisampled image of a color pass into the main framebuffer, with its depth if the flags ask."""
         if not (flags & RenderFlags.SEG or flags & RenderFlags.DEPTH_ONLY):
-            # Bind framebuffer and blit buffers
+            width, height = self._main_fb_dims
             glBindFramebuffer(GL_READ_FRAMEBUFFER, self._main_fb_ms)
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self._main_fb)
             glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_LINEAR)
             if flags & RenderFlags.RET_DEPTH:
                 glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_DEPTH_BUFFER_BIT, GL_NEAREST)
+
+    def _read_main_framebuffer(self, scene, flags):
+        width, height = self._main_fb_dims
+        self._resolve_main_framebuffer(flags)
         glBindFramebuffer(GL_READ_FRAMEBUFFER, self._main_fb)
 
         # Read depth if requested
@@ -1074,7 +1110,7 @@ class Renderer(object):
             return (depth_im,)
 
         # Read color
-        color_im = self.jit.read_color_buf(width, height, flags & RenderFlags.RGBA)
+        color_im = self.jit.read_color_buf(width, height)
 
         # Resize
         color_im = self._resize_image(color_im, antialias=not flags & RenderFlags.SEG)
@@ -1084,17 +1120,15 @@ class Renderer(object):
         return (color_im,)
 
     def _resize_image(self, value, antialias):
-        """Rescale the generated image if necessary."""
         if self.dpscale == 1:
             return value
 
-        img = PIL.Image.fromarray(value)
+        img = Image.fromarray(value)
         size = (self.viewport_width // self.dpscale, self.viewport_height // self.dpscale)
-        resample = PIL.Image.BILINEAR if antialias else PIL.Image.NEAREST
+        resample = Image.BILINEAR if antialias else Image.NEAREST
         img = img.resize(size, resample=resample)
-        return np.array(img, copy=False)
+        return np.asarray(img)
 
     def reload_program(self):
         self._program_cache.clear()
-        self._normal_program_cache.clear()
-        self.jit.program_id.clear()
+        self.jit.programs.clear()

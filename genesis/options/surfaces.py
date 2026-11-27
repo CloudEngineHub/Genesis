@@ -227,6 +227,43 @@ class Surface(Options):
     def requires_uv(self) -> bool:
         return False
 
+    @property
+    def roughness_factor(self) -> float:
+        """Mean roughness of the surface.
+
+        The rasterizer draws the whole surface with this value. It is the mean value of the roughness texture of the
+        surface, or 'default_roughness' for a surface without one.
+        """
+        return self.default_roughness
+
+    @property
+    def base_color_factor(self) -> tuple[float, float, float]:
+        """Color that the rasterizer multiplies the color of the surface by.
+
+        It is the albedo of a metal, which the color of the surface tints as it does for the ray tracer, and white for
+        any other surface.
+        """
+        return (1.0, 1.0, 1.0)
+
+    @property
+    def metallic_factor(self) -> float:
+        """Mean metalness of the surface.
+
+        The rasterizer draws the whole surface with this value. It is the mean value of the metallic texture of the
+        surface, 1.0 for a metal, and 0.0 for any other surface without a metallic texture.
+        """
+        return 0.0
+
+    @property
+    def transmission_factor(self) -> float:
+        """Share of the light that the surface lets through.
+
+        The rasterizer draws a surface letting light through as a clear dielectric tinted by its color, which reflects
+        more light at grazing angles, as its index of refraction gives. It is 1.0 for glass, the specular transmission
+        of a BSDF surface, and 0.0 otherwise.
+        """
+        return 0.0
+
     def get_rgba(self, batch: bool = False) -> BatchTexture | Texture:
         return _make_rgba(_resolve_albedo(self.texture, self.emission), None, batch)
 
@@ -298,6 +335,21 @@ class Surface(Options):
 # loaded from one asset) share a single merged array, and a texture update swaps in a new instance, which releases the
 # entry along with the last instance holding the former content.
 _RGBA_CACHE = OwnedCache()
+
+
+def _get_texture_mean_value(texture: Texture | None, default: float) -> float:
+    # The rasterizer draws the first texture of a batch, as it does for the color (see '_make_rgba')
+    if isinstance(texture, BatchTexture):
+        texture = texture.textures[0]
+    # A texture holding one value per point, such as a roughness map, holds it in its first channel
+    if isinstance(texture, ColorTexture):
+        return texture.color[0]
+    if isinstance(texture, ImageTexture):
+        # The mean color of a single-channel image is a scalar
+        return float(np.atleast_1d(texture.mean_color)[0] * texture.image_color[0])
+    # A surface refuses a dynamic texture for its roughness and metallic maps (see '_check_dynamic_textures')
+    assert texture is None
+    return default
 
 
 def _resolve_albedo(base_texture: Texture | None, emissive_texture: Texture | None) -> Texture | None:
@@ -433,6 +485,10 @@ class Glass(Surface):
         Roughness texture of the surface.
     normal_texture : gs.textures.Texture | None, optional
         Normal texture of the surface.
+    occlusion_texture : gs.textures.ImageTexture | None, optional
+        Ambient occlusion texture of the surface, the share of the ambient light reaching each point, read from its
+        first channel. The rasterizer darkens creases and cavities by it, which its lighting cannot shade otherwise,
+        for one more texture lookup per pixel. The raytracer computes this occlusion itself and ignores the texture.
     emissive_texture : gs.textures.Texture | None, optional
         Emissive texture of the surface.
     """
@@ -450,6 +506,7 @@ class Glass(Surface):
     thickness_texture: Texture | None = None
     roughness_texture: Texture | None = None
     normal_texture: Texture | None = None
+    occlusion_texture: ImageTexture | None = None
     emissive_texture: Texture | None = None
 
     @model_validator(mode="after")
@@ -462,6 +519,14 @@ class Glass(Surface):
         if self.specular_texture is not None and self.transmission_texture is None:
             self.transmission_texture = self.specular_texture
         return self
+
+    @property
+    def roughness_factor(self) -> float:
+        return _get_texture_mean_value(self.roughness_texture, self.default_roughness)
+
+    @property
+    def transmission_factor(self) -> float:
+        return 1.0
 
     @property
     def texture(self) -> Texture | None:
@@ -487,6 +552,7 @@ class Glass(Surface):
                 self.thickness_texture,
                 self.roughness_texture,
                 self.normal_texture,
+                self.occlusion_texture,
                 self.emissive_texture,
             )
         )
@@ -496,6 +562,7 @@ class Glass(Surface):
         *,
         roughness_texture: Texture | None = None,
         normal_texture: Texture | None = None,
+        occlusion_texture: ImageTexture | None = None,
         emissive_texture: Texture | None = None,
         force: bool = False,
         **kwargs,
@@ -505,7 +572,23 @@ class Glass(Surface):
             self.roughness_texture, roughness_texture, ColorTexture(color=(self.default_roughness,)), force
         )
         self.normal_texture = self._update_field(self.normal_texture, normal_texture, None, force)
+        self.occlusion_texture = self._update_field(self.occlusion_texture, occlusion_texture, None, force)
         self.emissive_texture = self._update_field(self.emissive_texture, emissive_texture, None, force)
+
+
+# The sRGB encoding of the albedo of each metal (see 'Metal.base_color_factor'), which approximates its reflectance at
+# normal incidence. The linear values are those of the Nyx renderer plugin (gs-nyx), so that both renderers draw a metal
+# alike.
+_METALS_ALBEDO: dict[MetalType, tuple[float, float, float]] = {
+    "aluminium": (0.962, 0.965, 0.966),
+    "gold": (1.000, 0.893, 0.590),
+    "copper": (0.969, 0.811, 0.750),
+    "brass": (0.959, 0.895, 0.682),
+    "iron": (0.755, 0.744, 0.731),
+    "titanium": (0.695, 0.665, 0.635),
+    "vanadium": (0.757, 0.752, 0.765),
+    "lithium": (0.962, 0.950, 0.910),
+}
 
 
 class Metal(Surface):
@@ -527,6 +610,10 @@ class Metal(Surface):
         Roughness texture of the surface.
     normal_texture : gs.textures.Texture | None, optional
         Normal texture of the surface.
+    occlusion_texture : gs.textures.ImageTexture | None, optional
+        Ambient occlusion texture of the surface, the share of the ambient light reaching each point, read from its
+        first channel. The rasterizer darkens creases and cavities by it, which its lighting cannot shade otherwise,
+        for one more texture lookup per pixel. The raytracer computes this occlusion itself and ignores the texture.
     emissive_texture : gs.textures.Texture | None, optional
         Emissive texture of the surface.
     """
@@ -538,7 +625,20 @@ class Metal(Surface):
     opacity_texture: Texture | None = None
     roughness_texture: Texture | None = None
     normal_texture: Texture | None = None
+    occlusion_texture: ImageTexture | None = None
     emissive_texture: Texture | None = None
+
+    @property
+    def roughness_factor(self) -> float:
+        return _get_texture_mean_value(self.roughness_texture, self.default_roughness)
+
+    @property
+    def metallic_factor(self) -> float:
+        return 1.0
+
+    @property
+    def base_color_factor(self) -> tuple[float, float, float]:
+        return _METALS_ALBEDO[self.metal_type]
 
     @property
     def texture(self) -> Texture | None:
@@ -561,6 +661,7 @@ class Metal(Surface):
                 self.opacity_texture,
                 self.roughness_texture,
                 self.normal_texture,
+                self.occlusion_texture,
                 self.emissive_texture,
             )
         )
@@ -581,6 +682,7 @@ class Metal(Surface):
         opacity_texture: Texture | None = None,
         roughness_texture: Texture | None = None,
         normal_texture: Texture | None = None,
+        occlusion_texture: ImageTexture | None = None,
         emissive_texture: Texture | None = None,
         force: bool = False,
         **kwargs,
@@ -593,6 +695,7 @@ class Metal(Surface):
             self.roughness_texture, roughness_texture, ColorTexture(color=(self.default_roughness,)), force
         )
         self.normal_texture = self._update_field(self.normal_texture, normal_texture, None, force)
+        self.occlusion_texture = self._update_field(self.occlusion_texture, occlusion_texture, None, force)
         self.emissive_texture = self._update_field(self.emissive_texture, emissive_texture, None, force)
 
 
@@ -616,6 +719,10 @@ class Plastic(Surface):
         Roughness texture of the surface.
     normal_texture : gs.textures.Texture | None, optional
         Normal texture of the surface.
+    occlusion_texture : gs.textures.ImageTexture | None, optional
+        Ambient occlusion texture of the surface, the share of the ambient light reaching each point, read from its
+        first channel. The rasterizer darkens creases and cavities by it, which its lighting cannot shade otherwise,
+        for one more texture lookup per pixel. The raytracer computes this occlusion itself and ignores the texture.
     emissive_texture : gs.textures.Texture | None, optional
         Emissive texture of the surface.
     """
@@ -627,7 +734,12 @@ class Plastic(Surface):
     opacity_texture: Texture | None = None
     roughness_texture: Texture | None = None
     normal_texture: Texture | None = None
+    occlusion_texture: ImageTexture | None = None
     emissive_texture: Texture | None = None
+
+    @property
+    def roughness_factor(self) -> float:
+        return _get_texture_mean_value(self.roughness_texture, self.default_roughness)
 
     @property
     def texture(self) -> Texture | None:
@@ -651,6 +763,7 @@ class Plastic(Surface):
                 self.opacity_texture,
                 self.roughness_texture,
                 self.normal_texture,
+                self.occlusion_texture,
                 self.emissive_texture,
             )
         )
@@ -671,6 +784,7 @@ class Plastic(Surface):
         opacity_texture: Texture | None = None,
         roughness_texture: Texture | None = None,
         normal_texture: Texture | None = None,
+        occlusion_texture: ImageTexture | None = None,
         emissive_texture: Texture | None = None,
         force: bool = False,
         **kwargs,
@@ -683,6 +797,7 @@ class Plastic(Surface):
             self.roughness_texture, roughness_texture, ColorTexture(color=(self.default_roughness,)), force
         )
         self.normal_texture = self._update_field(self.normal_texture, normal_texture, None, force)
+        self.occlusion_texture = self._update_field(self.occlusion_texture, occlusion_texture, None, force)
         self.emissive_texture = self._update_field(self.emissive_texture, emissive_texture, None, force)
 
 
@@ -710,6 +825,10 @@ class BSDF(Surface):
         Metallic texture of the surface.
     normal_texture : gs.textures.Texture | None, optional
         Normal texture of the surface.
+    occlusion_texture : gs.textures.ImageTexture | None, optional
+        Ambient occlusion texture of the surface, the share of the ambient light reaching each point, read from its
+        first channel. The rasterizer darkens creases and cavities by it, which its lighting cannot shade otherwise,
+        for one more texture lookup per pixel. The raytracer computes this occlusion itself and ignores the texture.
     emissive_texture : gs.textures.Texture | None, optional
         Emissive texture of the surface.
     """
@@ -721,9 +840,22 @@ class BSDF(Surface):
     roughness_texture: Texture | None = None
     metallic_texture: Texture | None = None
     normal_texture: Texture | None = None
+    occlusion_texture: ImageTexture | None = None
     emissive_texture: Texture | None = None
     specular_trans: float = 0.0
     diffuse_trans: float = 0.0
+
+    @property
+    def roughness_factor(self) -> float:
+        return _get_texture_mean_value(self.roughness_texture, self.default_roughness)
+
+    @property
+    def metallic_factor(self) -> float:
+        return _get_texture_mean_value(self.metallic_texture, 0.0)
+
+    @property
+    def transmission_factor(self) -> float:
+        return self.specular_trans
 
     @property
     def texture(self) -> Texture | None:
@@ -747,6 +879,7 @@ class BSDF(Surface):
                 self.roughness_texture,
                 self.metallic_texture,
                 self.normal_texture,
+                self.occlusion_texture,
                 self.emissive_texture,
             )
         )
@@ -768,6 +901,7 @@ class BSDF(Surface):
         roughness_texture: Texture | None = None,
         metallic_texture: Texture | None = None,
         normal_texture: Texture | None = None,
+        occlusion_texture: ImageTexture | None = None,
         emissive_texture: Texture | None = None,
         force: bool = False,
         **kwargs,
@@ -781,6 +915,7 @@ class BSDF(Surface):
         )
         self.metallic_texture = self._update_field(self.metallic_texture, metallic_texture, None, force)
         self.normal_texture = self._update_field(self.normal_texture, normal_texture, None, force)
+        self.occlusion_texture = self._update_field(self.occlusion_texture, occlusion_texture, None, force)
         self.emissive_texture = self._update_field(self.emissive_texture, emissive_texture, None, force)
 
 

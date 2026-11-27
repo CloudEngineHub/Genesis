@@ -195,10 +195,6 @@ def test_deformable_uv_textures(renderer_type, renderer, show_viewer, png_snapsh
         pbd_options=gs.options.PBDOptions(
             particle_size=0.01,
         ),
-        vis_options=gs.options.VisOptions(
-            # Disable shadows systematically for Rasterizer because they are forcibly disabled on CPU backend anyway
-            shadow=(renderer_type != RENDERER_TYPE.RASTERIZER),
-        ),
         renderer=renderer,
         show_viewer=show_viewer,
         show_FPS=False,
@@ -269,6 +265,64 @@ def test_deformable_uv_textures(renderer_type, renderer, show_viewer, png_snapsh
     # Render and verify
     rgb_arr, *_ = camera.render(rgb=True)
     assert rgb_array_to_png_bytes(rgb_arr) == png_snapshot
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_support_neighbors", [4, 12])
+def test_skinned_mesh_follows_affine_motion(n_support_neighbors):
+    with pytest.raises(gs.GenesisException, match="n_support_neighbors"):
+        gs.options.MPMVisOptions(n_support_neighbors=3)
+
+    scene = gs.Scene(
+        mpm_options=gs.options.MPMOptions(
+            vis=gs.options.MPMVisOptions(
+                n_support_neighbors=n_support_neighbors,
+            ),
+        ),
+    )
+    # The regular sampler lays the particles out in layers, all the nearest particles of some vertices of the bunny
+    # lying in a single layer. Turning the bunny about the vertical axis leaves rounding noise across its vertical layers.
+    bunny_aligned = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            pos=(-0.3, 0.0, 0.3),
+            file="meshes/bunny.obj",
+            scale=0.15,
+        ),
+        material=gs.materials.MPM.Elastic(
+            sampler="regular",
+        ),
+    )
+    bunny_turned = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            pos=(0.3, 0.0, 0.3),
+            euler=(0.0, 0.0, -8.0),
+            file="meshes/bunny.obj",
+            scale=0.15,
+        ),
+        material=gs.materials.MPM.Elastic(
+            sampler="regular",
+        ),
+    )
+    scene.build(n_envs=2)
+
+    # The particles stay at rest in the first environment, and undergo a stretch with shear in the second one
+    affine_mat = np.array(((1.3, 0.2, 0.0), (0.0, 0.9, 0.1), (-0.1, 0.0, 1.1)))
+    affine_offset = np.array((0.05, -0.1, 0.05))
+    for bunny in (bunny_aligned, bunny_turned):
+        particles_pos = tensor_to_array(bunny.get_particles_pos())
+        particles_pos[1] = particles_pos[1] @ affine_mat.T + affine_offset
+        bunny.set_particles_pos(particles_pos)
+    shapes = scene.sim.render_context.get_shapes(debug=False)
+    for bunny in (bunny_aligned, bunny_turned):
+        bunny_mesh = next(
+            shape for shape in shapes if isinstance(shape, DynamicMesh) and shape.seg_keys.entity == bunny.idx
+        )
+        vverts = bunny.vmesh.verts
+        assert_allclose(
+            tensor_to_array(bunny_mesh.verts),
+            (vverts, vverts @ affine_mat.T + affine_offset),
+            tol=5e-7 if gs.np_float == np.float32 else 1e-15,
+        )
 
 
 @pytest.mark.required
@@ -350,7 +404,7 @@ def test_set_vverts(renderer, show_viewer):
     # Every environment shows the first variant, the mesh of the asset placed at the pose of the visual geom
     sphere_vverts = sphere_verts + np.array((0.0, 0.0, 0.5))
     assert_allclose(entity.get_vverts(), sphere_vverts, tol=gs.EPS)
-    rgb_baseline = tensor_to_array(cam.render(rgb=True, force_render=True)[0])
+    rgb_baseline = tensor_to_array(cam.render(rgb=True)[0])
 
     # A variant is shown by name in some environments, and survives steps
     entity.set_vverts(envs_idx=[1], variant="squashed")
@@ -375,7 +429,7 @@ def test_set_vverts(renderer, show_viewer):
     # A reset shows the first variant again in every environment
     scene.reset()
     assert_allclose(entity.get_vverts(), sphere_vverts, tol=gs.EPS)
-    rgb_restored = tensor_to_array(cam.render(rgb=True, force_render=True)[0])
+    rgb_restored = tensor_to_array(cam.render(rgb=True)[0])
     # Rendering the same geometry again may round a color to the next level
     assert_allclose(rgb_restored, rgb_baseline, atol=1)
 
@@ -511,17 +565,17 @@ def test_set_vverts_sphere_to_box(renderer, show_viewer):
     scene.build()
 
     cam.set_pose(pos=(pos_sphere[0], pos_sphere[1], pos_sphere[2] + cam_dz), lookat=pos_sphere)
-    mask_sphere = cam.render(rgb=False, segmentation=True, force_render=True)[2] > 0
+    mask_sphere = cam.render(rgb=False, segmentation=True)[2] > 0
 
     cam.set_pose(pos=(pos_box[0], pos_box[1], pos_box[2] + cam_dz), lookat=pos_box)
-    mask_box = cam.render(rgb=False, segmentation=True, force_render=True)[2] > 0
+    mask_box = cam.render(rgb=False, segmentation=True)[2] > 0
 
     # The reference primitive sphere uses a different tessellation than the spherified cube grid, so the two circle
     # silhouettes differ by a handful of boundary pixels - bound the symmetric difference at 0.5% of the area.
     sphere_tolerance = max(int(0.005 * mask_sphere.sum()), 1)
 
     cam.set_pose(pos=(pos_deformable[0], pos_deformable[1], pos_deformable[2] + cam_dz), lookat=pos_deformable)
-    mask_deformable_sphere = cam.render(rgb=False, segmentation=True, force_render=True)[2] > 0
+    mask_deformable_sphere = cam.render(rgb=False, segmentation=True)[2] > 0
     assert int((mask_deformable_sphere ^ mask_sphere).sum()) < sphere_tolerance
 
     deformable.set_vverts(variant=1)

@@ -3,9 +3,10 @@ import inspect
 import math
 import os
 import weakref
-from functools import lru_cache, wraps
+from collections.abc import Sequence
+from functools import lru_cache, partial, wraps
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 
@@ -38,6 +39,9 @@ from .cache import (
     register_cache_clear,
 )
 from .misc import get_assets_dir, get_src_dir, unique_rows
+
+if TYPE_CHECKING:
+    from genesis.vis.camera import Camera
 
 # Largest coordinate discrepancy, as a fraction of the bounding-box diagonal, under which two meshes are considered
 # identical by the on-disk caches. Orders of magnitude below the spacing of genuinely distinct geometry, and orders of
@@ -74,6 +78,24 @@ def color_f32_to_u8(color) -> np.ndarray:
 
 def color_u8_to_f32(color) -> np.ndarray:
     return np.asarray(color, dtype=np.uint8).astype(np.float32) / 255.0
+
+
+def color_to_rgba(color: "tuple[float, ...] | np.ndarray") -> np.ndarray:
+    """Return a color of one to four channels as an RGBA color.
+
+    A gray or gray-alpha color spans the three color channels, as an image of one or two channels does, and the alpha
+    is 1.0 for a color without one.
+
+    Parameters
+    ----------
+    color : tuple[float, ...] | np.ndarray
+        The color, gray, gray-alpha, RGB or RGBA, with channels within [0.0, 1.0].
+    """
+    rgba = np.ones(4, dtype=gs.np_float)
+    rgba[:3] = color[:3] if len(color) >= 3 else color[:1]
+    if len(color) in (2, 4):
+        rgba[3] = color[-1]
+    return rgba
 
 
 def hsv_to_rgb(hue: np.ndarray, saturation: float, value: float) -> np.ndarray:
@@ -505,9 +527,12 @@ def compute_sdf_data(mesh, res):
     return sdf_data
 
 
-# Trimesh materials drawing the image textures, by texture and content of their emission, which the rasterizer shares
-# (see 'RasterizerContext.on_rigid'). A weak reference keys the texture, which never matches a later texture reusing
-# the id of a collected one, even while the release of the owned entries is disabled.
+# Trimesh materials drawing the image textures, keyed by texture, then by the factors and the index of refraction of the
+# surface, the content of its emission, its normal map and its occlusion map. The rasterizer draws every mesh sharing a
+# trimesh material with a single material, made with the factors of the first surface it meets (see
+# 'RasterizerContext._sync_shape_nodes'), so these are part of the key of every material. A weak reference keys a
+# texture, which never matches a later texture reusing the id of a collected one, even while the release of the owned
+# entries is disabled.
 _TEXTURE_MATERIALS_CACHE = OwnedCache()
 
 
@@ -524,17 +549,12 @@ def texture_to_rgba(
     The diffuse map holds sRGB uint8 values and the emissive map linear float16 values (see
     ``gs.textures.DynamicTexture``). An image is resized to 'resolution', given as (width, height), and converted from
     its own encoding. A color is sRGB where the surface draws the texture as its base color ('as_base_color') and linear
-    where it draws it as its emission, as for a static texture. A gray or gray-alpha color spans the three color
-    channels, as an image of one or two channels does. An 'opacity' texture gives the alpha in place of that of the
-    texture, as the opacity of a surface does.
+    where it draws it as its emission, as for a static texture, and spans the channels as 'color_to_rgba' does. An
+    'opacity' texture gives the alpha in place of that of the texture, as the opacity of a surface does.
     """
     width, height = resolution
     is_image = isinstance(texture, gs.textures.ImageTexture)
-    color = texture.image_color if is_image else texture.color
-    factor = np.ones(4, dtype=gs.np_float)
-    factor[:3] = color[:3] if len(color) >= 3 else color[:1]
-    if len(color) in (2, 4):
-        factor[3] = color[-1]
+    factor = color_to_rgba(texture.image_color if is_image else texture.color)
     if is_image:
         if texture.image_array is None:
             gs.raise_exception(f"A dynamic texture takes no HDR image, got '{texture.image_path}'.")
@@ -566,7 +586,7 @@ def surface_uvs_to_trimesh_visual(surface, uvs=None, n_verts=None):
     texture = surface.get_rgba()
 
     # 'trimesh' uses uvs starting from the top-left corner, so flip them to Genesis' convention. The flip runs at the
-    # precision a mesh stores its uvs at, so a mesh drawn from uvs read back from a file matches the one it was built as.
+    # precision of the uvs of the mesh, so a mesh drawn from uvs read back from a file matches the mesh it came from.
     flipped_uvs = None
     if uvs is not None:
         flipped_uvs = uvs.astype(gs.np_float)
@@ -612,12 +632,34 @@ def surface_uvs_to_trimesh_visual(surface, uvs=None, n_verts=None):
             )
         elif isinstance(emission, gs.textures.ColorTexture):
             emissive_kwargs = dict(emissiveFactor=emission.color)
+    # A normal map and an occlusion map sample uvs, so they are drawn only when the mesh has them, and only with a PBR
+    # material, since SimpleMaterial has neither channel
+    maps_kwargs = {}
+    # The texture of each map drawn, which keys the material along with the map it fills
+    maps_texture = {}
+    if not isinstance(surface, gs.surfaces.Emission) and flipped_uvs is not None:
+        for map_name, map_texture in (
+            ("normalTexture", surface.normal_texture),
+            ("occlusionTexture", surface.occlusion_texture),
+        ):
+            if isinstance(map_texture, gs.textures.ImageTexture) and map_texture.image_array is not None:
+                assert map_texture.image_array.dtype == np.uint8
+                maps_kwargs[map_name] = Image.fromarray(map_texture.image_array)
+                maps_texture[map_name] = map_texture
+    # The rasterizer reads a factor left unset as 1.0, as glTF specifies, which renders a fully metallic material
+    pbr_material_factory = partial(
+        trimesh.visual.material.PBRMaterial,
+        metallicFactor=surface.metallic_factor,
+        roughnessFactor=surface.roughness_factor,
+        **emissive_kwargs,
+        **maps_kwargs,
+    )
 
     if texture_seed is not None:
         if flipped_uvs is not None:
             # The images of a dynamic texture may turn transparent, which the blending of a PBR material follows
-            material = trimesh.visual.material.PBRMaterial(
-                baseColorTexture=Image.fromarray(texture_seed), baseColorFactor=(255, 255, 255, 255), **emissive_kwargs
+            material = pbr_material_factory(
+                baseColorTexture=Image.fromarray(texture_seed), baseColorFactor=(255, 255, 255, 255)
             )
             visual = trimesh.visual.TextureVisuals(uv=flipped_uvs, material=material)
         else:
@@ -627,35 +669,46 @@ def surface_uvs_to_trimesh_visual(surface, uvs=None, n_verts=None):
                 vertex_colors=np.tile(texture_seed.mean(axis=(0, 1)) / 255.0, [n_verts, 1])
             )
     elif isinstance(texture, gs.textures.ImageTexture):
+        # The color of an image scales its texels
+        image_rgba = color_to_rgba(texture.image_color)
         if flipped_uvs is not None:
             assert texture.image_array.dtype == np.uint8
             material = _TEXTURE_MATERIALS_CACHE.get(
                 texture,
-                (weakref.ref(texture), get_hashkey(emission) if emissive_kwargs else None),
+                (
+                    weakref.ref(texture),
+                    surface.metallic_factor,
+                    surface.roughness_factor,
+                    surface.base_color_factor,
+                    surface.transmission_factor,
+                    surface.ior,
+                    get_hashkey(emission) if emissive_kwargs else None,
+                    tuple((map_name, weakref.ref(map_texture)) for map_name, map_texture in maps_texture.items()),
+                ),
                 lambda: (
-                    trimesh.visual.material.PBRMaterial(
+                    pbr_material_factory(
                         baseColorTexture=Image.fromarray(texture.image_array),
-                        baseColorFactor=(255, 255, 255, 255),
-                        **emissive_kwargs,
+                        baseColorFactor=color_f32_to_u8(image_rgba),
                     )
-                    if emissive_kwargs
+                    if emissive_kwargs or maps_kwargs
                     else trimesh.visual.material.SimpleMaterial(
-                        image=Image.fromarray(texture.image_array), diffuse=(1.0, 1.0, 1.0, 1.0)
+                        image=Image.fromarray(texture.image_array), diffuse=image_rgba
                     )
                 ),
             )
             visual = trimesh.visual.TextureVisuals(uv=flipped_uvs, material=material)
         else:
-            # fall back to color texture
-            visual = trimesh.visual.ColorVisuals(vertex_colors=np.tile(texture.mean_color, [n_verts, 1]))
+            # A mesh without uvs takes the mean color of the image
+            visual = trimesh.visual.ColorVisuals(
+                vertex_colors=np.tile(color_to_rgba(texture.mean_color) * image_rgba, [n_verts, 1])
+            )
     elif isinstance(texture, gs.textures.ColorTexture):
         if n_verts is None:
             gs.raise_exception("n_verts is required for color texture.")
-        if emissive_kwargs:
-            # The flat base color applies through a factor, but an image emissive still samples the UVs, so pass them.
-            material = trimesh.visual.material.PBRMaterial(
-                baseColorFactor=color_f32_to_u8(texture.color), **emissive_kwargs
-            )
+        if emissive_kwargs or maps_kwargs:
+            # The flat base color applies through a factor, but an image emissive, a normal map or an occlusion map
+            # still samples the uvs, so pass them.
+            material = pbr_material_factory(baseColorFactor=color_f32_to_u8(texture.color))
             visual = trimesh.visual.TextureVisuals(uv=flipped_uvs, material=material)
         else:
             visual = trimesh.visual.ColorVisuals(vertex_colors=np.tile(np.array(texture.color), [n_verts, 1]))
@@ -690,32 +743,32 @@ def convex_decompose(mesh, coacd_options):
             is_cached_loaded = True
 
     if not is_cached_loaded:
-        with gs.logger.timer("Running convex decomposition."):
-            mesh = coacd.Mesh(mesh.vertices, mesh.faces)
-            args = coacd_options
-            result = coacd.run_coacd(
-                mesh,
-                threshold=args.threshold,
-                max_convex_hull=args.max_convex_hull,
-                preprocess_mode=args.preprocess_mode,
-                preprocess_resolution=args.preprocess_resolution,
-                resolution=args.resolution,
-                mcts_nodes=args.mcts_nodes,
-                mcts_iterations=args.mcts_iterations,
-                mcts_max_depth=args.mcts_max_depth,
-                pca=args.pca,
-                merge=args.merge,
-                decimate=args.decimate,
-                max_ch_vertex=args.max_ch_vertex,
-                extrude=args.extrude,
-                extrude_margin=args.extrude_margin,
-                apx_mode=args.apx_mode,
-                seed=args.seed,
-            )
-            mesh_parts = []
-            for vs, fs in result:
-                mesh_parts.append(trimesh.Trimesh(vs, fs))
-            cache.save({"mesh_parts": mesh_parts, "mesh_scale": mesh_scale})
+        gs.logger.info("Running convex decomposition.")
+        mesh = coacd.Mesh(mesh.vertices, mesh.faces)
+        args = coacd_options
+        result = coacd.run_coacd(
+            mesh,
+            threshold=args.threshold,
+            max_convex_hull=args.max_convex_hull,
+            preprocess_mode=args.preprocess_mode,
+            preprocess_resolution=args.preprocess_resolution,
+            resolution=args.resolution,
+            mcts_nodes=args.mcts_nodes,
+            mcts_iterations=args.mcts_iterations,
+            mcts_max_depth=args.mcts_max_depth,
+            pca=args.pca,
+            merge=args.merge,
+            decimate=args.decimate,
+            max_ch_vertex=args.max_ch_vertex,
+            extrude=args.extrude,
+            extrude_margin=args.extrude_margin,
+            apx_mode=args.apx_mode,
+            seed=args.seed,
+        )
+        mesh_parts = []
+        for vs, fs in result:
+            mesh_parts.append(trimesh.Trimesh(vs, fs))
+        cache.save({"mesh_parts": mesh_parts, "mesh_scale": mesh_scale})
 
     return mesh_parts
 
@@ -1225,86 +1278,74 @@ def apply_transform(transform, positions, normals=None):
 
 
 def create_frame(
-    origin_radius=0.012, axis_radius=0.005, axis_length=1.0, head_radius=0.01, head_length=0.03, sections=12
-):
+    origin_radius: float = 0.012,
+    axis_radius: float = 0.005,
+    axis_length: float = 1.0,
+    head_radius: float = 0.01,
+    head_length: float = 0.03,
+    sections: int = 12,
+) -> trimesh.Trimesh:
     origin = create_sphere(radius=origin_radius, subdivisions=2)
 
-    x = create_arrow(
-        length=axis_length,
-        radius=axis_radius,
-        l_ratio=head_length / axis_length,
-        r_ratio=head_radius / axis_radius,
-        body_color=(0.7, 0.0, 0.0, 1.0),
-        head_color=(0.7, 0.7, 0.7, 1.0),
-        sections=sections,
-    )
-    y = create_arrow(
-        length=axis_length,
-        radius=axis_radius,
-        l_ratio=head_length / axis_length,
-        r_ratio=head_radius / axis_radius,
-        body_color=(0.0, 0.7, 0.0, 1.0),
-        head_color=(0.7, 0.7, 0.7, 1.0),
-        sections=sections,
-    )
-    z = create_arrow(
-        length=axis_length,
-        radius=axis_radius,
-        l_ratio=head_length / axis_length,
-        r_ratio=head_radius / axis_radius,
-        body_color=(0.0, 0.0, 0.7, 1.0),
-        head_color=(0.7, 0.7, 0.7, 1.0),
-        sections=sections,
-    )
+    # The arrows point along z, then rotate onto x and y
+    axes = []
+    for body_color, euler in (
+        ((0.7, 0.0, 0.0, 1.0), (0.0, 90.0, 0.0)),
+        ((0.0, 0.7, 0.0, 1.0), (-90.0, 0.0, 0.0)),
+        ((0.0, 0.0, 0.7, 1.0), (0.0, 0.0, 0.0)),
+    ):
+        axis = create_arrow(
+            length=axis_length,
+            radius=axis_radius,
+            l_ratio=head_length / axis_length,
+            r_ratio=head_radius / axis_radius,
+            body_color=body_color,
+            head_color=(0.7, 0.7, 0.7, 1.0),
+            sections=sections,
+        )
+        axis.vertices = gu.transform_by_R(axis.vertices, gu.euler_to_R(euler))
+        axes.append(axis)
 
-    x.vertices = gu.transform_by_R(x.vertices, gu.euler_to_R((0.0, 90.0, 0.0)))
-    y.vertices = gu.transform_by_R(y.vertices, gu.euler_to_R((-90.0, 0.0, 0.0)))
-
-    return trimesh.util.concatenate([origin, x, y, z])
+    return trimesh.util.concatenate([origin, *axes])
 
 
-def create_camera_frustum(camera, color):
+def create_camera_frustum(camera: "Camera", color: np.ndarray | Sequence[float]) -> trimesh.Trimesh:
     # camera
-    camera_mesh = load_trimesh(os.path.join(get_src_dir(), "assets", "meshes", "camera/camera.glb"), force="mesh")
+    camera_mesh = load_trimesh(os.path.join(get_assets_dir(), "meshes", "camera", "camera.glb"), force="mesh")
     camera_mesh.visual = camera_mesh.visual.to_color()
     camera_mesh.apply_translation([0.0, 0.0, 1.0])
     camera_mesh.apply_scale(0.05)
 
-    # frustum
-    near_half_height = camera.near * np.tan(np.deg2rad(camera.fov / 2))
-    near_half_width = near_half_height * camera.aspect_ratio
-    far_half_height = camera.far * np.tan(np.deg2rad(camera.fov / 2))
-    far_half_width = far_half_height * camera.aspect_ratio
-
-    # Define the vertices of the frustum
-    vertices = np.array(
-        [
-            [0, 0, 0],  # apex
-            [-near_half_width, -near_half_height, -camera.near],  # near bottom left
-            [near_half_width, -near_half_height, -camera.near],  # near bottom right
-            [near_half_width, near_half_height, -camera.near],  # near top right
-            [-near_half_width, near_half_height, -camera.near],  # near top left
-            [-far_half_width, -far_half_height, -camera.far],  # far bottom left
-            [far_half_width, -far_half_height, -camera.far],  # far bottom right
-            [far_half_width, far_half_height, -camera.far],  # far top right
-            [-far_half_width, far_half_height, -camera.far],  # far top left
-        ]
+    # The frustum, through the boundary of the image between the clipping distances: rays from the pixels along the
+    # edges of the image, from its bottom-left corner around it, in pixels from its top-left corner with the rows going
+    # down. The rays of a pinhole camera span planes between the corners, those of a fisheye camera bend along each
+    # edge, at distances from the camera along each ray.
+    width, height = camera.res
+    (fx, _, cx), (_, fy, cy), _ = camera.intrinsics
+    n_side = 16 if camera.model == "fisheye" else 1
+    sides_pos = np.linspace(0.0, 1.0, n_side, endpoint=False)
+    sides_end = np.ones_like(sides_pos)
+    image_boundary = np.concatenate(
+        (
+            np.stack((width * sides_pos, height * sides_end), axis=-1),
+            np.stack((width * sides_end, height * (1.0 - sides_pos)), axis=-1),
+            np.stack((width * (1.0 - sides_pos), 0.0 * sides_end), axis=-1),
+            np.stack((0.0 * sides_end, height * sides_pos), axis=-1),
+        )
     )
+    if camera.model == "fisheye":
+        rays, _ = gu.fisheye_pixels_to_rays(image_boundary, (fx, fy, cx, cy), camera.distortion)
+    else:
+        rays = np.concatenate(((image_boundary - (cx, cy)) / (fx, fy), np.ones((len(image_boundary), 1))), axis=-1)
+    # From the frame of the camera of OpenCV to that of the camera, which looks along -z with y up
+    rays[:, 1:] *= -1.0
+    vertices = np.concatenate((np.zeros((1, 3)), camera.near * rays, camera.far * rays))
 
-    # Define the faces of the frustum
-    faces = np.array(
-        [
-            # # near face
-            # [1, 2, 3, 4],
-            # # far face
-            # [5, 6, 7, 8],
-            # side face
-            [2, 1, 5, 6],
-            [3, 2, 6, 7],
-            [4, 3, 7, 8],
-            [1, 4, 8, 5],
-        ]
-    )
+    # The side faces of the frustum, between consecutive rays, leaving it open at its near and far ends
+    n_boundary = len(image_boundary)
+    i_v = 1 + np.arange(n_boundary)
+    i_v_next = 1 + (np.arange(n_boundary) + 1) % n_boundary
+    faces = np.stack((i_v_next, i_v, i_v + n_boundary, i_v_next + n_boundary), axis=-1)
 
     # Create the frustum mesh
     frustum_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
@@ -1330,7 +1371,6 @@ def create_tets_mesh(n_tets=1, halfsize=1.0, quats=None, randomize_halfsize=True
             np.tile(np.random.uniform(0.3, 1.9, size=(n_tets * 4, 1)), [1, vert_per_tet // 4 * 3]).reshape(-1, 3)
             * halfsize
         )
-        # halfsize = np.random.uniform(0.2, 1.9, size=(n_tets * vert_per_tet, 3)) * halfsize
 
     vertices = (
         np.tile(
@@ -1648,7 +1688,8 @@ def create_plane(
 def generate_tetgen_config_from_morph(morph):
     if not isinstance(morph, gs.options.morphs.TetGenMixin):
         raise TypeError(
-            f"Expected an instance of a class that inherits from TetGenMixin, but got an instance of {type(morph).name}."
+            "Expected an instance of a class that inherits from TetGenMixin, but got an instance of "
+            f"{type(morph).name}."
         )
     return dict(
         order=morph.order,
@@ -1738,39 +1779,6 @@ def tetrahedralize_mesh(mesh, tet_cfg):
     verts, elems, *_ = tet.tetrahedralize(switches=make_tetgen_switches(tet_cfg))
 
     return verts, elems
-
-
-def visualize_tet(tet, mesh, show_surface=True, plot_cell_qual=False):
-    grid = tet.grid
-    if show_surface:
-        grid.plot(show_edges=True)
-    else:
-        # get cell centroids
-        cells = grid.cells.reshape(-1, 5)[:, 1:]
-        cell_center = grid.points[cells].mean(axis=1)
-
-        # extract cells below the 0 xy plane
-        cell_ind = (cell_center[:, 2] < 0.0).nonzero(as_tuple=False)
-        subgrid = grid.extract_cells(cell_ind)
-
-        # advanced plotting
-        if plot_cell_qual:
-            cell_qual = subgrid.compute_cell_quality()["CellQuality"]
-            subgrid.plot(
-                scalars=cell_qual, stitle="Quality", cmap="bwr", clim=[0, 1], flip_scalars=True, show_edges=True
-            )
-        else:
-            # Delaying import of 'pyvista' because it is an optional dependency
-            import pyvista as pv
-
-            faces = np.concatenate([np.full((mesh.faces.shape[0], 1), mesh.faces.shape[1]), mesh.faces], axis=1)
-            pv_data = pv.PolyData(mesh.vertices, faces)
-
-            plotter = pv.Plotter()
-            plotter.add_mesh(subgrid, "lightgrey", lighting=True, show_edges=True)
-            plotter.add_mesh(pv_data, "r", "wireframe")
-            plotter.add_legend([[" Input Mesh ", "r"], [" Tessellated Mesh ", "black"]])
-            plotter.show()
 
 
 def check_exr_compression(exr_path):

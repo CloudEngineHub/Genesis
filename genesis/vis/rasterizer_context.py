@@ -17,7 +17,6 @@ from genesis.engine.render_context import (
     Frames,
     Lines,
     Points,
-    ScopedRenderContext,
     SegmentationKeys,
     Shape,
     StaticMeshBatch,
@@ -25,6 +24,7 @@ from genesis.engine.render_context import (
 )
 from genesis.engine.state_change import StateChange, Subscriber, Tracker
 from genesis.ext import pyrender
+from genesis.ext.pyrender.constants import MAX_N_LIGHTS
 from genesis.ext.pyrender.jit_render import JITRenderer
 from genesis.typing import IndexType
 from genesis.utils.misc import BuildableMixin, tensor_to_array
@@ -35,6 +35,27 @@ POSE_MAX_ABS = 1e20
 
 # The levels of 'VisOptions.segmentation_level', in the order of the keys of SegmentationKeys
 SEGMENTATION_LEVELS = ("entity", "link", "geom")
+
+
+class _MaterialFactors(NamedTuple):
+    metallic_factor: float = 0.0
+    roughness_factor: float = 1.0
+    base_color_factor: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    transmission_factor: float = 0.0
+    ior: float | None = None
+
+
+def _get_material_factors(surface: "gs.surfaces.Surface | None") -> _MaterialFactors:
+    # A mesh drawn without a surface (a marker, a debug geometry) takes the factors of the default surface
+    if surface is None:
+        return _MaterialFactors()
+    return _MaterialFactors(
+        surface.metallic_factor,
+        surface.roughness_factor,
+        surface.base_color_factor,
+        surface.transmission_factor,
+        surface.ior,
+    )
 
 
 class SegmentationColorMap:
@@ -210,7 +231,7 @@ class RasterizerContext(BuildableMixin):
             ambient_light=self.ambient_light, bg_color=self.background_color, n_envs=len(self.rendered_envs_idx)
         )
 
-        self.jit = JITRenderer(self._scene, [], [], self.scene.envs_offset[self.rendered_envs_idx])
+        self.jit = JITRenderer(self._scene, self.scene.envs_offset[self.rendered_envs_idx])
 
         self.on_lights()
 
@@ -556,6 +577,7 @@ class RasterizerContext(BuildableMixin):
                         is_marker=is_marker,
                         views=0,
                         inst_tints=mesh_tints,
+                        **_get_material_factors(geometry.surface)._asdict(),
                     )
                     vis_materials += [
                         (key, mesh_node.primitives[0].material)
@@ -583,7 +605,6 @@ class RasterizerContext(BuildableMixin):
                 meshes, primitives = shape_nodes.meshes, shape_nodes.primitives
                 if not meshes:
                     return
-                # One transposed copy of the poses, which the buffer flush uploads as is: each node then takes a view
                 poses_T = poses_T.swapaxes(0, 1)
                 if len(meshes) < len(shape):
                     poses_T = poses_T[shape_nodes.meshes_posed]
@@ -598,7 +619,7 @@ class RasterizerContext(BuildableMixin):
                 for mesh, primitive, pose_T in zip(meshes, primitives, poses_T):
                     mesh._bounds = None
                     primitive.poses = pose_T
-                self.jit.update_buffer(primitives, "model", np.ascontiguousarray(poses_T.transpose((0, 1, 3, 2))))
+                self.jit.update_poses(primitives, poses_T)
                 for i in shape_nodes.floors_idx:
                     self.set_reflection_mat(poses_T[i])
                 if tints is not None:
@@ -668,6 +689,7 @@ class RasterizerContext(BuildableMixin):
                         is_marker=is_marker,
                         views=views,
                         inst_tints=None if tints is None else tints[i_r, None],
+                        **_get_material_factors(shape.surface)._asdict(),
                     )
                     nodes.append(self._add_node_seg(mesh_node, seg_keys=None if is_marker else shape.seg_keys))
                 if shape.textures:
@@ -711,6 +733,7 @@ class RasterizerContext(BuildableMixin):
                         shape.surface, n_verts=len(shape_nodes.tets_mesh.vertices)
                     )
                     vels = self._read(shape.vel, shape_nodes, arrays_host)
+                material_factors = _get_material_factors(shape.surface)._asdict()
                 for i_r, (env_i, pos) in enumerate(zip(nodes_env, poss)):
                     if sphere is None:
                         mesh_node = pyrender.Mesh.from_points(
@@ -721,10 +744,22 @@ class RasterizerContext(BuildableMixin):
                         tets_mesh.vertices = mu.transform_tets_mesh_verts(
                             tets_mesh.vertices, positions=pos, zs=vels[i_r]
                         )
-                        mesh_node = pyrender.Mesh.from_trimesh(tets_mesh, smooth=False, envs=env_i, views=views)
+                        mesh_node = pyrender.Mesh.from_trimesh(
+                            tets_mesh,
+                            smooth=False,
+                            envs=env_i,
+                            views=views,
+                            **material_factors,
+                        )
                     else:
                         mesh_node = pyrender.Mesh.from_trimesh(
-                            sphere, smooth=True, poses=gu.trans_to_T(pos), envs=env_i, is_marker=is_marker, views=views
+                            sphere,
+                            smooth=True,
+                            poses=gu.trans_to_T(pos),
+                            envs=env_i,
+                            is_marker=is_marker,
+                            views=views,
+                            **material_factors,
                         )
                     nodes.append(self._add_node_seg(mesh_node, seg_keys=None if is_marker else shape.seg_keys))
             elif shape_nodes.tets_mesh is not None:
@@ -734,10 +769,9 @@ class RasterizerContext(BuildableMixin):
                     self._update_vertices(node, tets_verts)
             else:
                 for node, pos in zip(nodes, poss):
-                    node.mesh.primitives[0].poses = gu.trans_to_T(pos)
-                    self.jit.update_buffer(
-                        node.mesh.primitives, "model", (node.mesh.primitives[0].poses.transpose((0, 2, 1)),)
-                    )
+                    primitive = node.mesh.primitives[0]
+                    primitive.poses = gu.trans_to_T(pos)
+                    self.jit.update_poses((primitive,), primitive.poses[np.newaxis])
         elif isinstance(shape, (Frames, Arrows, Lines)):
             if isinstance(shape, Frames):
                 # The transforms of the instances of each node drawing the frames: one node per frame holding one
@@ -798,10 +832,9 @@ class RasterizerContext(BuildableMixin):
                     nodes.append(self.add_node(mesh_node))
             else:
                 for node, node_T in zip(nodes, nodes_T):
-                    node.mesh.primitives[0].poses = node_T
-                    self.jit.update_buffer(
-                        node.mesh.primitives, "model", (node.mesh.primitives[0].poses.transpose((0, 2, 1)),)
-                    )
+                    primitive = node.mesh.primitives[0]
+                    primitive.poses = node_T
+                    self.jit.update_poses((primitive,), node_T[np.newaxis])
         if is_new:
             shape_nodes.nodes_views = None
             self._set_nodes_views(shape, shape_nodes)
@@ -818,15 +851,15 @@ class RasterizerContext(BuildableMixin):
             # The arrays hold the images in the format of their map, which the shaders read from the type of the array
             texture_array = pyrender.Texture(
                 source=tensor_to_array(images),
-                source_channels="RGBA" if texture.is_base_color else "RGB",
+                source_channels=pyrender.TexChannels.RGBA if texture.is_base_color else pyrender.TexChannels.RGB,
                 tex_type=GL_TEXTURE_2D_ARRAY,
                 data_format=GL_UNSIGNED_BYTE if texture.map_type == TEXTURE_MAP_TYPE.DIFFUSE else GL_HALF_FLOAT,
             )
             for primitive in primitives:
                 if texture.is_base_color:
-                    primitive.material.baseColorTexture = texture_array
+                    primitive.material.base_color_texture = texture_array
                 else:
-                    primitive.material.emissiveTexture = texture_array
+                    primitive.material.emissive_texture = texture_array
                 if primitive.texture_layers is None:
                     primitive.texture_layers = np.zeros((len(self.rendered_envs_idx), 2), dtype=np.float32)
             binding = TextureBinding(texture, texture_array, primitives, texture.changelog.track(StateChange.VISUAL))
@@ -881,17 +914,19 @@ class RasterizerContext(BuildableMixin):
             node = shape_nodes.nodes[i_n]
             if node is not None:
                 node.mesh.views = int(views[i_n])
-                self._scene._meshes_updated = True
+                self._scene.has_meshes_changed = True
                 # What the views draw changed, which the shadow maps follow (see 'pyrender.Scene.revision')
                 self._scene.bump_revision()
         shape_nodes.nodes_views = views
 
     def _update_vertices(self, node: "pyrender.Node", vverts: np.ndarray) -> None:
-        update_data = self._scene.reorder_vertices(node, vverts.astype(np.float32, copy=False))
+        (primitive,) = node.mesh.primitives
+        update_data = vverts.astype(np.float32, copy=False)
+        if primitive.vertex_mapping is not None:
+            update_data = update_data[primitive.vertex_mapping]
         self.jit.update_buffer(node.mesh.primitives, "pos", (update_data,))
-        normal_data = self.jit.update_normal(node, update_data)
-        if normal_data is not None:
-            self.jit.update_buffer(node.mesh.primitives, "normal", (normal_data,))
+        if primitive.normals is not None:
+            self.jit.update_buffer(node.mesh.primitives, "normal", (primitive.compute_normals(update_data),))
 
     def set_reflection_mat(self, geom_T):
         height = geom_T[0, 2, 3]
@@ -909,14 +944,14 @@ class RasterizerContext(BuildableMixin):
         for light in self.lights:
             self.add_light(light)
 
-    def update(self, force_render: bool = False):
+    def update(self):
         """
         Sync the nodes with the state of the scene.
 
         The nodes of a shape are updated once the render context refreshed it, after a change of state of its solver.
         """
         # Early return if already updated previously
-        if not force_render and self._t >= self.scene.sim.cur_step_global:
+        if self._t >= self.scene.sim.cur_step_global:
             return
 
         # The interactive viewer draws from its own thread whatever is uploaded here
@@ -925,7 +960,7 @@ class RasterizerContext(BuildableMixin):
             self._t = self.scene.sim.cur_step_global
 
             # Force updating rendering-only quantities that are not updated automatically during simulation
-            self.visualizer.update_cameras(force_render)
+            self.visualizer.update_cameras()
 
             # Reset scene bounds to trigger recomputation. They are involved in shadow map.
             self._scene._bounds = None
@@ -937,6 +972,8 @@ class RasterizerContext(BuildableMixin):
                 self.update_camera_frustum(camera)
 
     def add_light(self, light):
+        if len(self._scene.light_nodes) >= MAX_N_LIGHTS:
+            gs.raise_exception(f"The rasterizer renders at most {MAX_N_LIGHTS} lights.")
         # light direction is light pose's -z frame
         if isinstance(light, gs.options.vis.DirectionalLight):
             pose = np.eye(4, dtype=np.float32)
@@ -946,7 +983,12 @@ class RasterizerContext(BuildableMixin):
             pose = gu.trans_to_T(np.array(light.pos, dtype=np.float32))
             self.add_node(pyrender.PointLight(color=light.color, intensity=light.intensity), pose=pose)
         else:
-            gs.raise_exception(f"Unsupported light: {light}")
+            pose = gu.trans_to_T(np.array(light.pos, dtype=np.float32))
+            gu.z_up_to_R(-np.array(light.dir, dtype=np.float32), out=pose[:3, :3])
+            spot_light = pyrender.SpotLight(
+                color=light.color, intensity=light.intensity, cone_angle=np.deg2rad(light.cutoff)
+            )
+            self.add_node(spot_light, pose=pose)
 
     def create_node_seg(self, seg_key, seg_node):
         seg_idxc = self.seg_color_map.seg_key_to_idxc(seg_key)

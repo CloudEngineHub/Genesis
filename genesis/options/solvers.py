@@ -1,7 +1,7 @@
 from typing import Any, Literal
 
 import numpy as np
-from pydantic import Field, PrivateAttr, StrictBool, field_validator, model_validator
+from pydantic import Field, PrivateAttr, StrictBool, StrictInt, field_validator, model_validator
 
 import genesis as gs
 from genesis.typing import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt, Vec3FType
@@ -478,12 +478,13 @@ class ParticleVisOptions(Options):
     n_support_neighbors : int, optional
         The number of particles whose positions place each vertex of a visual mesh skinned on the particles of an MPM
         or PBD entity. More neighbors deform the mesh more smoothly, at the cost of the memory and of the time of
-        skinning it at each frame drawn. Defaults to 12.
+        skinning it at each frame drawn. At least 4, since fewer particles span a plane at most, off which no vertex
+        can be placed. Defaults to 12.
     """
 
     boundary: StrictBool = False
     recon_backend: Literal["splashsurf", "levelset"] = "splashsurf"
-    n_support_neighbors: PositiveInt = 12
+    n_support_neighbors: StrictInt = Field(default=12, ge=4)
 
     @field_validator("recon_backend", mode="before")
     @classmethod
@@ -492,6 +493,27 @@ class ParticleVisOptions(Options):
             gs.logger.warning("Surface reconstruction backend 'openvdb' is deprecated. Use 'levelset' instead.")
             return "levelset"
         return value
+
+
+class MPMVisOptions(ParticleVisOptions):
+    """
+    Options configuring how the entities of the MPM solver are drawn.
+
+    Parameters
+    ----------
+    boundary : bool, optional
+        See ``ParticleVisOptions``.
+    recon_backend : str, optional
+        See ``ParticleVisOptions``.
+    n_support_neighbors : int, optional
+        See ``ParticleVisOptions``.
+    muscle_groups : bool, optional
+        Whether a muscle holding several muscle groups draws the particles of each group in a color of its own in its
+        debug representation, in place of the color of its surface. The groups are read back from the device at each frame
+        drawn while the scene holds a muscle. Defaults to True.
+    """
+
+    muscle_groups: StrictBool = True
 
 
 class PBDVisOptions(ParticleVisOptions):
@@ -812,8 +834,8 @@ class MPMOptions(GravityMixin, TimeBasedMixin):
         This option is deprecated.
     leaf_block_size : int, optional
         This option is deprecated.
-    vis : gs.options.ParticleVisOptions, optional
-        How the entities of the solver are drawn and the markers it draws (see ``gs.options.ParticleVisOptions``).
+    vis : gs.options.MPMVisOptions, optional
+        How the entities of the solver are drawn and the markers it draws (see ``gs.options.MPMVisOptions``).
     """
 
     particle_size: PositiveFloat | None = None  # in meters. Will be computed automatically if it's None.
@@ -823,7 +845,7 @@ class MPMOptions(GravityMixin, TimeBasedMixin):
     # These will later be converted to discrete grid bound. The actual grid boundary could be slightly tighter.
     lower_bound: Vec3FType = (-1.0, -1.0, 0.0)
     upper_bound: Vec3FType = (1.0, 1.0, 1.0)
-    vis: ParticleVisOptions = Field(default_factory=ParticleVisOptions)
+    vis: MPMVisOptions = Field(default_factory=MPMVisOptions)
 
     def __init__(self, *, use_sparse_grid: bool = False, leaf_block_size: int = 8, **data):
         super().__init__(**data)

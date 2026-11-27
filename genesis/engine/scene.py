@@ -41,6 +41,7 @@ from genesis.engine.states.solvers import SimState, SimulatorCheckpoint
 from genesis.options import (
     BaseCouplerOptions,
     FEMOptions,
+    FisheyeLens,
     KinematicOptions,
     MPMOptions,
     PBDOptions,
@@ -53,7 +54,7 @@ from genesis.options import (
     ViewerOptions,
     VisOptions,
 )
-from genesis.options.entities import EntityT, get_entity_spec
+from genesis.options.entities import EntityT, get_default_surface, get_entity_spec
 from genesis.options.morphs import Morph
 from genesis.options.recorders import RecorderOptions, TrajectoryFile
 from genesis.options.renderers import RendererOptions
@@ -155,8 +156,9 @@ def description_digest(desc: SceneDescription) -> str:
 @gs.assert_initialized
 class Scene(BuildableMixin, RBC):
     """
-    A ``genesis.Scene`` object wraps all components in a simulation environment, including a simulator (containing multiple physics solvers), entities, and a visualizer (controlling both the viewer and all the cameras).
-    Basically, everything happens inside a scene.
+    A ``genesis.Scene`` object wraps all components in a simulation environment, including a simulator (containing
+    multiple physics solvers), entities, and a visualizer (controlling both the viewer and all the cameras). Basically,
+    everything happens inside a scene.
 
     Parameters
     ----------
@@ -175,11 +177,13 @@ class Scene(BuildableMixin, RBC):
     coupler_options : gs.options.CouplerOptions
         The options configuring the `coupler` between different solvers.
     vis_options : gs.options.VisOptions
-        The options configuring the visualization system (``scene.visualizer``). Visualizer controls both the interactive viewer and the cameras.
+        The options configuring the visualization system (``scene.visualizer``). Visualizer controls both the
+        interactive viewer and the cameras.
     viewer_options : gs.options.ViewerOptions
         The options configuring the viewer (``scene.visualizer.viewer``).
     renderer : gs.renderers.RendererOptions
-        The renderer options used by `camera` for rendering images. This doesn't affect the behavior of the interactive viewer.
+        The renderer options used by `camera` for rendering images. This doesn't affect the behavior of the interactive
+        viewer.
     show_viewer : bool
         Whether to show the interactive viewer. Set it to False if you only need headless rendering.
     show_FPS : bool
@@ -395,7 +399,9 @@ class Scene(BuildableMixin, RBC):
         material : gs.materials.Material | None, optional
             The material of the entity. If None, use ``gs.materials.Rigid()``.
         surface : gs.surfaces.Surface | None, optional
-            The surface of the entity. If None, use ``gs.surfaces.Default()``.
+            The surface of the entity. If None, resolved based on the morph and the material:
+            ``gs.surfaces.Default(metallic=0.3, roughness=0.5)`` for a plane, ``gs.surfaces.Water()`` for a liquid,
+            and ``gs.surfaces.Default()`` otherwise. Defaults to None.
         visualize_contact : bool | None, optional
             Whether the contacts of the entity are drawn as markers, arrows that the interactive viewer and the debug
             cameras draw. Each contact is read back and drawn at every frame, so reserve it for the entities being
@@ -423,7 +429,10 @@ class Scene(BuildableMixin, RBC):
         material = spec.material
         # The surface resolves on a copy, since other entities may share it. The morph resolves in place, as shared
         # morphs rely on (see 'Entity.spec').
-        surface = gs.surfaces.Default() if spec.surface is None else spec.surface.model_copy()
+        if spec.surface is None:
+            surface = get_default_surface(spec.morphs[0], material)
+        else:
+            surface = spec.surface.model_copy()
 
         # some morph should not smooth surface normal
         if isinstance(spec.morphs[0], (gs.morphs.Box, gs.morphs.Cylinder, gs.morphs.Terrain)):
@@ -723,12 +732,12 @@ class Scene(BuildableMixin, RBC):
     @gs.assert_unbuilt
     def add_camera(
         self,
-        model="pinhole",
+        model=None,
         res=(320, 320),
         pos=(0.5, 2.5, 3.5),
         lookat=(0.5, 0.5, 0.5),
         up=(0.0, 0.0, 1.0),
-        fov=30,
+        fov=None,
         aperture=None,
         focus_dist=None,
         GUI=False,
@@ -747,14 +756,19 @@ class Scene(BuildableMixin, RBC):
         - The 'pinhole' model is a simple camera model that captures light rays from a single point in space. Given a
           `lens`, it becomes a thin-lens camera simulating a lens of finite aperture, which blurs what lies away from
           its focus distance (depth of field). A lens is only supported by the Raytracer.
-        - The 'fisheye' model is a camera model that simulates a fisheye lens, allowing for wide-angle views. It is
-          only supported by the BatchRenderer.
+        - The 'fisheye' model simulates a fisheye lens, whose wide view may span more than the half space in front of
+          the camera. Given a `lens` (gs.options.FisheyeLens), it follows the calibration of a real camera, its
+          intrinsics and its distortion in the Kannala-Brandt model of OpenCV. Without lens, it is an equidistant
+          projection, the circle inscribed in the image spanning `fov`. Its depth image holds the distance of each
+          pixel to the camera along its ray. The Rasterizer renders the faces of a cube map around the camera that the
+          image reaches, up to six passes of the scene per image, and resamples them. The BatchRenderer renders an
+          equidistant fisheye alone, and the RayTracer renders none.
 
         Parameters
         ----------
-        model : str
-            The projection of the camera: 'pinhole' or 'fisheye'. Deprecated: 'thinlens' stands for a pinhole camera with
-            a `lens`.
+        model : str | None
+            The projection of the camera: 'pinhole' or 'fisheye', None for that of its `lens`, pinhole without lens.
+            Deprecated: 'thinlens' stands for a pinhole camera with a `lens`.
         res : tuple of int, shape (2,)
             The resolution of the camera, specified as a tuple (width, height).
         pos : tuple of float, shape (3,)
@@ -763,8 +777,9 @@ class Scene(BuildableMixin, RBC):
             The point in the scene that the camera is looking at, specified as (x, y, z).
         up : tuple of float, shape (3,)
             The up vector of the camera, defining its orientation, specified as (x, y, z).
-        fov : float
-            The vertical field of view of the camera in degrees.
+        fov : float | None
+            The vertical field of view of the camera in degrees, or for a fisheye camera the angle that the circle
+            inscribed in its image spans. A calibrated fisheye lens gives it. None for 30 degrees otherwise.
         aperture : float | None
             Deprecated: use `lens`. The f-number of the lens of a 'thinlens' camera, 2.0 if None.
         focus_dist : float | None
@@ -795,8 +810,9 @@ class Scene(BuildableMixin, RBC):
             ``VisOptions.debug``). The Rasterizer renders it whatever the renderer of the scene, so that it records the
             simulation at any resolution and from any pose without interfering with what robots perceive from their
             environment. Defaults to False.
-        lens : gs.options.ThinLens | None
-            The lens of a pinhole camera, which makes it a thin-lens camera, None for a sharp image. Defaults to None.
+        lens : gs.options.ThinLens | gs.options.FisheyeLens | None
+            The lens of a pinhole camera, which makes it a thin-lens camera, or the calibrated lens of a fisheye camera,
+            None for a sharp pinhole image or an equidistant fisheye. Defaults to None.
 
         Returns
         -------
@@ -813,6 +829,12 @@ class Scene(BuildableMixin, RBC):
                     gs.raise_exception("'lens' and the deprecated 'model=\"thinlens\"' cannot be given together.")
                 lens = ThinLens(aperture=2.0 if aperture is None else aperture, focus_dist=focus_dist)
                 model = "pinhole"
+        if model is None:
+            model = "fisheye" if isinstance(lens, FisheyeLens) else "pinhole"
+        if isinstance(lens, FisheyeLens) and fov is not None:
+            gs.raise_exception("The field of view of a camera with a calibrated fisheye lens comes from its lens.")
+        if fov is None and not isinstance(lens, FisheyeLens):
+            fov = 30
         if denoise is None:
             denoise = sys.platform != "darwin"
         return self._visualizer.add_camera(
@@ -853,7 +875,8 @@ class Scene(BuildableMixin, RBC):
             The maximum number of particles the emitter holds at once, recycled once all are emitted. Each one costs
             memory and simulation time from the start, emitted or not. Default is 20000.
         surface : gs.surfaces.Surface | None, optional
-            The surface of the emitted particles. Defaults to ``gs.surfaces.Default(color=(0.6, 0.8, 1.0, 1.0))``.
+            The surface of the emitted particles. If None, resolved as ``Scene.add_entity`` does:
+            ``gs.surfaces.Water()`` for a liquid and ``gs.surfaces.Default()`` otherwise. Defaults to None.
         spec : gs.entities.MPM | gs.entities.SPH | gs.entities.PBD | None, optional
             The entity spec of the emitted particles, which replaces the material and the surface.
 
@@ -886,12 +909,8 @@ class Scene(BuildableMixin, RBC):
         if emitter_spec.morph is not None:
             gs.raise_exception("The emitter sets the morph of its entity spec. Leave it None.")
 
-        surface = emitter_spec.surface
-        if surface is None:
-            surface = gs.surfaces.Default(color=(0.6, 0.8, 1.0, 1.0))
-
         morph = gs.morphs.Nowhere(n_particles=max_particles)
-        entity = self.add_entity(spec=emitter_spec.model_copy(update={"morph": morph, "surface": surface}))
+        entity = self.add_entity(spec=emitter_spec.model_copy(update={"morph": morph}))
         emitter = Emitter(entity, max_particles)
         self._emitters.append(emitter)
         return emitter
@@ -954,55 +973,55 @@ class Scene(BuildableMixin, RBC):
         # A failed build destroys the scene, so that it never stays half built
         is_done = False
         try:
-            with gs.logger.timer(f"Building scene ~~~<{self._uid}>~~~..."):
-                self.env_spacing = env_spacing
-                self.n_envs_per_row = n_envs_per_row
-                self._center_envs_at_origin = center_envs_at_origin
+            gs.logger.info(f"Building scene ~~~<{self._uid}>~~~...")
+            self.env_spacing = env_spacing
+            self.n_envs_per_row = n_envs_per_row
+            self._center_envs_at_origin = center_envs_at_origin
 
-                # A scene without parallel environments lays out one
-                n_envs_ = max(1, n_envs)
-                if self.n_envs_per_row is None:
-                    self.n_envs_per_row = math.ceil(math.sqrt(n_envs_))
+            # A scene without parallel environments lays out one
+            n_envs_ = max(1, n_envs)
+            if self.n_envs_per_row is None:
+                self.n_envs_per_row = math.ceil(math.sqrt(n_envs_))
 
-                # compute offset values for visualizing each env
-                if not isinstance(env_spacing, (list, tuple)) or len(env_spacing) != 2:
-                    gs.raise_exception("`env_spacing` should be a tuple of length 2.")
-                self._layout = EnvironmentLayout(n_envs, tuple(env_spacing), self.n_envs_per_row, center_envs_at_origin)
-                offset_x = (np.arange(n_envs_) // self.n_envs_per_row) * self.env_spacing[0]
-                offset_y = (np.arange(n_envs_) % self.n_envs_per_row) * self.env_spacing[1]
-                offset_z = np.zeros((n_envs_,))
-                self.envs_offset = np.stack((offset_x, offset_y, offset_z), axis=-1, dtype=gs.np_float)
+            # compute offset values for visualizing each env
+            if not isinstance(env_spacing, (list, tuple)) or len(env_spacing) != 2:
+                gs.raise_exception("`env_spacing` should be a tuple of length 2.")
+            self._layout = EnvironmentLayout(n_envs, tuple(env_spacing), self.n_envs_per_row, center_envs_at_origin)
+            offset_x = (np.arange(n_envs_) // self.n_envs_per_row) * self.env_spacing[0]
+            offset_y = (np.arange(n_envs_) % self.n_envs_per_row) * self.env_spacing[1]
+            offset_z = np.zeros((n_envs_,))
+            self.envs_offset = np.stack((offset_x, offset_y, offset_z), axis=-1, dtype=gs.np_float)
 
-                # move to center
-                if center_envs_at_origin:
-                    center = (np.max(self.envs_offset, axis=0) + np.min(self.envs_offset, axis=0)) / 2.0
-                    self.envs_offset -= center
+            # move to center
+            if center_envs_at_origin:
+                center = (np.max(self.envs_offset, axis=0) + np.min(self.envs_offset, axis=0)) / 2.0
+                self.envs_offset -= center
 
-                with namespace(self._namespace):
-                    self._sim.build(n_envs)
-                self._render_context = self._sim.render_context.register(
-                    self, rendered_envs_idx=self.options.vis.rendered_envs_idx, n_envs=self._sim.n_envs
+            with namespace(self._namespace):
+                self._sim.build(n_envs)
+            self._render_context = self._sim.render_context.register(
+                self, rendered_envs_idx=self.options.vis.rendered_envs_idx, n_envs=self._sim.n_envs
+            )
+
+            # reset state
+            self._reset()
+
+            gs.logger.info("Compiling simulation kernels...")
+            self._sim.step()
+            try:
+                self._sim.check_errno()
+            except gs.GenesisException as e:
+                gs.logger.warning(
+                    "The initial state is invalid. Register a valid one with 'scene.reset(state)', or overwrite it "
+                    "manually following 'scene.build' and every call to 'scene.reset()', otherwise stepping will "
+                    f"fail with: {e}"
                 )
-
-                # reset state
-                self._reset()
-
-            with gs.logger.timer("Compiling simulation kernels..."):
-                self._sim.step()
-                try:
-                    self._sim.check_errno()
-                except gs.GenesisException as e:
-                    gs.logger.warning(
-                        "The initial state is invalid. Register a valid one with 'scene.reset(state)', or overwrite it "
-                        "manually following 'scene.build' and every call to 'scene.reset()', otherwise stepping will "
-                        f"fail with: {e}"
-                    )
-                self._sim.reset(self._init_state)
-                self._restart()
+            self._sim.reset(self._init_state)
+            self._restart()
 
             # visualizer
-            with gs.logger.timer("Building visualizer..."):
-                self._visualizer.build()
+            gs.logger.info("Building visualizer...")
+            self._visualizer.build()
 
             # recorders, which lay out the phases a step times once (see 'StepTimer.add_phases')
             self._sim.step_timer.add_phases("recorders", "rendering", "video")
@@ -1175,10 +1194,10 @@ class Scene(BuildableMixin, RBC):
     @gs.assert_built
     def get_error_envs_mask(self) -> torch.Tensor:
         """
-        Return whether each environment flagged an error since its last reset, such as an overflow of contacts or a 'nan'.
+        Return whether each environment flagged an error since its last reset, such as a contact overflow or a 'nan'.
 
-        A flagged error raises at the beginning of the next step, before anything else, until it is cleared: by resetting
-        the state of the environment, or with 'clear_errno'.
+        A flagged error raises at the beginning of the next step, before anything else, until it is cleared: by
+        resetting the state of the environment, or with 'clear_errno'.
         """
         return self._sim.get_error_envs_mask()
 
@@ -1565,7 +1584,6 @@ class Scene(BuildableMixin, RBC):
         colorize_seg=False,
         normal=False,
         antialiasing=False,
-        force_render=False,
     ):
         """
         Render the scene for all cameras using the batch renderer.
@@ -1582,8 +1600,6 @@ class Scene(BuildableMixin, RBC):
             Whether to render the normal image.
         antialiasing : bool, optional
             Whether to apply anti-aliasing.
-        force_render : bool, optional
-            Whether to force render the scene.
 
         Returns:
             A tuple of tensors of shape (n_envs, H, W, 3) if rgb is not None,
@@ -1594,7 +1610,7 @@ class Scene(BuildableMixin, RBC):
             gs.raise_exception("Method only supported by 'BatchRenderer'")
 
         rgb_out, depth_out, seg_out, normal_out = self._visualizer.batch_renderer.render(
-            rgb, depth, segmentation, normal, antialiasing, force_render
+            rgb, depth, segmentation, normal, antialiasing
         )
         if segmentation and colorize_seg:
             seg_out = tuple(self._visualizer.batch_renderer.colorize_seg_idxc_arr(seg) for seg in seg_out)
@@ -1676,14 +1692,13 @@ class Scene(BuildableMixin, RBC):
     # ------------------------------------------------------------------------------------
 
     def _reject_unexportable(self) -> None:
-        """Raise when the scene holds an entity, an emitter or a force field no description covers, and warn about what
+        """Raise when the scene holds an emitter or a force field, which no description covers, and warn about what
         'export' leaves out.
         """
         # A scene holding what alters the simulation is rejected, since a file leaving it out would restore other
         # physics. Everything else is left out with a warning: what observes or draws the simulation, and every
         # callback. Every solver holds the same force fields, so one solver names them all.
-        rejected_kinds = Counter(type(entity).__name__ for entity in self.entities if entity.desc is None)
-        rejected_kinds.update(type(emitter).__name__ for emitter in self._emitters)
+        rejected_kinds = Counter(type(emitter).__name__ for emitter in self._emitters)
         rejected_kinds.update(type(force_field).__name__ for force_field in self._sim.solvers[0].force_fields.fields)
         omitted_kinds = Counter(type(sensor).__name__ for sensor in self.sensors)
         if self._visualizer is not None:
@@ -1733,11 +1748,20 @@ class Scene(BuildableMixin, RBC):
         simulation had run to, so the simulated state has to be reproduced by stepping it again. Adding an entity
         resolves its description, so a scene is exported before it is built as readily as after.
 
-        Only a rigid or a kinematic entity carries a description. A scene
-        holding anything that alters the simulation raises, naming it: an emitter and a force field. Everything else
-        a description leaves out is written without, with a warning naming it: a camera, a sensor, a callback Genesis
-        calls at every step, a texture read from an HDR or EXR file, and the visual vertices an entity was given at
-        runtime. A recorder neither simulates nor draws, so it is left out without a word.
+        Not supported, raising on export:
+
+        - an emitter
+        - a force field
+
+        Left out of the file, with a warning:
+
+        - a camera
+        - a sensor
+        - a callback Genesis calls at every step
+        - a texture read from an HDR or EXR file
+        - the visual vertices an entity was given at runtime
+
+        A recorder neither simulates nor draws, so it is left out without a warning.
 
         Parameters
         ----------
@@ -1845,8 +1869,8 @@ class Scene(BuildableMixin, RBC):
         """Write the whole state of this scene to a file, for 'load_checkpoint' to open a copy standing where it stands.
 
         The file holds the scene as 'export' writes it and every array of the simulation, scratch included, so the
-        exact state of a failing run is kept for inspection. It is a trajectory file of one frame (see 'TrajectoryFile'),
-        and 'load_trajectory' opens it as such.
+        exact state of a failing run is kept for inspection. It is a trajectory file of one frame (see
+        'TrajectoryFile'), and 'load_trajectory' opens it as such.
 
         Parameters
         ----------
